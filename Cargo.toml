@@ -1,0 +1,22 @@
+[package]
+name = "codetracer-cardano-recorder"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "codetracer-cardano-recorder"
+path = "src/main.rs"
+
+[dependencies]
+codetracer_trace_types = "0.16"
+codetracer_trace_writer = "0.17"
+clap = { version = "4", features = ["derive"] }
+eyre = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+num-bigint = "0.4"
+num-traits = "0.2"
+uplc = "1.1.21"
+
+[dev-dependencies]
+tempfile = "3"
