@@ -1,1 +1,0 @@
-/home/zahary/metacraft/codetracer-cardano-recorder/target/debug/libcodetracer_cardano_recorder.rlib: /home/zahary/metacraft/codetracer-cardano-recorder/src/lib.rs /home/zahary/metacraft/codetracer-cardano-recorder/src/recorder.rs /home/zahary/metacraft/codetracer-cardano-recorder/src/source_map.rs /home/zahary/metacraft/codetracer-cardano-recorder/src/tracer.rs
