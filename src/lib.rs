@@ -5,6 +5,8 @@
 //! evaluating them in order, and converting the results into the
 //! CodeTracer trace format for debugging and analysis.
 
+pub mod blockfrost;
 pub mod recorder;
 pub mod source_map;
 pub mod tracer;
+pub mod transaction;
