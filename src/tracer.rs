@@ -626,10 +626,10 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
         let trimmed = lines[i].trim();
         let line_num = (i + 1) as u32;
 
-        let (is_test, after_keyword) = if trimmed.starts_with("fn ") {
-            (false, &trimmed[3..])
-        } else if trimmed.starts_with("test ") {
-            (true, &trimmed[5..])
+        let (is_test, after_keyword) = if let Some(rest) = trimmed.strip_prefix("fn ") {
+            (false, rest)
+        } else if let Some(rest) = trimmed.strip_prefix("test ") {
+            (true, rest)
         } else {
             i += 1;
             continue;
@@ -758,8 +758,7 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
         return None;
     }
 
-    if trimmed.starts_with("let ") {
-        let after_let = &trimmed[4..];
+    if let Some(after_let) = trimmed.strip_prefix("let ") {
         if let Some(eq_pos) = after_let.find('=') {
             let name = after_let[..eq_pos].trim().to_string();
             let expr = after_let[eq_pos + 1..].trim().to_string();
@@ -782,8 +781,8 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
 /// Check if an expression is a simple function call like `compute()`.
 fn parse_function_call(expr: &str) -> Option<String> {
     let expr = expr.trim();
-    if expr.ends_with("()") {
-        let name = expr[..expr.len() - 2].trim();
+    if let Some(name) = expr.strip_suffix("()") {
+        let name = name.trim();
         if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return Some(name.to_string());
         }
