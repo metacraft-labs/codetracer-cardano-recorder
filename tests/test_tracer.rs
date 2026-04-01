@@ -268,10 +268,8 @@ fn test_aiken_step_events() {
     let events = load_trace_events(&out_dir);
 
     // Count Step events.
-    let step_events: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e.get("Step").is_some())
-        .collect();
+    let step_events: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e.get("Step").is_some()).collect();
 
     // flow_test.ak has 5 let bindings + 1 bare expr in compute() = 6,
     // plus 1 bare expr in flow_test() test block = 7.
@@ -290,7 +288,9 @@ fn test_aiken_step_events() {
             step.get("path_id").is_some(),
             "Step event should have path_id field"
         );
-        let line = step["line"].as_i64().expect("Step line should be an integer");
+        let line = step["line"]
+            .as_i64()
+            .expect("Step line should be an integer");
         assert!(line > 0, "Step line should be positive, got {}", line);
         assert!(
             line <= 15,
@@ -481,10 +481,7 @@ fn test_aiken_cli_record() {
     assert!(!events.is_empty(), "CLI trace should have events");
 
     let step_count = events.iter().filter(|e| e.get("Step").is_some()).count();
-    assert!(
-        step_count > 0,
-        "CLI trace should contain Step events"
-    );
+    assert!(step_count > 0, "CLI trace should contain Step events");
 
     // Verify values are present in the CLI-produced trace too.
     let int_values = collect_int_values(&events);
@@ -506,13 +503,9 @@ fn test_uplc_cek_machine_addition() {
     let term: Term<NamedDeBruijn> = Term::Apply {
         function: Rc::new(Term::Apply {
             function: Rc::new(Term::Builtin(DefaultFunction::AddInteger)),
-            argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(
-                BigInt::from(10),
-            )))),
+            argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(BigInt::from(10))))),
         }),
-        argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(
-            BigInt::from(32),
-        )))),
+        argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(BigInt::from(32))))),
     };
 
     let program = Program {
@@ -543,13 +536,9 @@ fn test_uplc_cek_machine_full_computation() {
     let sum_val = Term::Apply {
         function: Rc::new(Term::Apply {
             function: Rc::new(Term::Builtin(DefaultFunction::AddInteger)),
-            argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(
-                BigInt::from(10),
-            )))),
+            argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(BigInt::from(10))))),
         }),
-        argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(
-            BigInt::from(32),
-        )))),
+        argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(BigInt::from(32))))),
     };
 
     // doubled = multiplyInteger(sum_val, 2)
@@ -558,9 +547,7 @@ fn test_uplc_cek_machine_full_computation() {
             function: Rc::new(Term::Builtin(DefaultFunction::MultiplyInteger)),
             argument: Rc::new(sum_val),
         }),
-        argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(
-            BigInt::from(2),
-        )))),
+        argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(BigInt::from(2))))),
     };
 
     // final_result = addInteger(doubled, 10)
@@ -569,9 +556,7 @@ fn test_uplc_cek_machine_full_computation() {
             function: Rc::new(Term::Builtin(DefaultFunction::AddInteger)),
             argument: Rc::new(doubled),
         }),
-        argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(
-            BigInt::from(10),
-        )))),
+        argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(BigInt::from(10))))),
     };
 
     // equalsInteger(final_result, 94)
@@ -580,9 +565,7 @@ fn test_uplc_cek_machine_full_computation() {
             function: Rc::new(Term::Builtin(DefaultFunction::EqualsInteger)),
             argument: Rc::new(final_result),
         }),
-        argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(
-            BigInt::from(94),
-        )))),
+        argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(BigInt::from(94))))),
     };
 
     let program = Program {
@@ -631,14 +614,13 @@ fn test_uplc_parse_and_eval() {
 
 #[test]
 fn test_uplc_file_evaluation() {
-    let uplc_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("test-programs/uplc/flow_test.uplc");
+    let uplc_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-programs/uplc/flow_test.uplc");
 
-    let uplc_src = std::fs::read_to_string(&uplc_path)
-        .expect("failed to read flow_test.uplc");
+    let uplc_src = std::fs::read_to_string(&uplc_path).expect("failed to read flow_test.uplc");
 
-    let parsed = uplc::parser::program(&uplc_src)
-        .expect("flow_test.uplc should parse as valid UPLC");
+    let parsed =
+        uplc::parser::program(&uplc_src).expect("flow_test.uplc should parse as valid UPLC");
 
     let named_db: Program<NamedDeBruijn> = parsed
         .to_named_debruijn()

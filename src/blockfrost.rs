@@ -4,7 +4,7 @@
 //! transaction details, extract Plutus script bytes, datum, redeemer,
 //! and script context needed to replay validator execution.
 
-use eyre::{Result, eyre};
+use eyre::{eyre, Result};
 
 use crate::transaction::{PlutusVersion, TransactionData};
 
@@ -110,17 +110,15 @@ impl BlockfrostClient {
             .iter()
             .find_map(|input| input["reference_script_hash"].as_str())
             .or_else(|| {
-                utxos_json["outputs"]
-                    .as_array()
-                    .and_then(|outputs| {
-                        outputs
-                            .iter()
-                            .find_map(|output| output["reference_script_hash"].as_str())
-                    })
+                utxos_json["outputs"].as_array().and_then(|outputs| {
+                    outputs
+                        .iter()
+                        .find_map(|output| output["reference_script_hash"].as_str())
+                })
             });
 
-        let script_hash = script_hash
-            .ok_or_else(|| eyre!("no Plutus script found in transaction {tx_hash}"))?;
+        let script_hash =
+            script_hash.ok_or_else(|| eyre!("no Plutus script found in transaction {tx_hash}"))?;
 
         // Fetch the script CBOR.
         let script_url = format!("{}/scripts/{}/cbor", self.base_url, script_hash);
@@ -138,8 +136,8 @@ impl BlockfrostClient {
             .as_str()
             .ok_or_else(|| eyre!("no CBOR field in script response"))?;
 
-        let script_bytes = hex::decode(script_hex)
-            .map_err(|e| eyre!("invalid hex in script CBOR: {e}"))?;
+        let script_bytes =
+            hex::decode(script_hex).map_err(|e| eyre!("invalid hex in script CBOR: {e}"))?;
 
         // Fetch redeemers.
         let redeemers_url = format!("{}/txs/{}/redeemers", self.base_url, tx_hash);
@@ -222,19 +220,16 @@ mod tests {
 
     #[test]
     fn test_client_with_custom_base_url() {
-        let client = BlockfrostClient::with_base_url(
-            "key".to_string(),
-            "https://custom.api.io".to_string(),
-        );
+        let client =
+            BlockfrostClient::with_base_url("key".to_string(), "https://custom.api.io".to_string());
         assert_eq!(client.base_url, "https://custom.api.io");
     }
 
     #[test]
     fn test_fetch_with_empty_key() {
         let client = BlockfrostClient::new(String::new());
-        let result = client.fetch_transaction(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        );
+        let result = client
+            .fetch_transaction("0000000000000000000000000000000000000000000000000000000000000000");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(

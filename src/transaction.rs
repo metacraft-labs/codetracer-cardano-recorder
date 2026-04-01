@@ -13,7 +13,7 @@
 
 use std::fmt;
 
-use eyre::{Result, eyre};
+use eyre::{eyre, Result};
 use uplc::ast::{DeBruijn, NamedDeBruijn, Program};
 
 use pallas_primitives::conway::Language;
@@ -98,8 +98,7 @@ pub fn decode_script(script_bytes: &[u8]) -> Result<Program<NamedDeBruijn>> {
 /// Decode a hex-encoded PlutusData string into `PlutusData`.
 fn decode_plutus_data_hex(hex_str: &str) -> Result<pallas_primitives::conway::PlutusData> {
     use pallas_primitives::Fragment;
-    let bytes =
-        hex::decode(hex_str).map_err(|e| eyre!("invalid hex in PlutusData: {e}"))?;
+    let bytes = hex::decode(hex_str).map_err(|e| eyre!("invalid hex in PlutusData: {e}"))?;
     let data = pallas_primitives::conway::PlutusData::decode_fragment(&bytes)
         .map_err(|e| eyre!("failed to decode PlutusData from CBOR: {e}"))?;
     Ok(data)
@@ -153,10 +152,10 @@ pub fn reconstruct_applied_program_text(tx_data: &TransactionData) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use num_bigint::BigInt;
+    use std::rc::Rc;
     use uplc::ast::{Constant, Data, DeBruijn, Program, Term};
     use uplc::machine::cost_model::ExBudget;
-    use std::rc::Rc;
-    use num_bigint::BigInt;
 
     /// Helper to construct a NamedDeBruijn value wrapped in Rc.
     fn named_db(name: &str, index: usize) -> Rc<NamedDeBruijn> {
@@ -313,8 +312,7 @@ mod tests {
             script_version: PlutusVersion::V2,
         };
 
-        let program =
-            reconstruct_applied_program(&tx_data).expect("reconstruction failed");
+        let program = reconstruct_applied_program(&tx_data).expect("reconstruction failed");
 
         // Evaluate through the CEK machine -- should return True.
         let result = program.eval(ExBudget::default());
@@ -358,8 +356,7 @@ mod tests {
             script_version: PlutusVersion::V2,
         };
 
-        let program =
-            reconstruct_applied_program(&tx_data).expect("reconstruction failed");
+        let program = reconstruct_applied_program(&tx_data).expect("reconstruction failed");
         let result = program.eval(ExBudget::default());
         let term = result.result().expect("evaluation failed");
         assert_eq!(term, Term::Constant(Rc::new(Constant::Bool(true))));
@@ -381,8 +378,7 @@ mod tests {
             script_version: PlutusVersion::V2,
         };
 
-        let program =
-            reconstruct_applied_program(&tx_data).expect("reconstruction failed");
+        let program = reconstruct_applied_program(&tx_data).expect("reconstruction failed");
 
         let result = program.eval(ExBudget::default());
         let term = result.result().expect("evaluation failed");
@@ -410,8 +406,7 @@ mod tests {
             script_version: PlutusVersion::V2,
         };
 
-        let text = reconstruct_applied_program_text(&tx_data)
-            .expect("reconstruction failed");
+        let text = reconstruct_applied_program_text(&tx_data).expect("reconstruction failed");
 
         // The text should contain the applied program.
         assert!(!text.is_empty(), "program text should not be empty");

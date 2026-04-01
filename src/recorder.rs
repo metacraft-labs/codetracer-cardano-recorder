@@ -16,11 +16,7 @@ use crate::tracer::AikenTracer;
 /// Reads the Aiken source file at `source_path`, parses function definitions
 /// and variable assignments, evaluates them, captures the trace, and writes
 /// CodeTracer trace files to `out_dir`.
-pub fn record(
-    source_path: &Path,
-    out_dir: &Path,
-    format: TraceEventsFileFormat,
-) -> Result<()> {
+pub fn record(source_path: &Path, out_dir: &Path, format: TraceEventsFileFormat) -> Result<()> {
     let source_code = std::fs::read_to_string(source_path)
         .with_context(|| format!("failed to read source file: {}", source_path.display()))?;
 
