@@ -106,10 +106,7 @@ fn main() -> Result<()> {
         Commands::Record(args) => record(args),
         Commands::Replay(args) => replay(args),
         Commands::Version => {
-            println!(
-                "codetracer-cardano-recorder {}",
-                env!("CARGO_PKG_VERSION")
-            );
+            println!("codetracer-cardano-recorder {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }
@@ -198,7 +195,8 @@ fn replay(args: ReplayArgs) -> Result<()> {
 
     eprintln!(
         "Budget spent: {} CPU, {} MEM",
-        result.cost().cpu, result.cost().mem
+        result.cost().cpu,
+        result.cost().mem
     );
 
     Ok(())

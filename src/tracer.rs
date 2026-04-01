@@ -14,8 +14,8 @@ use std::rc::Rc;
 
 use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer::trace_writer::TraceWriter;
-use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
-use eyre::{Context, Result, eyre};
+use codetracer_trace_writer::{create_trace_writer, TraceEventsFileFormat};
+use eyre::{eyre, Context, Result};
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use uplc::ast::{Constant, NamedDeBruijn, Program, Term};
@@ -120,10 +120,7 @@ fn uplc_eq(a: Term<NamedDeBruijn>, b: Term<NamedDeBruijn>) -> Term<NamedDeBruijn
 /// Supports: integer literals, variable references, True/False, binary operators
 /// (+, -, *, /), comparison operators (==, !=, <, >, <=, >=), and parenthesized
 /// sub-expressions.
-fn compile_expr_to_uplc(
-    expr: &str,
-    known: &HashMap<String, i64>,
-) -> Option<Term<NamedDeBruijn>> {
+fn compile_expr_to_uplc(expr: &str, known: &HashMap<String, i64>) -> Option<Term<NamedDeBruijn>> {
     let expr = expr.trim();
     if expr.is_empty() {
         return None;
@@ -444,38 +441,32 @@ impl AikenTracer {
             ("String", TypeKind::String),
             ("ByteArray", TypeKind::String),
         ] {
-            let type_id =
-                TraceWriter::ensure_type_id(&mut *tracer.writer, *kind, type_name);
+            let type_id = TraceWriter::ensure_type_id(&mut *tracer.writer, *kind, type_name);
             tracer.type_ids.insert(type_name.to_string(), type_id);
         }
 
         tracer.evaluate_program(source_path, &functions)?;
 
-        TraceWriter::finish_writing_trace_events(&mut *tracer.writer)
-            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
         TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
             .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer)
-            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
 
         Ok(())
     }
 
     /// Evaluate the program starting from the first `test` block or `fn main()`.
-    fn evaluate_program(
-        &mut self,
-        source_path: &Path,
-        functions: &[FunctionDef],
-    ) -> Result<()> {
+    fn evaluate_program(&mut self, source_path: &Path, functions: &[FunctionDef]) -> Result<()> {
         let func_map: HashMap<String, &FunctionDef> =
             functions.iter().map(|f| (f.name.clone(), f)).collect();
 
-        let entry = func_map.get("main").copied().or_else(|| {
-            functions.iter().find(|f| f.is_test)
-        });
+        let entry = func_map
+            .get("main")
+            .copied()
+            .or_else(|| functions.iter().find(|f| f.is_test));
 
-        let entry_fn = entry
-            .ok_or_else(|| eyre!("no main function or test block found in Aiken program"))?;
+        let entry_fn =
+            entry.ok_or_else(|| eyre!("no main function or test block found in Aiken program"))?;
 
         let mut env = HashMap::new();
         self.evaluate_function(source_path, entry_fn, &func_map, &mut env)?;
@@ -506,16 +497,10 @@ impl AikenTracer {
         for stmt in &func.body {
             match stmt {
                 Statement::LetBinding { name, expr, line } => {
-                    TraceWriter::register_step(
-                        &mut *self.writer,
-                        source_path,
-                        Line(*line as i64),
-                    );
+                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
                     // Compile expression to UPLC and evaluate via the real CEK machine.
-                    if let Some(val) = self.eval_expr_via_uplc(
-                        expr, &env, source_path, func_map,
-                    )? {
+                    if let Some(val) = self.eval_expr_via_uplc(expr, &env, source_path, func_map)? {
                         env.insert(name.clone(), val);
 
                         let type_id = self.type_ids.get("Int").copied().unwrap();
@@ -528,15 +513,9 @@ impl AikenTracer {
                     }
                 }
                 Statement::Expr { expr, line } => {
-                    TraceWriter::register_step(
-                        &mut *self.writer,
-                        source_path,
-                        Line(*line as i64),
-                    );
+                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
-                    if let Some(val) = self.eval_expr_via_uplc(
-                        expr, &env, source_path, func_map,
-                    )? {
+                    if let Some(val) = self.eval_expr_via_uplc(expr, &env, source_path, func_map)? {
                         return_value = Some(val);
                     }
                 }
@@ -572,9 +551,7 @@ impl AikenTracer {
         }
 
         // Check for comparison with function call: compute() == 94
-        if let Some(result) =
-            self.eval_comparison_with_call(expr, env, source_path, func_map)?
-        {
+        if let Some(result) = self.eval_comparison_with_call(expr, env, source_path, func_map)? {
             return Ok(Some(result));
         }
 
@@ -583,12 +560,8 @@ impl AikenTracer {
             if let Some(callee) = func_map.get(&call_name) {
                 let callee = (*callee).clone();
                 let mut dummy_env = HashMap::new();
-                let result = self.evaluate_function(
-                    source_path,
-                    &callee,
-                    func_map,
-                    &mut dummy_env,
-                )?;
+                let result =
+                    self.evaluate_function(source_path, &callee, func_map, &mut dummy_env)?;
                 return Ok(result);
             }
         }
@@ -620,8 +593,7 @@ impl AikenTracer {
                     let right_has_call = parse_function_call(right).is_some();
 
                     if left_has_call || right_has_call {
-                        let left_val =
-                            self.eval_expr_via_uplc(left, env, source_path, func_map)?;
+                        let left_val = self.eval_expr_via_uplc(left, env, source_path, func_map)?;
                         let right_val =
                             self.eval_expr_via_uplc(right, env, source_path, func_map)?;
 
@@ -681,7 +653,11 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
             let after_arrow = after_keyword[arrow_pos + 2..].trim();
             let type_end = after_arrow.find('{').unwrap_or(after_arrow.len());
             let rt = after_arrow[..type_end].trim().to_string();
-            if rt.is_empty() { None } else { Some(rt) }
+            if rt.is_empty() {
+                None
+            } else {
+                Some(rt)
+            }
         } else if is_test {
             Some("Bool".to_string())
         } else {
@@ -950,7 +926,10 @@ test flow_test() {
 
     #[test]
     fn test_parse_function_call() {
-        assert_eq!(parse_function_call("compute()"), Some("compute".to_string()));
+        assert_eq!(
+            parse_function_call("compute()"),
+            Some("compute".to_string())
+        );
         assert_eq!(parse_function_call("not_a_call"), None);
         assert_eq!(parse_function_call(""), None);
     }
@@ -1014,13 +993,9 @@ test flow_test() {
         let term: Term<NamedDeBruijn> = Term::Apply {
             function: Rc::new(Term::Apply {
                 function: Rc::new(Term::Builtin(DefaultFunction::AddInteger)),
-                argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(
-                    BigInt::from(10),
-                )))),
+                argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(BigInt::from(10))))),
             }),
-            argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(
-                BigInt::from(32),
-            )))),
+            argument: Rc::new(Term::Constant(Rc::new(Constant::Integer(BigInt::from(32))))),
         };
 
         let program = Program {
