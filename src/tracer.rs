@@ -401,7 +401,7 @@ impl AikenTracer {
     /// 2. For each expression, compiles it to a UPLC term and evaluates it
     ///    through the real CEK machine.
     /// 3. Emits Step events at source lines and Value events with variable values.
-    /// 4. Writes trace.bin, trace_metadata.json, trace_paths.json.
+    /// 4. Writes trace.json/trace.bin (depending on format), trace_metadata.json, trace_paths.json.
     pub fn trace_program(
         source_path: &Path,
         source_code: &str,
@@ -422,7 +422,11 @@ impl AikenTracer {
         std::fs::create_dir_all(out_dir)
             .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-        let events_path = out_dir.join("trace.bin");
+        let events_filename = match format {
+            TraceEventsFileFormat::Json => "trace.json",
+            TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 => "trace.bin",
+        };
+        let events_path = out_dir.join(events_filename);
         let metadata_path = out_dir.join("trace_metadata.json");
         let paths_path = out_dir.join("trace_paths.json");
 
