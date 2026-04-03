@@ -451,6 +451,9 @@ impl AikenTracer {
 
         tracer.evaluate_program(source_path, &functions)?;
 
+        // Close the <toplevel> call that start() opened.
+        TraceWriter::register_return(&mut *tracer.writer, NONE_VALUE);
+
         TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
         TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
             .map_err(|e| eyre!("{e}"))?;
@@ -473,19 +476,27 @@ impl AikenTracer {
             entry.ok_or_else(|| eyre!("no main function or test block found in Aiken program"))?;
 
         let mut env = HashMap::new();
-        self.evaluate_function(source_path, entry_fn, &func_map, &mut env)?;
+        // Merge the entry-point function into <toplevel> by skipping its
+        // Call/Return events. TraceWriter::start() already created <toplevel>
+        // at depth 0. Emitting register_call for the entry function would push
+        // all steps to depth 1, breaking step-over from the initial position.
+        self.evaluate_function(source_path, entry_fn, &func_map, &mut env, true)?;
 
         Ok(())
     }
 
     /// Evaluate a single function, emitting trace events.
     /// Each expression is compiled to UPLC and evaluated through the real CEK machine.
+    ///
+    /// When `is_entry_point` is true, Call/Return events are suppressed so the
+    /// function body runs at depth 0 under `<toplevel>`.
     fn evaluate_function(
         &mut self,
         source_path: &Path,
         func: &FunctionDef,
         func_map: &HashMap<String, &FunctionDef>,
         _parent_env: &mut HashMap<String, i64>,
+        is_entry_point: bool,
     ) -> Result<Option<i64>> {
         let fn_id = TraceWriter::ensure_function_id(
             &mut *self.writer,
@@ -493,7 +504,9 @@ impl AikenTracer {
             source_path,
             Line(func.line as i64),
         );
-        TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
+        if !is_entry_point {
+            TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
+        }
 
         let mut env: HashMap<String, i64> = HashMap::new();
         let mut return_value: Option<i64> = None;
@@ -526,14 +539,16 @@ impl AikenTracer {
             }
         }
 
-        match return_value {
-            Some(val) => {
-                let type_id = self.type_ids.get("Int").copied().unwrap();
-                let value = ValueRecord::Int { i: val, type_id };
-                TraceWriter::register_return(&mut *self.writer, value);
-            }
-            None => {
-                TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
+        if !is_entry_point {
+            match return_value {
+                Some(val) => {
+                    let type_id = self.type_ids.get("Int").copied().unwrap();
+                    let value = ValueRecord::Int { i: val, type_id };
+                    TraceWriter::register_return(&mut *self.writer, value);
+                }
+                None => {
+                    TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
+                }
             }
         }
 
@@ -565,7 +580,7 @@ impl AikenTracer {
                 let callee = (*callee).clone();
                 let mut dummy_env = HashMap::new();
                 let result =
-                    self.evaluate_function(source_path, &callee, func_map, &mut dummy_env)?;
+                    self.evaluate_function(source_path, &callee, func_map, &mut dummy_env, false)?;
                 return Ok(result);
             }
         }
