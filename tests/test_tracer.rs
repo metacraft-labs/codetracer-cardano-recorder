@@ -19,7 +19,7 @@ fn run_tracer_on_file(source_path: &Path, out_dir: &Path) {
     codetracer_cardano_recorder::recorder::record(
         source_path,
         out_dir,
-        TraceEventsFileFormat::Json,
+        TraceEventsFileFormat::Binary,
     )
     .expect("trace_program should succeed");
 }
