@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use codetracer_trace_writer::TraceEventsFileFormat;
+use codetracer_trace_writer_nim::TraceEventsFileFormat;
 use num_bigint::BigInt;
 use uplc::ast::{Constant, NamedDeBruijn, Program, Term};
 use uplc::builtins::DefaultFunction;
