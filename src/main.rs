@@ -54,10 +54,37 @@ enum Commands {
     Version,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+/// Output trace container format selection for the CLI.
+///
+/// `Ctfs` is the canonical CodeTracer multi-stream container that the
+/// upstream Nim reader (`NimTraceReaderHandle`) and the db-backend
+/// `CTFSTraceReader` consume directly.  It is the default for new
+/// traces.
+///
+/// `Binary` is the legacy CBOR + Zstd container kept for backward
+/// compatibility with older traces; `Json` is the human-readable
+/// variant useful for debugging.
+///
+/// This mirrors the format selection added to other recorders during
+/// the 2026-05 CTFS audits (EVM 1.39, Solana 1.44, Move 1.46).
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
+    /// Canonical CodeTracer multi-stream container (recommended).
+    Ctfs,
+    /// Legacy CBOR + Zstd binary format.
     Binary,
+    /// Human-readable JSON (slower; useful for debugging).
     Json,
+}
+
+impl From<OutputFormat> for TraceEventsFileFormat {
+    fn from(f: OutputFormat) -> Self {
+        match f {
+            OutputFormat::Ctfs => TraceEventsFileFormat::Ctfs,
+            OutputFormat::Binary => TraceEventsFileFormat::Binary,
+            OutputFormat::Json => TraceEventsFileFormat::Json,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -75,8 +102,10 @@ struct ReplayArgs {
     #[arg(short = 'o', long, default_value = "./ct-traces/")]
     out_dir: PathBuf,
 
-    /// Output format for the trace data.
-    #[arg(short = 'f', long, default_value = "binary")]
+    /// Output format for the trace data.  Defaults to `ctfs` — the
+    /// canonical multi-stream container consumed by the upstream Nim
+    /// reader and db-backend.
+    #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::Ctfs)]
     format: OutputFormat,
 }
 
@@ -91,8 +120,10 @@ struct RecordArgs {
     #[arg(short = 'o', long, default_value = "./ct-traces/")]
     out_dir: PathBuf,
 
-    /// Output format for the trace data.
-    #[arg(short = 'f', long, default_value = "binary")]
+    /// Output format for the trace data.  Defaults to `ctfs` — the
+    /// canonical multi-stream container consumed by the upstream Nim
+    /// reader and db-backend.
+    #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::Ctfs)]
     format: OutputFormat,
 }
 
@@ -126,10 +157,7 @@ fn record(args: RecordArgs) -> Result<()> {
 
     eprintln!("Source file: {}", source_path.display());
 
-    let format = match args.format {
-        OutputFormat::Binary => TraceEventsFileFormat::Binary,
-        OutputFormat::Json => TraceEventsFileFormat::Json,
-    };
+    let format: TraceEventsFileFormat = args.format.into();
 
     // 2. Create the output directory
     let out_dir = &args.out_dir;
