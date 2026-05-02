@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
+use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
@@ -560,6 +560,17 @@ impl AikenTracer {
 
     /// Evaluate an expression by compiling it to UPLC and running the real CEK machine.
     /// Handles function calls, comparisons with function calls, and simple expressions.
+    ///
+    /// UPLC CEK evaluation can fail (budget exhaustion, divide-by-zero,
+    /// type errors etc.).  Pre-fix, such failures bubbled up via `?` and
+    /// aborted `trace_program`, leaving a partially-written trace and
+    /// dropping the failure message from the trace stream entirely.
+    /// Post-fix (CTFS audit 2026-05), evaluation errors are routed
+    /// through `register_special_event(EventLogKind::Error, ...)` so they
+    /// surface in CodeTracer's event-log pane, and we return `Ok(None)`
+    /// so the recorder can continue and finalise the trace.  This
+    /// mirrors the canonical pattern established by the Move (1.46)
+    /// audit for `Effect::ExecutionError`.
     fn eval_expr_via_uplc(
         &mut self,
         expr: &str,
@@ -590,8 +601,24 @@ impl AikenTracer {
 
         // Compile the expression to a UPLC term and evaluate via the CEK machine.
         if let Some(uplc_term) = compile_expr_to_uplc(expr, env) {
-            let result_term = eval_uplc_term(uplc_term)?;
-            return Ok(term_to_i64(&result_term));
+            match eval_uplc_term(uplc_term) {
+                Ok(result_term) => return Ok(term_to_i64(&result_term)),
+                Err(err) => {
+                    // Surface the UPLC failure into the trace stream and
+                    // continue.  Metadata carries a stable tag the
+                    // frontend can route on (see Move 1.46
+                    // `MoveExecutionError` and the Solana 1.44 syscall
+                    // pattern); content is the human-readable message.
+                    let message = format!("{err}");
+                    TraceWriter::register_special_event(
+                        &mut *self.writer,
+                        EventLogKind::Error,
+                        "AikenUplcEvalError",
+                        &message,
+                    );
+                    return Ok(None);
+                }
+            }
         }
 
         Ok(None)
@@ -621,10 +648,24 @@ impl AikenTracer {
 
                         if let (Some(l), Some(r)) = (left_val, right_val) {
                             // Build a UPLC comparison and evaluate it.
+                            // Same error-routing pattern as
+                            // `eval_expr_via_uplc`: surface CEK errors as
+                            // a special event rather than aborting the
+                            // trace.
                             let cmp_term = uplc_eq(uplc_int(l), uplc_int(r));
-                            let result_term = eval_uplc_term(cmp_term)?;
-                            let result = term_to_i64(&result_term);
-                            return Ok(result);
+                            match eval_uplc_term(cmp_term) {
+                                Ok(result_term) => return Ok(term_to_i64(&result_term)),
+                                Err(err) => {
+                                    let message = format!("{err}");
+                                    TraceWriter::register_special_event(
+                                        &mut *self.writer,
+                                        EventLogKind::Error,
+                                        "AikenUplcEvalError",
+                                        &message,
+                                    );
+                                    return Ok(None);
+                                }
+                            }
                         }
                     }
                 }
