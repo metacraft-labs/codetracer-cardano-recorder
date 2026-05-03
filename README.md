@@ -31,12 +31,14 @@ cargo build
 #### Record an Aiken program
 
 ```bash
-codetracer-cardano-recorder record <file.ak> --out-dir <dir> [--format binary|json]
+codetracer-cardano-recorder record <file.ak> --out-dir <dir> [--format ctfs|binary|json]
 ```
 
 Parses the `.ak` source file, evaluates variable assignments through the
 UPLC CEK machine, captures the execution trace, and writes CodeTracer
-trace files to `--out-dir`.
+trace files to `--out-dir`. The default `ctfs` format is the canonical
+CodeTracer multi-stream container; `binary` is the legacy CBOR+Zstd
+format and `json` is intended for debugging.
 
 #### Replay an on-chain Cardano transaction
 
