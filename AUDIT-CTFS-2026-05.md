@@ -152,18 +152,19 @@ with four regression tests, mirroring the pattern used by EVM
   `record --help` and asserts the output advertises `ctfs` as a
   `--format` value with `[default: ctfs]`.  Catches accidental
   reverts of the `OutputFormat` enum to its pre-fix shape.
-* `test_steps_emitted_for_let_bindings` — structural smoke test
-  that the produced `.ct` container is materially populated
-  (>100 bytes), guarding against an empty-trace regression in the
-  step-emission code path.
+* `test_steps_emitted_for_let_bindings` — originally a structural
+  smoke test; the read-side follow-up now opens the produced `.ct`
+  through `NimTraceReaderHandle` and asserts readable step count,
+  function table entries, source path, call count, and step JSON.
 * `test_uplc_eval_error_does_not_abort_trace` — synthesises an
   Aiken source whose final expression triggers a divide-by-zero in
   UPLC, runs the recorder, and asserts (a) `record(...)` returns
-  `Ok` (the eval error did not abort the writer) and (b) a `.ct`
-  container is still produced.  Pre-fix this would fail because the
-  CEK error propagated through `?` and aborted `trace_program`
-  mid-write; post-fix it succeeds because the error is routed
-  through `register_special_event`.
+  `Ok` (the eval error did not abort the writer) and (b) the error
+  is readable back from the `.ct` through `NimTraceReaderHandle` as
+  an `error` event whose content mentions the divide failure.  Pre-
+  fix this would fail because the CEK error propagated through `?`
+  and aborted `trace_program` mid-write; post-fix it succeeds because
+  the error is routed through `register_special_event`.
 
 ## Tests run
 
@@ -193,6 +194,19 @@ LIBRARY_PATH="/nix/store/5hg6h4zjxc3ax7j4ywn6ksd509yl4pmd-zstd-1.5.6/lib" \
 This is an existing dev-shell ergonomics issue that predates the
 audit; documented here so the next agent can run the suite without
 re-investigating.
+
+## Closed follow-ups
+
+### Read-side CTFS content assertions
+
+Closed in the follow-up audit test update.  `tests/test_ctfs_audit.rs`
+now opens produced `.ct` containers through
+`codetracer_trace_writer_nim::NimTraceReaderHandle` and asserts
+reader-visible step count, call count, function names (`flow_test` /
+`compute`), source path resolution for `flow_test.ak`, step JSON, and
+the divide-by-zero `AikenUplcEvalError` as a readable `error` event.
+This closes only the assertion-depth follow-up; no recorder semantics
+changed.
 
 ## Open gaps / follow-ups
 

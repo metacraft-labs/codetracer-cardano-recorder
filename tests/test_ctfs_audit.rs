@@ -16,7 +16,7 @@
 
 use std::path::Path;
 
-use codetracer_trace_writer_nim::TraceEventsFileFormat;
+use codetracer_trace_writer_nim::{NimTraceReaderHandle, TraceEventsFileFormat};
 
 const CTFS_MAGIC: [u8; 5] = [0xC0, 0xDE, 0x72, 0xAC, 0xE2];
 
@@ -27,13 +27,48 @@ fn record_flow_test(format: TraceEventsFileFormat) -> (tempfile::TempDir, std::p
     let out_dir = tmp_dir.path().join("traces");
     std::fs::create_dir_all(&out_dir).unwrap();
 
-    let source_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("test-programs/aiken/flow_test.ak");
+    let source_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("test-programs/aiken/flow_test.ak");
 
     codetracer_cardano_recorder::recorder::record(&source_path, &out_dir, format)
         .expect("recorder::record should succeed");
 
     (tmp_dir, out_dir)
+}
+
+fn first_ct_file(out_dir: &Path) -> std::path::PathBuf {
+    let mut ct_files: Vec<_> = std::fs::read_dir(out_dir)
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
+        .collect();
+    ct_files.sort();
+    assert!(
+        !ct_files.is_empty(),
+        "expected a .ct container in {:?}",
+        out_dir
+    );
+    ct_files[0].clone()
+}
+
+fn open_ctfs_reader(out_dir: &Path) -> NimTraceReaderHandle {
+    let ct_path = first_ct_file(out_dir);
+    NimTraceReaderHandle::open(&ct_path.to_string_lossy())
+        .unwrap_or_else(|e| panic!("failed to open Nim CTFS reader for {ct_path:?}: {e}"))
+}
+
+fn json_bytes_as_string(value: &serde_json::Value) -> String {
+    let bytes: Vec<u8> = value
+        .as_array()
+        .unwrap_or_else(|| panic!("expected byte array JSON, got {value:#}"))
+        .iter()
+        .map(|byte| {
+            byte.as_u64()
+                .unwrap_or_else(|| panic!("expected byte value, got {byte:#}")) as u8
+        })
+        .collect();
+    String::from_utf8(bytes).expect("event data should be UTF-8")
 }
 
 // ---- Audit (f): CTFS multi-stream container is producible -----------------
@@ -51,19 +86,8 @@ fn record_flow_test(format: TraceEventsFileFormat) -> (tempfile::TempDir, std::p
 fn test_ctfs_writer_produces_ct_container() {
     let (_tmp, out_dir) = record_flow_test(TraceEventsFileFormat::Ctfs);
 
-    let ct_files: Vec<_> = std::fs::read_dir(&out_dir)
-        .expect("read_dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
-        .collect();
-
-    assert!(
-        !ct_files.is_empty(),
-        "expected a .ct container in {:?}",
-        out_dir
-    );
-    let content = std::fs::read(&ct_files[0]).expect("read ct file");
+    let ct_path = first_ct_file(&out_dir);
+    let content = std::fs::read(&ct_path).expect("read ct file");
     assert!(content.len() >= 5, ".ct container too small");
     assert_eq!(
         &content[..5],
@@ -104,38 +128,50 @@ fn test_ctfs_format_advertised_in_help() {
 // ---- Audit (e): Step records emitted on every line transition -------------
 
 /// `register_step` must fire on each LetBinding / Expr statement so the
-/// frontend can step line-by-line through the Aiken source.  A trace
-/// produced for `flow_test.ak` (5 let-bindings + 1 expr in `compute()`,
-/// 1 expr in `flow_test`) should generate a non-trivial trace.
-///
-/// Without a fixture-aware reader we can't introspect the produced
-/// step-event count from in-memory; the CTFS container is binary.  A
-/// reasonable proxy: the trace file is non-empty and the smoke test
-/// suite (`test_tracer.rs`) exercises the same code path.  Keep this
-/// test as a structural guard that the trace dir contains the expected
-/// CTFS artefacts.
+/// frontend can step line-by-line through the Aiken source.  The assertion
+/// opens the produced `.ct` with the Nim reader and verifies the reader can
+/// see the expected top-level/compute calls, source path, and statement
+/// steps instead of only checking for non-empty bytes.
 #[test]
 fn test_steps_emitted_for_let_bindings() {
     let (_tmp, out_dir) = record_flow_test(TraceEventsFileFormat::Ctfs);
+    let reader = open_ctfs_reader(&out_dir);
 
-    let entries: Vec<_> = std::fs::read_dir(&out_dir)
-        .expect("read_dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .collect();
-
-    let ct_size: u64 = entries
-        .iter()
-        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
-        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
-        .sum();
-
-    // The flow_test program produces multiple Step / Value records; the
-    // CTFS container should have meaningful content well above the
-    // header magic.
     assert!(
-        ct_size > 100,
-        "ct container should hold step + value records, got {ct_size} bytes"
+        reader.step_count() >= 7,
+        "flow_test.ak should expose statement steps through the CTFS reader"
+    );
+    assert!(
+        reader.call_count() >= 1,
+        "expected at least one readable call record"
+    );
+
+    let function_names: Vec<_> = (0..reader.function_count())
+        .map(|id| reader.function(id).expect("read function name"))
+        .collect();
+    assert!(
+        function_names.iter().any(|name| name == "flow_test"),
+        "missing flow_test function in {function_names:#?}"
+    );
+    assert!(
+        function_names.iter().any(|name| name == "compute"),
+        "missing compute function in {function_names:#?}"
+    );
+
+    let paths: Vec<_> = (0..reader.path_count())
+        .map(|id| reader.path(id).expect("read path"))
+        .collect();
+    assert!(
+        paths.iter().any(|path| path.ends_with("flow_test.ak")),
+        "missing flow_test.ak path in {paths:#?}"
+    );
+
+    let first_step: serde_json::Value =
+        serde_json::from_str(&reader.step_json(0).expect("read first step JSON"))
+            .expect("parse first step JSON");
+    assert!(
+        first_step["global_line_index"].as_u64().is_some(),
+        "step JSON should expose a global line index: {first_step:#}"
     );
 }
 
@@ -151,14 +187,8 @@ fn test_steps_emitted_for_let_bindings() {
 /// We exercise this by writing a synthesised Aiken source whose final
 /// expression triggers a divide-by-zero — UPLC's `divideInteger` raises
 /// a CEK error on division by zero.  The recorder must complete
-/// successfully (no error returned) and produce a CTFS container with
-/// the embedded special-event record.
-///
-/// Without a CTFS reader in the recorder's dev-deps we cannot decode
-/// the container directly here.  The test verifies the post-fix
-/// invariant at the recorder API: `record(...)` returns Ok and a CTFS
-/// container is produced even on an evaluation error.  This is the
-/// exact regression that the pre-fix recorder failed.
+/// successfully (no error returned), produce a CTFS container, and expose
+/// a readable error event through the Nim reader.
 #[test]
 fn test_uplc_eval_error_does_not_abort_trace() {
     let tmp_dir = tempfile::tempdir().expect("tempdir");
@@ -187,17 +217,26 @@ fn test_uplc_eval_error_does_not_abort_trace() {
          not abort the recorder.  Got: {result:?}"
     );
 
-    // A CTFS container should still have been produced (the writer's
-    // finish_writing_trace_events runs to completion).
-    let ct_files: Vec<_> = std::fs::read_dir(&out_dir)
-        .expect("read_dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
-        .collect();
+    let reader = open_ctfs_reader(&out_dir);
     assert!(
-        !ct_files.is_empty(),
-        "expected a .ct container even after eval error; got {:?}",
-        out_dir
+        reader.event_count() > 0,
+        "expected a readable CTFS error event after eval failure"
+    );
+
+    let events: Vec<_> = (0..reader.event_count())
+        .map(|idx| reader.event_json(idx).expect("read event JSON"))
+        .collect();
+    let error_contents: Vec<_> = events
+        .iter()
+        .map(|event| serde_json::from_str::<serde_json::Value>(event).expect("parse event JSON"))
+        .filter(|event| event["kind"] == "error")
+        .map(|event| json_bytes_as_string(&event["data"]))
+        .collect();
+
+    assert!(
+        error_contents
+            .iter()
+            .any(|content| content.to_lowercase().contains("divide")),
+        "expected divide-by-zero error content in readable CTFS events; events={events:#?}"
     );
 }
