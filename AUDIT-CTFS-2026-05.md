@@ -281,33 +281,20 @@ Out of scope for any single recorder audit; flag as an
 infrastructure follow-up in
 `codetracer-trace-format-nim/src/codetracer_trace_writer_ffi.nim`.
 
-### Findings that would also apply to a future Aiken-recorder audit
+### Aiken recorder repository split reclassification
 
-`codetracer-aiken-recorder` (sibling repo, not audited in this
-session per the user's scope) is a parallel implementation of the
-same Aiken-source-walking trace path.  When that recorder is
-audited next, the following findings from this Cardano audit are
-likely to apply directly (verify, do not assume):
+The May 2026 handoff originally listed a separate
+`codetracer-aiken-recorder` sibling.  The local checkout set contains
+no such repository, and this crate is already the Aiken source recorder:
+`src/recorder.rs` records `.ak` files, `src/tracer.rs` implements the
+`AikenTracer`, and the audit tests use `test-programs/aiken/`.
 
-* (f) **CTFS default-format**: check `codetracer-aiken-recorder/src/main.rs`
-  for the `OutputFormat` / `--format` shape.  If it predates the
-  2026-05 audit pattern, it likely defaults to `Binary` / `Json`
-  and needs the same `OutputFormat::Ctfs` + `default_value_t`
-  uplift applied here.
-* (c) **UPLC eval error routing**: any direct `eval_uplc_term(...)?`
-  call site in the Aiken recorder is a candidate for the same
-  `register_special_event(Error, "AikenUplcEvalError", message)`
-  fix applied in this commit.  The Aiken recorder shares the
-  underlying UPLC CEK machine via the `uplc` crate, so the same
-  failure modes (budget, div-by-zero, type errors) bubble up the
-  same way.
-* (b) **Parser-limited call args**: if the Aiken recorder shares
-  the `aiken_parser.rs` (or a fork of it), it inherits the
-  nullary-only call limitation and the same parser-extension
-  follow-up applies.
-* (a), (d), (e), (g), C-FFI: likely OK by structure (Rust-native,
-  single-threaded smart-contract execution).  Verify quickly during
-  the Aiken audit.
+Treat the Aiken audit scope as part of this Cardano recorder unless a
+new standalone sibling is later added intentionally.  The still-open
+Aiken-source gaps are the parser-limited call-argument support and the
+broader Plutus replay-path tracing feature documented above; there is
+no separate missing-repo audit item to run against the current sibling
+layout.
 
 ### `start()` toplevel function still has `vec![]` args
 
