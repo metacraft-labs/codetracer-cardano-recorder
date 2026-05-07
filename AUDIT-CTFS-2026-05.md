@@ -313,3 +313,77 @@ infers no other types.  Aiken supports `Bool`, `ByteArray`, `String`,
 `ValueRecord` would improve the locals pane fidelity but is
 orthogonal to the CTFS audit and tracked here as a non-blocking
 follow-up.
+
+## Convention compliance follow-up — 2026-05-08
+
+The 2026-05-02 audit landed a `--format ctfs|binary|json` `clap::ValueEnum`
+defaulting to `Ctfs`, mirroring the EVM (1.39) / Solana (1.44) /
+Move (1.46) audits.  Subsequent to that audit,
+`Recorder-CLI-Conventions.md` §4 in `codetracer-specs` was tightened
+to require **CTFS-only** output: recorders no longer accept a
+`--format` flag and `ct print` (shipped with `codetracer-trace-format-nim`)
+is the canonical conversion tool for human-readable output.
+`Repo-Requirements.md` §2.2 / §2.3 reflect this contract.
+
+This entry records the convention compliance follow-up applied to the
+Cardano recorder on 2026-05-08, mirroring the Cairo recorder
+2026-05-08 follow-up landed in commit `2710b5e` of
+`codetracer-cairo-recorder`:
+
+* The `--format` / `-f` CLI flag was removed from `record` and
+  `replay` subcommands.  The `OutputFormat` enum and the
+  `impl From<OutputFormat> for TraceEventsFileFormat` block were
+  deleted.  Clap rejects `--format <anything>` with an
+  "unexpected argument" error.
+* The JSON / legacy-binary output paths were removed.  The recorder's
+  writer is hard-pinned to `TraceEventsFileFormat::Ctfs` at every call
+  site: `tracer.rs::AikenTracer::trace_program` and
+  `recorder.rs::record` no longer take a `format` parameter.
+* The `events_filename` match in `tracer.rs` (which used to dispatch
+  on `Json` / `Binary` / `BinaryV0` / `Ctfs`) was collapsed to a
+  single CTFS arm.
+* `CODETRACER_CARDANO_RECORDER_OUT_DIR` was added as a fallback for
+  `--out-dir`.  Lookup order is CLI flag → env var → `./ct-traces/`.
+* `CODETRACER_CARDANO_RECORDER_DISABLED=1` (or `true`) skips the
+  trace emission entirely; the Cardano recorder doesn't run a
+  separate target subprocess so "disabled" simply means "don't write
+  any artefacts".
+* The CTFS-only contract is now in force across the codebase: the
+  binary's `--help` output mentions `ct print` as the conversion tool;
+  the README documents only CTFS, the env-var contract, and the
+  `ct print` workflow.
+* Tests in `tests/test_tracer.rs` that previously drove the CLI with
+  `--format json` were rewritten to drive the recorder library
+  directly and assert on the produced `.ct` container.  A new
+  `test_recorded_trace_via_ct_print_json` records `flow_test.ak` and
+  pipes the resulting `.ct` container through `ct-print --json`,
+  asserting that the canonical flow values (10 / 32 / 42 / 84 / 94)
+  surface in the textual rendering.  The test skips gracefully (with
+  a printed `SKIP:` line) when `ct-print` is not present (e.g. when
+  the crate is built outside the metacraft workspace).
+* New env-var integration tests
+  (`test_env_out_dir_used_when_flag_omitted`,
+  `test_env_disabled_skips_recording`, `test_format_flag_rejected_by_clap`)
+  cover the convention §5 surface, plus
+  `test_no_format_flag_in_help` and `test_help_mentions_ct_print` in
+  `tests/test_ctfs_audit.rs` lock in the §4 invariants.
+* `tests/test_ctfs_audit.rs` was updated to drop the
+  `TraceEventsFileFormat` parameter from its `record_flow_test`
+  helper and `recorder::record(...)` call sites, and the old
+  `test_ctfs_format_advertised_in_help` test (which would have locked
+  in the regression) was replaced with the post-fix
+  `test_no_format_flag_in_help` and `test_help_mentions_ct_print`
+  tests.
+* `tests/verify-cli-convention-no-silent-skip.sh` was added as a
+  shell-level guard that runs the binary's `--help`, asserts
+  `--format` and `CODETRACER_FORMAT` are absent, asserts the standard
+  flags (`--out-dir`, `--version`) are present, and asserts the
+  `CODETRACER_CARDANO_RECORDER_OUT_DIR` env var is referenced in
+  source.  A `Justfile` was added at repo root to wire it into
+  `just lint` / `just test`.
+
+References:
+
+* [`codetracer-specs/Recorder-CLI-Conventions.md`](../codetracer-specs/Recorder-CLI-Conventions.md) §4 (CTFS-only) and §5 (env vars).
+* [`codetracer-specs/Repo-Requirements.md`](../codetracer-specs/Repo-Requirements.md) §2.2 (CLI compliance) and §2.3 (trace format compatibility).
+* [`codetracer-cairo-recorder` commit `2710b5e`](../codetracer-cairo-recorder/) — the Cairo recorder follow-up that this work mirrors.
