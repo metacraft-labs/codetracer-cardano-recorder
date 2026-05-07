@@ -395,19 +395,25 @@ pub struct AikenTracer {
 }
 
 impl AikenTracer {
-    /// Trace an Aiken program and write CodeTracer output files.
+    /// Trace an Aiken program and write a CodeTracer CTFS bundle.
     ///
     /// 1. Parses the source file for function definitions and test blocks.
     /// 2. For each expression, compiles it to a UPLC term and evaluates it
     ///    through the real CEK machine.
     /// 3. Emits Step events at source lines and Value events with variable values.
-    /// 4. Writes trace.json/trace.bin (depending on format), trace_metadata.json, trace_paths.json.
-    pub fn trace_program(
-        source_path: &Path,
-        source_code: &str,
-        out_dir: &Path,
-        format: TraceEventsFileFormat,
-    ) -> Result<()> {
+    /// 4. Writes the canonical CTFS multi-stream `.ct` container plus the
+    ///    `trace_metadata.json` / `trace_paths.json` sidecars to `out_dir`.
+    ///
+    /// The output format is fixed to CTFS — see
+    /// `Recorder-CLI-Conventions.md` §4 in `codetracer-specs`.  Use
+    /// `ct print` (from `codetracer-trace-format-nim`) to convert the
+    /// produced bundle to JSON or other text forms.
+    pub fn trace_program(source_path: &Path, source_code: &str, out_dir: &Path) -> Result<()> {
+        // CTFS-only.  Pre-2026-05-08 the recorder accepted a format
+        // parameter (`TraceEventsFileFormat::{Json,Binary,Ctfs}`) and the
+        // CLI exposed a `--format` flag.  The convention now mandates
+        // CTFS exclusively.
+        let format = TraceEventsFileFormat::Ctfs;
         let _source_map = SourceMap::from_source(source_path, source_code);
         let functions = parse_functions(source_code);
 
@@ -422,12 +428,8 @@ impl AikenTracer {
         std::fs::create_dir_all(out_dir)
             .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-        let events_filename = match format {
-            TraceEventsFileFormat::Json => "trace.json",
-            TraceEventsFileFormat::Binary
-            | TraceEventsFileFormat::BinaryV0
-            | TraceEventsFileFormat::Ctfs => "trace.bin",
-        };
+        // CTFS multi-stream container.
+        let events_filename = "trace.ctfs";
         let events_path = out_dir.join(events_filename);
         let metadata_path = out_dir.join("trace_metadata.json");
         let paths_path = out_dir.join("trace_paths.json");

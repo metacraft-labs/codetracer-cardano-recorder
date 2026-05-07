@@ -9,9 +9,9 @@ A recorder for Cardano/Aiken smart contracts that produces [CodeTracer](https://
 
 `codetracer-cardano-recorder` compiles Aiken source files to UPLC
 (Untyped Plutus Lambda Calculus), evaluates them through the CEK machine,
-and captures step-level execution traces in the CodeTracer trace format.
-It also supports replaying on-chain Cardano transactions via the
-Blockfrost API.
+and captures step-level execution traces in the canonical CodeTracer
+CTFS multi-stream format. It also supports replaying on-chain Cardano
+transactions via the Blockfrost API.
 
 ### Building
 
@@ -31,24 +31,44 @@ cargo build
 #### Record an Aiken program
 
 ```bash
-codetracer-cardano-recorder record <file.ak> --out-dir <dir> [--format ctfs|binary|json]
+codetracer-cardano-recorder record <file.ak> --out-dir <dir>
 ```
 
 Parses the `.ak` source file, evaluates variable assignments through the
-UPLC CEK machine, captures the execution trace, and writes CodeTracer
-trace files to `--out-dir`. The default `ctfs` format is the canonical
-CodeTracer multi-stream container; `binary` is the legacy CBOR+Zstd
-format and `json` is intended for debugging.
+UPLC CEK machine, captures the execution trace, and writes a CTFS trace
+bundle to `--out-dir`.
+
+The recorder always writes traces in the canonical CodeTracer CTFS
+multi-stream format (a single `.ct` container plus
+`trace_metadata.json` / `trace_paths.json` sidecars). There is no
+`--format` flag — see "Converting traces" below for human-readable
+output.
 
 #### Replay an on-chain Cardano transaction
 
 ```bash
-codetracer-cardano-recorder replay <tx-hash> --out-dir <dir> [--api-key <key>]
+codetracer-cardano-recorder replay --tx-hash <tx-hash> [--blockfrost-key <key>]
 ```
 
 Fetches the transaction via the Blockfrost API, extracts the Plutus
 script and its arguments (datum, redeemer, script context), and traces
 the validator execution through the UPLC CEK machine.
+
+#### Converting traces to JSON / text
+
+The recorder is CTFS-only. To convert a recorded `.ct` bundle to a
+human-readable form, use `ct print` from
+[`codetracer-trace-format-nim`](../codetracer-trace-format-nim):
+
+```bash
+ct-print --json <recording-dir>/<program>.ct
+```
+
+`ct-print` accepts `--json`, `--json-events`, `--summary`, and
+`--follow` modes; see its `--help` for details. This conversion path
+is the canonical way to produce textual oracles for golden-snapshot
+tests, debugging, and interop with non-CodeTracer tools — see
+`Recorder-CLI-Conventions.md` §4 in the `codetracer-specs` repo.
 
 ### Architecture
 
@@ -77,9 +97,15 @@ Test programs live in:
 
 ### Environment variables
 
-| Variable | Description |
-|---|---|
-| `BLOCKFROST_API_KEY` | Blockfrost API key, required for the `replay` subcommand. Can also be passed via `--api-key`. |
+The recorder respects the standard CodeTracer recorder env-var contract
+defined in `Recorder-CLI-Conventions.md` §5:
+
+| Variable | CLI equivalent | Description |
+|---|---|---|
+| `CODETRACER_CARDANO_RECORDER_OUT_DIR` | `--out-dir` | Fallback output directory when `--out-dir` is omitted. The CLI flag always wins. |
+| `CODETRACER_CARDANO_RECORDER_DISABLED` | — | Set to `1` or `true` to run the recorder in pass-through mode (no trace artefacts written). |
+| `CODETRACER_CARDANO_RECORDER_LOG_LEVEL` | — | Recorder log verbosity (advisory; the Cardano recorder currently logs to stderr unconditionally). |
+| `BLOCKFROST_API_KEY` | `--blockfrost-key` | Blockfrost API key, required for the `replay` subcommand. |
 
 ### Contributing
 
