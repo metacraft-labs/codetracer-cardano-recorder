@@ -395,6 +395,21 @@ enum Statement {
         #[allow(dead_code)]
         line: u32,
     },
+    /// Aiken's `trace @"label": value` expression — the language's
+    /// only built-in I/O surface (the closest analogue of `stdout`
+    /// for an on-chain validator).  Per
+    /// `metacraft-specs/policies/recorder-test-requirements.md` §2
+    /// each `trace` call MUST surface as an `EventLogKind::Write`
+    /// io_event carrying the label string and the traced value.
+    /// `line` is held for the future wired-up execution path (see
+    /// the `Statement::Trace` arm in `evaluate_function`) where the
+    /// io_event will pair with a step at the `trace` source line.
+    Trace {
+        label: String,
+        value: String,
+        #[allow(dead_code)]
+        line: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +498,22 @@ impl AikenTracer {
         // surfaced from the executed path.
         tracer.emit_fail_events_for_program(&functions);
 
+        // Surface every `trace @"label": value` statement in the
+        // program as an `EventLogKind::Write` io_event.  `trace` is
+        // Aiken's only built-in I/O surface (the closest analogue of
+        // `stdout` for an on-chain validator) and
+        // `metacraft-specs/policies/recorder-test-requirements.md`
+        // §2 mandates that every reachable trace produces a
+        // user-visible `RecordEvent`.  Like
+        // `emit_fail_events_for_program`, this is a tactical
+        // post-execution sweep: the recorder today only runs the
+        // first `test` block, so we can't rely on the execution
+        // path to reach every `trace`.  When the recorder gains
+        // "execute every reachable `trace`" support, this sweep
+        // should dedupe against trace events already emitted from
+        // the executed path.
+        tracer.emit_trace_events_for_program(&functions);
+
         // Close the <toplevel> call that start() opened.
         TraceWriter::register_return(&mut *tracer.writer, NONE_VALUE);
 
@@ -511,6 +542,43 @@ impl AikenTracer {
                         EventLogKind::Error,
                         "AikenFail",
                         message,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Emit one `EventLogKind::Write` io_event per `trace @"label":
+    /// value` (or bare-label / value-only) statement found anywhere
+    /// in the parsed program.  The metadata tag (`AikenTrace`)
+    /// mirrors the `AikenFail` convention established for `fail`
+    /// expressions and the cross-recorder pattern used by Move
+    /// (`MoveExecutionError`) / Solana syscall failures — the
+    /// frontend can route on it to distinguish Aiken trace output
+    /// from other write-kind io_events.
+    ///
+    /// The content text is `"<label>: <value-expr>"` for labelled
+    /// traces, just `"<value-expr>"` for value-only traces, and just
+    /// `"<label>"` for bare-label traces.  Until the recorder gains
+    /// runtime resolution of trace values, the `value-expr` is the
+    /// literal source-level expression text (e.g. `"after-a: a"`)
+    /// rather than the resolved integer — same static-sweep
+    /// limitation called out for `emit_fail_events_for_program`.
+    fn emit_trace_events_for_program(&mut self, functions: &[FunctionDef]) {
+        for func in functions {
+            for stmt in &func.body {
+                if let Statement::Trace { label, value, .. } = stmt {
+                    let text = match (label.is_empty(), value.is_empty()) {
+                        (false, false) => format!("{label}: {value}"),
+                        (false, true) => label.clone(),
+                        (true, false) => value.clone(),
+                        (true, true) => String::new(),
+                    };
+                    TraceWriter::register_special_event(
+                        &mut *self.writer,
+                        EventLogKind::Write,
+                        "AikenTrace",
+                        &text,
                     );
                 }
             }
@@ -604,6 +672,23 @@ impl AikenTracer {
                     // `fail`, this arm should emit the event inline
                     // and the sweep should dedupe.
                     break;
+                }
+                Statement::Trace { line, .. } => {
+                    // `trace @"label": value` statements are surfaced
+                    // as `EventLogKind::Write` io_events via the
+                    // post-execution sweep in
+                    // `emit_trace_events_for_program` (same
+                    // tactical-static-sweep pattern as
+                    // `Statement::Fail` — see
+                    // `emit_fail_events_for_program` and the
+                    // KNOWN LIMITATIONS note on commit 7e5a177).
+                    // We still emit a `register_step` here so the
+                    // trace line appears in the step stream at its
+                    // source position.  When the recorder later
+                    // gains "execute every reachable `trace`"
+                    // support, this arm should emit the io_event
+                    // inline and the sweep should dedupe.
+                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
                 }
             }
         }
@@ -919,6 +1004,19 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
         }
     }
 
+    // Aiken's `trace @"label": value` (and the bare-label /
+    // value-only forms) — the language's only built-in I/O surface,
+    // which must surface as an `EventLogKind::Write` io_event
+    // carrying the label string and the traced value text.
+    if let Some(rest) = trimmed.strip_prefix("trace ") {
+        let (label, value) = parse_trace_payload(rest);
+        return Some(Statement::Trace {
+            label,
+            value,
+            line: line_num,
+        });
+    }
+
     Some(Statement::Expr {
         expr: trimmed.to_string(),
         line: line_num,
@@ -941,6 +1039,55 @@ fn parse_fail_message(payload: &str) -> String {
         return inner.to_string();
     }
     payload.to_string()
+}
+
+/// Split an Aiken `trace` payload into `(label, value)`.
+///
+/// Accepted forms:
+///
+/// * `@"label": value`   — labelled trace, the canonical form.
+/// * `"label": value`    — legacy string-literal label.
+/// * `@"label"`          — bare-label trace (no traced value).
+/// * `"label"`           — legacy bare-label trace.
+/// * `value`             — value-only trace (label defaults to empty).
+///
+/// The label is returned with the `@"..."` sigil and surrounding
+/// quotes stripped; the value is the trimmed remainder after the
+/// label-separating `:` (or empty for bare-label forms).
+fn parse_trace_payload(payload: &str) -> (String, String) {
+    let payload = payload.trim();
+
+    // `@"label"[: value]` — the canonical Aiken form.
+    if let Some(rest) = payload.strip_prefix('@') {
+        let rest = rest.trim_start();
+        if let Some(after_quote) = rest.strip_prefix('"') {
+            if let Some(end) = after_quote.find('"') {
+                let label = after_quote[..end].to_string();
+                let tail = after_quote[end + 1..].trim_start();
+                let value = tail
+                    .strip_prefix(':')
+                    .map(|v| v.trim().to_string())
+                    .unwrap_or_default();
+                return (label, value);
+            }
+        }
+    }
+
+    // `"label"[: value]` — legacy string-literal label.
+    if let Some(after_quote) = payload.strip_prefix('"') {
+        if let Some(end) = after_quote.find('"') {
+            let label = after_quote[..end].to_string();
+            let tail = after_quote[end + 1..].trim_start();
+            let value = tail
+                .strip_prefix(':')
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default();
+            return (label, value);
+        }
+    }
+
+    // Value-only `trace value` form — label is empty.
+    (String::new(), payload.to_string())
 }
 
 /// Check if an expression is a simple function call like `compute()`.
