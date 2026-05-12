@@ -646,18 +646,28 @@ fn test_control_flow_test_via_ct_print_full() {
         .collect();
     assert_eq!(
         functions,
-        vec!["control_flow", "compute"],
-        "function table mismatch — has classify/pick support landed?"
+        vec!["control_flow", "compute", "classify", "pick"],
+        "function table must include classify+pick now that the parser \
+         recognises calls with arguments — see commit landing \
+         `parse_function_call` arg support",
     );
 
     // ----- counts -----------------------------------------------------
-    // 8 step events: 1 outer + 1 dispatch + 5 let-bindings + 1 trailing
-    // expression.  Only `raw` produces a real Int value; the other
-    // four let-bindings call `classify`/`pick` with arguments which
-    // the parser can't compile, so they emit empty `vars` arrays.
+    // Steps now cover the entire `compute → classify → pick` chain:
+    //   1 outer  (the implicit start-of-trace step at line 1)
+    //   1 dispatch (`compute() == 602` in the test body)
+    //   6 in compute (5 let-bindings + 1 trailing `result` expr)
+    //   6 in classify (`if n < 0 {`, `-1`, `} else if n == 0 {`, `0`,
+    //                  `} else {`, `1` — the hand-rolled parser
+    //                  treats each non-`}` body line as its own
+    //                  Statement::Expr, "last evaluable line wins"
+    //                  for the function's return value)
+    //   4 in pick (`when tag is {` + three arms recognised by the new
+    //              `find_top_level_arrow` helper)
+    //   = 18 steps total.
     let counts = &doc["counts"];
-    assert_eq!(counts["steps"].as_u64(), Some(8), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(counts["steps"].as_u64(), Some(18), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -665,41 +675,47 @@ fn test_control_flow_test_via_ct_print_full() {
     );
     assert_eq!(
         counts["values"].as_u64(),
-        Some(8),
+        Some(18),
         "values; counts={counts}"
     );
 
     let events = doc["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 10, "events.len()");
+    // 18 steps + 3 call_entry + 3 call_exit = 24 events.
+    assert_eq!(events.len(), 24, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
-    // RECORDER BUG: spec wants [compute, classify, pick] (the test
-    // body invokes compute, which calls classify and pick).  Today we
-    // only see the bare `compute()` call because `classify(raw)` is
-    // not parsed as a call.  Once that lands, this list grows.
-    assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
+    // The chain is now captured end-to-end: the test body invokes
+    // compute(), which in turn calls classify(raw) and pick(sign).
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "classify".to_string(),
+            "pick".to_string(),
+        ],
+    );
 
     // ----- Decoded variable values ------------------------------------
-    // RECORDER BUG: `sign`, `bonus`, `combined`, `result` should each
-    // surface as an Int decoded from real CEK evaluation; today the
-    // recorder emits an empty `vars` array for those steps because
-    // their right-hand side contains a function call with arguments.
+    // All five let-bindings now surface as decoded Ints:
+    //   raw=7 (literal)
+    //   sign=classify(7)=1 (last-evaluable-line == else-branch literal)
+    //   bonus=pick(1)=300 (last `when` arm value)
+    //   combined=sign+bonus=301
+    //   result=combined*2=602
     assert_eq!(
         observed_var_sequence(&doc),
-        vec![("raw".to_string(), 7)],
-        "only `raw` is decoded today; the other let-bindings depend on \
-         classify(raw)/pick(sign) which the source-level parser cannot \
-         compile to UPLC."
+        vec![
+            ("raw".to_string(), 7),
+            ("sign".to_string(), 1),
+            ("bonus".to_string(), 300),
+            ("combined".to_string(), 301),
+            ("result".to_string(), 602),
+        ],
     );
 }
 
 #[test]
-#[ignore = "RECORDER BUG: classify/pick calls with arguments are not \
-            parsed as function calls, so sign/bonus/combined/result do \
-            not surface as decoded Ints.  Tracking expectation: full \
-            chain should yield [(\"raw\", 7), (\"sign\", 1), \
-            (\"bonus\", 300), (\"combined\", 301), (\"result\", 602)]."]
 fn test_control_flow_test_full_chain_decodes() {
     let Some((doc, _)) =
         record_and_dump_full("test_control_flow_test_full_chain_decodes", "control_flow_test.ak")

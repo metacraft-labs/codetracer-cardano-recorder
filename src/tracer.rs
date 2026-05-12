@@ -603,13 +603,23 @@ impl AikenTracer {
         // Call/Return events. TraceWriter::start() already created <toplevel>
         // at depth 0. Emitting register_call for the entry function would push
         // all steps to depth 1, breaking step-over from the initial position.
-        self.evaluate_function(source_path, entry_fn, &func_map, &mut env, true)?;
+        self.evaluate_function(source_path, entry_fn, &func_map, &mut env, true, &[])?;
 
         Ok(())
     }
 
     /// Evaluate a single function, emitting trace events.
     /// Each expression is compiled to UPLC and evaluated through the real CEK machine.
+    ///
+    /// `args` carries the resolved integer values for the function's
+    /// formal parameters (in source order).  They are bound into the
+    /// callee's local env so the body can reference them by name —
+    /// without this binding, the parser previously dropped any call
+    /// with arguments (`classify(raw)`, `pick(sign)`) on the floor.
+    /// Extra args (more than `func.params.len()`) are ignored;
+    /// missing args leave the corresponding param unbound (the body
+    /// will then fail to compile that reference, same fall-through as
+    /// any other undefined variable).
     ///
     /// When `is_entry_point` is true, Call/Return events are suppressed so the
     /// function body runs at depth 0 under `<toplevel>`.
@@ -620,6 +630,7 @@ impl AikenTracer {
         func_map: &HashMap<String, &FunctionDef>,
         _parent_env: &mut HashMap<String, i64>,
         is_entry_point: bool,
+        args: &[i64],
     ) -> Result<Option<i64>> {
         let fn_id = TraceWriter::ensure_function_id(
             &mut *self.writer,
@@ -632,6 +643,12 @@ impl AikenTracer {
         }
 
         let mut env: HashMap<String, i64> = HashMap::new();
+        // Bind formal params to actual arg values.  We zip with the
+        // shorter of the two so callers passing too few args still
+        // produce a (degraded but consistent) trace rather than a panic.
+        for ((param_name, _param_type), arg_val) in func.params.iter().zip(args.iter()) {
+            env.insert(param_name.clone(), *arg_val);
+        }
         let mut return_value: Option<i64> = None;
 
         for stmt in &func.body {
@@ -739,14 +756,39 @@ impl AikenTracer {
             return Ok(Some(result));
         }
 
-        // Check for function call: <name>()
-        if let Some(call_name) = parse_function_call(expr) {
+        // Check for function call: `<name>(...)` — zero-or-more args.
+        // Each argument expression is evaluated in the caller's env
+        // before being threaded into the callee's param bindings (see
+        // `evaluate_function`).  An argument that fails to evaluate
+        // (None) aborts the call and falls through to the generic
+        // compile path, matching the existing "best-effort, never panic"
+        // discipline.
+        if let Some((call_name, arg_exprs)) = parse_function_call(expr) {
             if let Some(callee) = func_map.get(&call_name) {
                 let callee = (*callee).clone();
-                let mut dummy_env = HashMap::new();
-                let result =
-                    self.evaluate_function(source_path, &callee, func_map, &mut dummy_env, false)?;
-                return Ok(result);
+                let mut arg_vals: Vec<i64> = Vec::with_capacity(arg_exprs.len());
+                let mut all_args_ok = true;
+                for arg_expr in &arg_exprs {
+                    match self.eval_expr_via_uplc(arg_expr, env, source_path, func_map)? {
+                        Some(v) => arg_vals.push(v),
+                        None => {
+                            all_args_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if all_args_ok {
+                    let mut dummy_env = HashMap::new();
+                    let result = self.evaluate_function(
+                        source_path,
+                        &callee,
+                        func_map,
+                        &mut dummy_env,
+                        false,
+                        &arg_vals,
+                    )?;
+                    return Ok(result);
+                }
             }
         }
 
@@ -1017,10 +1059,59 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
         });
     }
 
+    // Aiken `when` arms: `pattern -> value` (one per line in the
+    // canonical formatting).  The hand-rolled tracer doesn't perform
+    // pattern matching; it instead treats each arm as a sequential
+    // statement whose value-side becomes the function's running
+    // return-value, so the body of `pick(tag) { when tag is { ... }
+    // }` ends up returning the value of the LAST arm.  This matches
+    // the broader "last evaluable line wins" convention the
+    // recorder already uses for `if`/`else` blocks (whose bodies
+    // here are bare integer literals).  When the parser later gains
+    // real `when` support, this arm should evaluate the pattern
+    // against the scrutinee and only emit the matching branch.
+    //
+    // Recognition is intentionally tight: the line must contain a
+    // top-level `->` (not inside parens) AND the value-side must be
+    // a non-empty expression.  We also skip lines whose left-hand
+    // side looks like a function declaration (`fn foo() -> Int`) —
+    // those don't reach `parse_statement` today because the body
+    // loop starts AFTER the `fn ... {` header line, but the guard
+    // keeps the helper safe under future refactors.
+    if let Some(arrow_pos) = find_top_level_arrow(trimmed) {
+        let lhs = trimmed[..arrow_pos].trim();
+        let rhs = trimmed[arrow_pos + 2..].trim();
+        if !lhs.is_empty() && !rhs.is_empty() && !lhs.starts_with("fn ") {
+            return Some(Statement::Expr {
+                expr: rhs.to_string(),
+                line: line_num,
+            });
+        }
+    }
+
     Some(Statement::Expr {
         expr: trimmed.to_string(),
         line: line_num,
     })
+}
+
+/// Find the byte offset of a top-level `->` (paren-depth 0).  Used by
+/// `parse_statement` to recognise `when` arms.  Returns the offset of
+/// the `-`.
+fn find_top_level_arrow(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'-' if depth == 0 && bytes[i + 1] == b'>' => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Strip Aiken's `@"..."` string-literal sigil from a `fail` / `error`
@@ -1090,16 +1181,98 @@ fn parse_trace_payload(payload: &str) -> (String, String) {
     (String::new(), payload.to_string())
 }
 
-/// Check if an expression is a simple function call like `compute()`.
-fn parse_function_call(expr: &str) -> Option<String> {
+/// Parse a function-call expression like `compute()` / `classify(raw)` /
+/// `combine(a, b + 1)` into `(name, args)` where `args` is the list of
+/// trimmed argument-expression strings (empty for zero-argument calls).
+///
+/// The hand-rolled parser only recognises a call when the trimmed input
+/// has the shape `<ident>(...)` with the trailing `)` matching the first
+/// `(` at the top level — anything after the closing paren disqualifies
+/// the input (so `compute() == 94` is NOT a bare call and is left for
+/// the comparison-with-call path).  Arguments are split on top-level
+/// commas (i.e. commas at paren depth 0), so `combine(f(a), b)` parses
+/// as two args `"f(a)"` and `"b"`.  Each argument is later evaluated by
+/// the same `eval_expr_via_uplc` pipeline used for let-binding RHSs.
+///
+/// Pre-fix this function returned `Option<String>` (the name only) and
+/// only matched `name()`.  The Cardano fixture
+/// `control_flow_test.ak` calls `classify(raw)` / `pick(sign)`, which
+/// the bare-`()` form silently dropped — captured by the now-passing
+/// `test_control_flow_test_full_chain_decodes` test.
+fn parse_function_call(expr: &str) -> Option<(String, Vec<String>)> {
     let expr = expr.trim();
-    if let Some(name) = expr.strip_suffix("()") {
-        let name = name.trim();
-        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            return Some(name.to_string());
+    let open = expr.find('(')?;
+    if !expr.ends_with(')') {
+        return None;
+    }
+    let name = expr[..open].trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    // The very first character must look like a letter / underscore so we
+    // don't mistake e.g. `-1 + (a)` for a call.  `name` already passed the
+    // alphanumeric/underscore test, but it could still start with a digit
+    // (e.g. `1abc`), which is not a legal Aiken identifier.
+    if !name
+        .chars()
+        .next()
+        .map(|c| c.is_alphabetic() || c == '_')
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    // Ensure the trailing `)` matches the leading `(` at the top level —
+    // i.e. nothing of substance follows the matched closer.  Walk paren
+    // depth from `open` forward; the depth must hit zero exactly at
+    // `expr.len() - 1`.
+    let mut depth = 0i32;
+    for (i, ch) in expr.bytes().enumerate().skip(open) {
+        match ch {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 && i != expr.len() - 1 {
+                    return None;
+                }
+            }
+            _ => {}
         }
     }
-    None
+    if depth != 0 {
+        return None;
+    }
+
+    let inner = &expr[open + 1..expr.len() - 1];
+    let args = split_top_level_commas(inner);
+    Some((name.to_string(), args))
+}
+
+/// Split a string on top-level commas (commas at paren depth 0).  Each
+/// element is trimmed; an all-whitespace input yields an empty `Vec`
+/// (the zero-argument call form).
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(s[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim().to_string());
+    out
 }
 
 #[cfg(test)]
@@ -1237,12 +1410,43 @@ test flow_test() {
 
     #[test]
     fn test_parse_function_call() {
+        // Zero-argument call: name plus an empty Vec of arg-exprs.
         assert_eq!(
             parse_function_call("compute()"),
-            Some("compute".to_string())
+            Some(("compute".to_string(), vec![]))
         );
+        // Single-argument call — the case that previously slipped
+        // through.  See `test_control_flow_test_full_chain_decodes`.
+        assert_eq!(
+            parse_function_call("classify(raw)"),
+            Some(("classify".to_string(), vec!["raw".to_string()]))
+        );
+        assert_eq!(
+            parse_function_call("pick(sign)"),
+            Some(("pick".to_string(), vec!["sign".to_string()]))
+        );
+        // Multi-argument call: top-level commas split.
+        assert_eq!(
+            parse_function_call("combine(a, b + 1)"),
+            Some(("combine".to_string(), vec!["a".to_string(), "b + 1".to_string()]))
+        );
+        // Nested call inside an arg keeps the inner parens intact and
+        // is NOT split on the inner comma.
+        assert_eq!(
+            parse_function_call("outer(f(a, b), c)"),
+            Some((
+                "outer".to_string(),
+                vec!["f(a, b)".to_string(), "c".to_string()]
+            ))
+        );
+        // Non-calls.
         assert_eq!(parse_function_call("not_a_call"), None);
         assert_eq!(parse_function_call(""), None);
+        // Trailing content after the matched `)` disqualifies the
+        // input — `compute() == 94` is handled by the comparison path.
+        assert_eq!(parse_function_call("compute() == 94"), None);
+        // Identifier may not start with a digit.
+        assert_eq!(parse_function_call("1abc()"), None);
     }
 
     #[test]
