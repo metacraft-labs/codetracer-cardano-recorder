@@ -1018,11 +1018,15 @@ fn test_error_paths_test_emits_fail_event() {
 // --- tracing_test.ak -------------------------------------------------------
 
 /// Records `tracing_test.ak`.  The program calls `trace @"label":
-/// value` three times.  RECORDER BUG: `trace` is parsed as a bare
-/// expression statement and produces no `RecordEvent` (write kind)
-/// — the recorder has no `trace`-handling at all today, so
-/// `io_events` is 0.  When the recorder gains trace support, the
-/// `#[ignore]`d sibling test below will start passing.
+/// value` three times.  The recorder now scans for `trace @"..."`
+/// statements anywhere in the parsed program and emits one
+/// `EventLogKind::Write` io_event per `trace` (post-execution
+/// sweep — see `AikenTracer::emit_trace_events_for_program`,
+/// which inherits the same static-sweep limitation called out on
+/// commit 7e5a177 for `fail`).  The `AikenTrace` metadata tag
+/// mirrors the `AikenFail` convention so the frontend can route
+/// trace output independently of generic write-kind io_events.
+/// See `metacraft-specs/policies/recorder-test-requirements.md` §2.
 #[test]
 fn test_tracing_test_via_ct_print_full() {
     let Some((doc, source_path)) =
@@ -1044,22 +1048,25 @@ fn test_tracing_test_via_ct_print_full() {
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
-    // RECORDER BUG: should be >= 3 (one per `trace @"...": ...`).
+    // The recorder emits exactly three `EventLogKind::Write`
+    // io_events — one per `trace @"...": ...` statement in
+    // `compute()` (post-execution sweep over all parsed function
+    // bodies — see `AikenTracer::emit_trace_events_for_program`).
     assert_eq!(
         counts["io_events"].as_u64(),
-        Some(0),
+        Some(3),
         "io_events; counts={counts}"
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 9 steps + 1 call_entry + 1 call_exit = 11 events.
-    assert_eq!(events.len(), 11, "events.len()");
+    // 9 steps + 1 call_entry + 1 call_exit + 3 io_events = 14 events.
+    assert_eq!(events.len(), 14, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
 
-    // The integer let-bindings still surface even though the
-    // intervening `trace` expressions don't: a, b, sum_val.
+    // The integer let-bindings surface alongside the trace events:
+    // a, b, sum_val.
     assert_eq!(
         observed_var_sequence(&doc),
         vec![
@@ -1068,13 +1075,37 @@ fn test_tracing_test_via_ct_print_full() {
             ("sum_val".into(), 9),
         ],
     );
+
+    // Each `trace @"label": value` surfaces as an `ioStdout` io_event
+    // (the multi-stream IOEvent stream collapses
+    // `EventLogKind::Write` / `WriteFile` / `WriteOther` to the
+    // `ioStdout` bucket — see `toIOEventKind` in
+    // `codetracer-trace-format-nim`) whose `text` carries
+    // `"<label>: <value-expr>"` verbatim.  The frontend can route on
+    // the `AikenTrace` metadata tag (mirroring the `AikenFail`
+    // convention) to distinguish trace output from generic
+    // write-kind io_events.  Until the recorder gains runtime
+    // resolution of trace values, the `value-expr` is the literal
+    // source-level expression text (e.g. `"after-a: a"`) rather
+    // than the resolved integer; same static-sweep limitation
+    // called out for `emit_fail_events_for_program`.
+    let trace_events: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "io" && e["io_kind"] == "ioStdout")
+        .collect();
+    let texts: Vec<&str> = trace_events
+        .iter()
+        .map(|e| e["text"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["after-a: a", "after-b: b", "final-sum: sum_val"],
+        "ioStdout events should carry one entry per `trace @\"label\": value` \
+         with text \"<label>: <value-expr>\""
+    );
 }
 
 #[test]
-#[ignore = "RECORDER BUG: `trace @\"label\": value` is not surfaced \
-            as a RecordEvent (write kind).  Spec-compliant output \
-            should emit one io_event per trace call, with the label \
-            string and the decoded value."]
 fn test_tracing_test_emits_record_events() {
     let Some((doc, _)) =
         record_and_dump_full("test_tracing_test_emits_record_events", "tracing_test.ak")
