@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord, NONE_VALUE};
+use codetracer_trace_types::{EventLogKind, Line, TypeId, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
@@ -358,6 +358,50 @@ fn find_top_level_single_op(expr: &str, op: char) -> Option<usize> {
 // Aiken AST types
 // ---------------------------------------------------------------------------
 
+/// A run-time Aiken value flowing through the hand-rolled evaluator.
+///
+/// The recorder grew out of an int-only proof-of-concept where the
+/// evaluation env was `HashMap<String, i64>`.  That was enough for
+/// `flow_test.ak` / `nested_calls_test.ak` (both pure-arithmetic
+/// fixtures), but `collections_test.ak` exercises three structured
+/// shapes — list literal `xs = [1, 2, 3, 4]`, tuple literal
+/// `(10, 20)`, record literal `Point { x: 3, y: 4 }` — that the
+/// trace MUST surface as `ValueRecord::Sequence` / `Tuple` / `Struct`
+/// per `metacraft-specs/policies/recorder-test-requirements.md`.
+///
+/// `Value` is the smallest superset that lets the same env carry both
+/// scalars (for the existing UPLC-CEK arithmetic pipeline) and the
+/// new structured shapes.  Conversion to `ValueRecord` happens at the
+/// `register_variable_with_full_value` boundary; conversion back to
+/// `i64` (for `compile_expr_to_uplc`) happens via `Value::as_i64`.
+#[derive(Debug, Clone)]
+enum Value {
+    Int(i64),
+    /// Aiken list literal — emitted as `ValueRecord::Sequence`.
+    List(Vec<Value>),
+    /// Aiken tuple literal — emitted as `ValueRecord::Tuple`.
+    Tuple(Vec<Value>),
+    /// Aiken record literal — emitted as `ValueRecord::Struct`.  The
+    /// type name is needed so we can `ensure_type_id` the right
+    /// `TypeKind::Struct`; field names are kept for `p.field` access.
+    Record {
+        type_name: String,
+        fields: Vec<(String, Value)>,
+    },
+}
+
+impl Value {
+    /// Project to `i64` for the UPLC-CEK arithmetic pipeline.  Only
+    /// the `Int` variant has a meaningful answer; structured values
+    /// can't be substituted into a UPLC term.
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        }
+    }
+}
+
 /// A parsed Aiken function or test block.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -476,6 +520,13 @@ impl AikenTracer {
             ("Bool", TypeKind::Int),
             ("String", TypeKind::String),
             ("ByteArray", TypeKind::String),
+            // Pre-register the generic structured-value type names
+            // used by the literal-emitting paths.  Per-record-type
+            // names (e.g. "Point") are registered lazily in
+            // `value_to_record` the first time a literal of that
+            // shape lands in the trace.
+            ("List", TypeKind::Seq),
+            ("Tuple", TypeKind::Seq),
         ] {
             let type_id = TraceWriter::ensure_type_id(&mut *tracer.writer, *kind, type_name);
             tracer.type_ids.insert(type_name.to_string(), type_id);
@@ -598,7 +649,7 @@ impl AikenTracer {
         let entry_fn =
             entry.ok_or_else(|| eyre!("no main function or test block found in Aiken program"))?;
 
-        let mut env = HashMap::new();
+        let mut env: HashMap<String, Value> = HashMap::new();
         // Merge the entry-point function into <toplevel> by skipping its
         // Call/Return events. TraceWriter::start() already created <toplevel>
         // at depth 0. Emitting register_call for the entry function would push
@@ -606,6 +657,77 @@ impl AikenTracer {
         self.evaluate_function(source_path, entry_fn, &func_map, &mut env, true, &[])?;
 
         Ok(())
+    }
+
+    /// Convert a structured `Value` to its on-trace `ValueRecord`
+    /// shape and register the necessary type ids on first use.
+    ///
+    /// `Int` → `ValueRecord::Int { type_id: type_ids["Int"] }`.
+    /// `List` → `ValueRecord::Sequence { is_slice: false, type_id: type_ids["List"] }`.
+    /// `Tuple` → `ValueRecord::Tuple { type_id: type_ids["Tuple"] }`.
+    /// `Record { type_name }` → `ValueRecord::Struct { type_id: type_ids[type_name] }`,
+    ///   lazily registering `type_name` as `TypeKind::Struct` the first
+    ///   time it's seen.  Field names are dropped at the
+    ///   `ValueRecord::Struct` boundary (the wire format only carries
+    ///   `field_values: Vec<ValueRecord>`); the per-type
+    ///   `TypeSpecificInfo::Struct { fields }` registration that
+    ///   carries the names is handled inside the Nim writer.
+    fn value_to_record(&mut self, val: &Value) -> ValueRecord {
+        match val {
+            Value::Int(i) => {
+                let type_id = self
+                    .type_ids
+                    .get("Int")
+                    .copied()
+                    .unwrap_or(TypeId(0));
+                ValueRecord::Int { i: *i, type_id }
+            }
+            Value::List(elements) => {
+                let elements: Vec<ValueRecord> =
+                    elements.iter().map(|v| self.value_to_record(v)).collect();
+                let type_id = self
+                    .type_ids
+                    .get("List")
+                    .copied()
+                    .unwrap_or(TypeId(0));
+                ValueRecord::Sequence {
+                    elements,
+                    is_slice: false,
+                    type_id,
+                }
+            }
+            Value::Tuple(elements) => {
+                let elements: Vec<ValueRecord> =
+                    elements.iter().map(|v| self.value_to_record(v)).collect();
+                let type_id = self
+                    .type_ids
+                    .get("Tuple")
+                    .copied()
+                    .unwrap_or(TypeId(0));
+                ValueRecord::Tuple { elements, type_id }
+            }
+            Value::Record { type_name, fields } => {
+                let field_values: Vec<ValueRecord> = fields
+                    .iter()
+                    .map(|(_n, v)| self.value_to_record(v))
+                    .collect();
+                let type_id = if let Some(id) = self.type_ids.get(type_name).copied() {
+                    id
+                } else {
+                    let id = TraceWriter::ensure_type_id(
+                        &mut *self.writer,
+                        TypeKind::Struct,
+                        type_name,
+                    );
+                    self.type_ids.insert(type_name.clone(), id);
+                    id
+                };
+                ValueRecord::Struct {
+                    field_values,
+                    type_id,
+                }
+            }
+        }
     }
 
     /// Evaluate a single function, emitting trace events.
@@ -628,10 +750,10 @@ impl AikenTracer {
         source_path: &Path,
         func: &FunctionDef,
         func_map: &HashMap<String, &FunctionDef>,
-        _parent_env: &mut HashMap<String, i64>,
+        _parent_env: &mut HashMap<String, Value>,
         is_entry_point: bool,
-        args: &[i64],
-    ) -> Result<Option<i64>> {
+        args: &[Value],
+    ) -> Result<Option<Value>> {
         let fn_id = TraceWriter::ensure_function_id(
             &mut *self.writer,
             &func.name,
@@ -642,26 +764,90 @@ impl AikenTracer {
             TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
         }
 
-        let mut env: HashMap<String, i64> = HashMap::new();
-        // Bind formal params to actual arg values.  We zip with the
-        // shorter of the two so callers passing too few args still
-        // produce a (degraded but consistent) trace rather than a panic.
-        for ((param_name, _param_type), arg_val) in func.params.iter().zip(args.iter()) {
-            env.insert(param_name.clone(), *arg_val);
+        let mut env: HashMap<String, Value> = HashMap::new();
+        // Bind formal params to actual arg values and emit each as a
+        // step variable so structured arguments (tuple / record /
+        // list) actually surface in the trace's variable stream.
+        // Without this, a callee like `sum_pair(p: (Int, Int))`
+        // would receive a `Value::Tuple` for `p`, immediately
+        // destructure it into `(a, b)` and only `a` / `b` (Ints)
+        // would land as variables — the Tuple shape itself would
+        // stay invisible, defeating the whole point of decoding
+        // tuple literals at the call site.
+        //
+        // We zip with the shorter of the two arrays so callers
+        // passing too few args still produce a (degraded but
+        // consistent) trace rather than a panic.
+        if !func.params.is_empty() && !args.is_empty() && !is_entry_point {
+            // Emit a step at the function's signature line so the
+            // upcoming `register_variable_with_full_value` calls
+            // attach their variables to a real step event (the
+            // backend's variable-buffering model expects every
+            // variable to belong to the most-recent step).
+            TraceWriter::register_step(
+                &mut *self.writer,
+                source_path,
+                Line(func.line as i64),
+            );
         }
-        let mut return_value: Option<i64> = None;
+        for ((param_name, _param_type), arg_val) in func.params.iter().zip(args.iter()) {
+            env.insert(param_name.clone(), arg_val.clone());
+            if !is_entry_point {
+                let value = self.value_to_record(arg_val);
+                TraceWriter::register_variable_with_full_value(
+                    &mut *self.writer,
+                    param_name,
+                    value,
+                );
+            }
+        }
+        let mut return_value: Option<Value> = None;
 
         for stmt in &func.body {
             match stmt {
                 Statement::LetBinding { name, expr, line } => {
                     TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
-                    // Compile expression to UPLC and evaluate via the real CEK machine.
-                    if let Some(val) = self.eval_expr_via_uplc(expr, &env, source_path, func_map)? {
-                        env.insert(name.clone(), val);
+                    // `let (a, b) = <expr>` — Aiken tuple-destructuring
+                    // pattern.  We resolve <expr> to a `Value::Tuple`
+                    // and bind each component to the corresponding
+                    // pattern name in the env, emitting one variable
+                    // event per bound name (so the calltrace pane
+                    // shows `a = 10` / `b = 20` at the destructuring
+                    // step rather than an opaque `(a, b) = ...`).
+                    if let Some(pattern_names) = parse_tuple_pattern(name) {
+                        if let Some(rhs) =
+                            self.eval_expr_to_value(expr, &env, source_path, func_map)?
+                        {
+                            if let Value::Tuple(parts) = &rhs {
+                                for (pname, pval) in
+                                    pattern_names.iter().zip(parts.iter())
+                                {
+                                    env.insert(pname.clone(), pval.clone());
+                                    let value = self.value_to_record(pval);
+                                    TraceWriter::register_variable_with_full_value(
+                                        &mut *self.writer,
+                                        pname,
+                                        value,
+                                    );
+                                }
+                            }
+                        }
+                        continue;
+                    }
 
-                        let type_id = self.type_ids.get("Int").copied().unwrap();
-                        let value = ValueRecord::Int { i: val, type_id };
+                    // Try the structured-value path first — this
+                    // captures list/tuple/record literals, field
+                    // accesses, and call results that themselves
+                    // return structured values.  Falls back to the
+                    // historical i64-only UPLC path inside
+                    // `eval_expr_to_value` when the expression is
+                    // pure arithmetic.
+                    if let Some(val) =
+                        self.eval_expr_to_value(expr, &env, source_path, func_map)?
+                    {
+                        let value = self.value_to_record(&val);
+                        env.insert(name.clone(), val);
                         TraceWriter::register_variable_with_full_value(
                             &mut *self.writer,
                             name,
@@ -672,7 +858,9 @@ impl AikenTracer {
                 Statement::Expr { expr, line } => {
                     TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
-                    if let Some(val) = self.eval_expr_via_uplc(expr, &env, source_path, func_map)? {
+                    if let Some(val) =
+                        self.eval_expr_to_value(expr, &env, source_path, func_map)?
+                    {
                         return_value = Some(val);
                     }
                 }
@@ -711,10 +899,9 @@ impl AikenTracer {
         }
 
         if !is_entry_point {
-            match return_value {
+            match &return_value {
                 Some(val) => {
-                    let type_id = self.type_ids.get("Int").copied().unwrap();
-                    let value = ValueRecord::Int { i: val, type_id };
+                    let value = self.value_to_record(val);
                     TraceWriter::register_return(&mut *self.writer, value);
                 }
                 None => {
@@ -742,7 +929,7 @@ impl AikenTracer {
     fn eval_expr_via_uplc(
         &mut self,
         expr: &str,
-        env: &HashMap<String, i64>,
+        env: &HashMap<String, Value>,
         source_path: &Path,
         func_map: &HashMap<String, &FunctionDef>,
     ) -> Result<Option<i64>> {
@@ -751,25 +938,39 @@ impl AikenTracer {
             return Ok(None);
         }
 
+        // Field-access pre-pass: rewrite every `<ident>.<field>`
+        // (where `<ident>` is bound in `env` to a `Value::Record` or
+        // `Value::Tuple`) to the resolved scalar literal, so the
+        // downstream UPLC compiler (which only knows about
+        // identifiers and integer literals) sees an int-only
+        // expression.  Without this, `p.x * p.x + p.y * p.y` would
+        // be unresolvable — the UPLC compiler doesn't understand
+        // dotted names — and `point_distance_sq` would silently
+        // return `None`.
+        let resolved = resolve_field_accesses(expr, env);
+        let expr_str: &str = &resolved;
+
         // Check for comparison with function call: compute() == 94
-        if let Some(result) = self.eval_comparison_with_call(expr, env, source_path, func_map)? {
+        if let Some(result) = self.eval_comparison_with_call(expr_str, env, source_path, func_map)? {
             return Ok(Some(result));
         }
 
         // Check for function call: `<name>(...)` — zero-or-more args.
         // Each argument expression is evaluated in the caller's env
         // before being threaded into the callee's param bindings (see
-        // `evaluate_function`).  An argument that fails to evaluate
-        // (None) aborts the call and falls through to the generic
-        // compile path, matching the existing "best-effort, never panic"
-        // discipline.
-        if let Some((call_name, arg_exprs)) = parse_function_call(expr) {
+        // `evaluate_function`).  Arguments may be structured values
+        // (tuple literal, record literal); the result of the call is
+        // projected back to `i64` here for backward compatibility with
+        // the int-only callers (let-binding-as-Int / comparison).
+        // Callers that want the structured result go through
+        // `eval_expr_to_value` directly.
+        if let Some((call_name, arg_exprs)) = parse_function_call(expr_str) {
             if let Some(callee) = func_map.get(&call_name) {
                 let callee = (*callee).clone();
-                let mut arg_vals: Vec<i64> = Vec::with_capacity(arg_exprs.len());
+                let mut arg_vals: Vec<Value> = Vec::with_capacity(arg_exprs.len());
                 let mut all_args_ok = true;
                 for arg_expr in &arg_exprs {
-                    match self.eval_expr_via_uplc(arg_expr, env, source_path, func_map)? {
+                    match self.eval_expr_to_value(arg_expr, env, source_path, func_map)? {
                         Some(v) => arg_vals.push(v),
                         None => {
                             all_args_ok = false;
@@ -787,13 +988,20 @@ impl AikenTracer {
                         false,
                         &arg_vals,
                     )?;
-                    return Ok(result);
+                    return Ok(result.and_then(|v| v.as_i64()));
                 }
             }
         }
 
+        // Build the int-only sub-env that `compile_expr_to_uplc`
+        // expects, projecting structured `Value`s through `as_i64`
+        // (which returns `None` for non-`Int` shapes — they're
+        // simply absent from the UPLC-substitution map, matching the
+        // behaviour of any other unknown identifier).
+        let int_env = value_env_to_i64_map(env);
+
         // Compile the expression to a UPLC term and evaluate via the CEK machine.
-        if let Some(uplc_term) = compile_expr_to_uplc(expr, env) {
+        if let Some(uplc_term) = compile_expr_to_uplc(expr_str, &int_env) {
             match eval_uplc_term(uplc_term) {
                 Ok(result_term) => return Ok(term_to_i64(&result_term)),
                 Err(err) => {
@@ -817,12 +1025,159 @@ impl AikenTracer {
         Ok(None)
     }
 
+    /// Evaluate an Aiken expression to a `Value`, supporting both
+    /// structured shapes (list / tuple / record literals, field
+    /// accesses, calls returning structured values) and the existing
+    /// int-only UPLC-CEK arithmetic pipeline.
+    ///
+    /// Resolution order (first match wins):
+    /// 1. List literal `[a, b, c]` → `Value::List(...)`.
+    /// 2. Record literal `Type { f: v, g: w }` → `Value::Record { ... }`.
+    /// 3. Tuple literal `(a, b[, c...])` (paren-wrapped, 2+ comma-
+    ///    separated elements) → `Value::Tuple(...)`.
+    /// 4. Bare variable reference — read from `env` (preserves
+    ///    structured shape, no UPLC round-trip).
+    /// 5. Field access `<lhs>.<field>` — `Value::Record` or
+    ///    `Value::Tuple` (numeric index) projection.
+    /// 6. Function call `f(args...)` — evaluate args via
+    ///    `eval_expr_to_value`, recurse into `evaluate_function`,
+    ///    return the callee's `Value` result.
+    /// 7. Fallback — delegate to `eval_expr_via_uplc` (the int-only
+    ///    arithmetic / comparison-with-call pipeline) and lift the
+    ///    `i64` result back into a `Value::Int`.
+    fn eval_expr_to_value(
+        &mut self,
+        expr: &str,
+        env: &HashMap<String, Value>,
+        source_path: &Path,
+        func_map: &HashMap<String, &FunctionDef>,
+    ) -> Result<Option<Value>> {
+        let expr = expr.trim();
+        if expr.is_empty() {
+            return Ok(None);
+        }
+
+        // 1. List literal: `[a, b, c]`.
+        if let Some(elems) = parse_list_literal(expr) {
+            let mut out = Vec::with_capacity(elems.len());
+            for e in elems {
+                match self.eval_expr_to_value(&e, env, source_path, func_map)? {
+                    Some(v) => out.push(v),
+                    None => return Ok(None),
+                }
+            }
+            return Ok(Some(Value::List(out)));
+        }
+
+        // 2. Record literal: `Type { f: v, g: w }`.
+        if let Some((type_name, fields)) = parse_record_literal(expr) {
+            let mut out_fields = Vec::with_capacity(fields.len());
+            for (fname, fexpr) in fields {
+                match self.eval_expr_to_value(&fexpr, env, source_path, func_map)? {
+                    Some(v) => out_fields.push((fname, v)),
+                    None => return Ok(None),
+                }
+            }
+            return Ok(Some(Value::Record {
+                type_name,
+                fields: out_fields,
+            }));
+        }
+
+        // 3. Tuple literal: `(a, b[, c...])` — must be paren-wrapped
+        // and contain at least one top-level comma at depth 1.
+        if let Some(elems) = parse_tuple_literal(expr) {
+            let mut out = Vec::with_capacity(elems.len());
+            for e in elems {
+                match self.eval_expr_to_value(&e, env, source_path, func_map)? {
+                    Some(v) => out.push(v),
+                    None => return Ok(None),
+                }
+            }
+            return Ok(Some(Value::Tuple(out)));
+        }
+
+        // 4. Bare variable reference — preserves structured shape.
+        if is_simple_identifier(expr) {
+            if let Some(v) = env.get(expr) {
+                return Ok(Some(v.clone()));
+            }
+            // Fall through to UPLC for unknown identifiers (will
+            // surface as an evaluation error rather than panicking).
+        }
+
+        // 5. Field access: `<lhs>.<field>` — top-level dot, where
+        // `<lhs>` resolves to a `Value::Record` or `Value::Tuple`
+        // and `<field>` is either a field name (Record) or numeric
+        // index (Tuple).
+        if let Some((lhs, field)) = split_top_level_dot(expr) {
+            if let Some(base) =
+                self.eval_expr_to_value(lhs, env, source_path, func_map)?
+            {
+                match (&base, field) {
+                    (Value::Record { fields, .. }, fname) => {
+                        if let Some((_, v)) = fields.iter().find(|(n, _)| n == fname) {
+                            return Ok(Some(v.clone()));
+                        }
+                    }
+                    (Value::Tuple(elements), idx_str) => {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            if let Some(v) = elements.get(idx) {
+                                return Ok(Some(v.clone()));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 6. Function call returning a structured value.  We only
+        // intercept calls whose result is non-Int — Int-returning
+        // calls fall through to the existing `eval_expr_via_uplc`
+        // path so the comparison-with-call shape (`compute() == 94`)
+        // continues to work.
+        if let Some((call_name, arg_exprs)) = parse_function_call(expr) {
+            if let Some(callee) = func_map.get(&call_name) {
+                let callee = (*callee).clone();
+                let mut arg_vals: Vec<Value> = Vec::with_capacity(arg_exprs.len());
+                let mut all_args_ok = true;
+                for arg_expr in &arg_exprs {
+                    match self.eval_expr_to_value(arg_expr, env, source_path, func_map)? {
+                        Some(v) => arg_vals.push(v),
+                        None => {
+                            all_args_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if all_args_ok {
+                    let mut dummy_env = HashMap::new();
+                    let result = self.evaluate_function(
+                        source_path,
+                        &callee,
+                        func_map,
+                        &mut dummy_env,
+                        false,
+                        &arg_vals,
+                    )?;
+                    return Ok(result);
+                }
+            }
+        }
+
+        // 7. Fallback — int-only UPLC-CEK arithmetic.  Lift the
+        // resulting `i64` (if any) back into a `Value::Int`.
+        let result = self.eval_expr_via_uplc(expr, env, source_path, func_map)?;
+        Ok(result.map(Value::Int))
+    }
+
     /// Try to evaluate a comparison expression that may contain function calls.
     /// For example: `compute() == 94`
     fn eval_comparison_with_call(
         &mut self,
         expr: &str,
-        env: &HashMap<String, i64>,
+        env: &HashMap<String, Value>,
         source_path: &Path,
         func_map: &HashMap<String, &FunctionDef>,
     ) -> Result<Option<i64>> {
@@ -866,6 +1221,89 @@ impl AikenTracer {
         }
         Ok(None)
     }
+}
+
+/// Project a structured `Value` env down to the int-only sub-env that
+/// `compile_expr_to_uplc` consumes for variable substitution.  Non-`Int`
+/// values are dropped (they simply won't be found by the UPLC compiler,
+/// matching the historical "unknown identifier → leave the substitution
+/// hole" behaviour).
+fn value_env_to_i64_map(env: &HashMap<String, Value>) -> HashMap<String, i64> {
+    env.iter()
+        .filter_map(|(k, v)| v.as_i64().map(|i| (k.clone(), i)))
+        .collect()
+}
+
+/// Rewrite every `<ident>.<field-or-index>` subterm of `expr` (where
+/// `<ident>` is bound in `env` to a `Value::Record` or `Value::Tuple`)
+/// to the resolved scalar literal text.  Used by `eval_expr_via_uplc`
+/// to bridge the field-access syntax the parser already understands
+/// to the int-only UPLC substitution map that `compile_expr_to_uplc`
+/// expects.
+///
+/// Walks the expression byte-by-byte, identifying maximal runs of
+/// `<ident>.<field>` shape at safe positions (i.e. the head of the
+/// `<ident>` must be at a word boundary).  Only `Int`-valued field
+/// projections are substituted; structured-valued projections stay
+/// in place (they'd just hit the same "unknown identifier" wall
+/// downstream).
+fn resolve_field_accesses(expr: &str, env: &HashMap<String, Value>) -> String {
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let prev = if i == 0 { None } else { Some(bytes[i - 1]) };
+        let at_word_boundary = match prev {
+            None => true,
+            Some(p) => !(p.is_ascii_alphanumeric() || p == b'_' || p == b'.'),
+        };
+        if at_word_boundary && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            let ident_start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            let ident = &expr[ident_start..i];
+            if i < bytes.len() && bytes[i] == b'.' {
+                // `<ident>.<field>` — gather the field run (alnum / _).
+                let field_start = i + 1;
+                let mut j = field_start;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                {
+                    j += 1;
+                }
+                if j > field_start {
+                    let field = &expr[field_start..j];
+                    if let Some(base) = env.get(ident) {
+                        let resolved: Option<i64> = match base {
+                            Value::Record { fields, .. } => fields
+                                .iter()
+                                .find(|(n, _)| n == field)
+                                .and_then(|(_, v)| v.as_i64()),
+                            Value::Tuple(elements) => field
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|idx| elements.get(idx))
+                                .and_then(|v| v.as_i64()),
+                            _ => None,
+                        };
+                        if let Some(n) = resolved {
+                            out.push_str(&n.to_string());
+                            i = j;
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push_str(ident);
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,9 +1686,16 @@ fn parse_function_call(expr: &str) -> Option<(String, Vec<String>)> {
     Some((name.to_string(), args))
 }
 
-/// Split a string on top-level commas (commas at paren depth 0).  Each
-/// element is trimmed; an all-whitespace input yields an empty `Vec`
-/// (the zero-argument call form).
+/// Split a string on top-level commas (commas at depth 0 across all
+/// bracket flavours).  Each element is trimmed; an all-whitespace input
+/// yields an empty `Vec` (the zero-argument call form).
+///
+/// The pre-fix version only tracked `()` depth, which silently mangled
+/// arguments containing nested record literals or list literals, e.g.
+/// `point_distance_sq(Point { x: 3, y: 4 })` was split on the inner `,`
+/// inside the `{}` and decoded as two arguments instead of one.  The
+/// fix tracks `()`, `[]`, and `{}` together so structured literals
+/// nested inside a call are passed through atomically.
 fn split_top_level_commas(s: &str) -> Vec<String> {
     let s = s.trim();
     if s.is_empty() {
@@ -1262,8 +1707,8 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
     let bytes = s.as_bytes();
     for i in 0..bytes.len() {
         match bytes[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
             b',' if depth == 0 => {
                 out.push(s[start..i].trim().to_string());
                 start = i + 1;
@@ -1273,6 +1718,194 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
     }
     out.push(s[start..].trim().to_string());
     out
+}
+
+/// Recognise an identifier (alphanumeric + underscore, starting with
+/// a letter or underscore).  Used by `eval_expr_to_value` to short-
+/// circuit the UPLC round-trip when the expression is a bare variable
+/// reference whose env value is already a `Value` (so structured
+/// shapes survive the lookup instead of being projected to `i64` and
+/// re-lifted to `Value::Int`).
+fn is_simple_identifier(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Recognise a `let (a, b, c) = ...` tuple-destructuring pattern and
+/// return the pattern names.  The pattern must be surrounded by
+/// parens, contain at least one comma, and every element must be a
+/// simple identifier (no nested patterns).
+///
+/// Returns `None` for non-pattern names — the caller falls through to
+/// the regular let-binding path.
+fn parse_tuple_pattern(name: &str) -> Option<Vec<String>> {
+    let name = name.trim();
+    let inner = name.strip_prefix('(')?.strip_suffix(')')?;
+    let parts = split_top_level_commas(inner);
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(parts.len());
+    for p in parts {
+        if !is_simple_identifier(&p) {
+            return None;
+        }
+        out.push(p);
+    }
+    Some(out)
+}
+
+/// Find a top-level `.` separator between a left-hand expression and
+/// a single trailing field name / numeric index.  Used by
+/// `eval_expr_to_value` to recognise field-access expressions like
+/// `p.x` (record field) or `pair.0` (tuple positional access).
+///
+/// Returns `(<lhs>, <field>)` when the input has the shape
+/// `<expr>.<simple-name-or-digits>` at top level (i.e. the dot is at
+/// depth 0 across all bracket flavours).  Returns `None` for
+/// non-matching shapes — including chained accesses (`a.b.c`),
+/// arithmetic with `.` (we don't support floats), or anything where
+/// the field side isn't a simple ident / digit run.
+fn split_top_level_dot(expr: &str) -> Option<(&str, &str)> {
+    let expr = expr.trim();
+    let bytes = expr.as_bytes();
+    let mut depth = 0i32;
+    let mut last_dot: Option<usize> = None;
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'.' if depth == 0 => last_dot = Some(i),
+            _ => {}
+        }
+    }
+    let pos = last_dot?;
+    let lhs = expr[..pos].trim();
+    let field = expr[pos + 1..].trim();
+    if lhs.is_empty() || field.is_empty() {
+        return None;
+    }
+    let valid_field = field.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && field
+            .chars()
+            .next()
+            .map(|c| c.is_alphanumeric() || c == '_')
+            .unwrap_or(false);
+    if !valid_field {
+        return None;
+    }
+    Some((lhs, field))
+}
+
+/// Recognise an Aiken list literal `[expr, expr, ...]` and return the
+/// element-expression strings.  Returns `None` for non-list-shaped
+/// input (no leading `[`, unbalanced brackets, content past the
+/// matching `]`, etc.).
+///
+/// `[]` (empty list) parses as `Some(vec![])` so the recorder can
+/// surface even empty `xs` as `ValueRecord::Sequence { elements: [] }`.
+fn parse_list_literal(expr: &str) -> Option<Vec<String>> {
+    let expr = expr.trim();
+    let inner = expr.strip_prefix('[')?.strip_suffix(']')?;
+    // Make sure the trailing `]` matches the leading `[` at depth 0
+    // — i.e. the whole expression IS the list, not a list followed
+    // by some operator (`[1] ++ [2]`).
+    let bytes = expr.as_bytes();
+    let mut depth = 0i32;
+    for (i, ch) in bytes.iter().enumerate() {
+        match ch {
+            b'[' | b'(' | b'{' => depth += 1,
+            b']' | b')' | b'}' => {
+                depth -= 1;
+                if depth == 0 && i != expr.len() - 1 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    let parts = split_top_level_commas(inner);
+    Some(parts)
+}
+
+/// Recognise an Aiken tuple literal `(a, b[, c...])` and return the
+/// element-expression strings.  Returns `None` for non-tuple shapes
+/// — including unit `()` and parenthesised single expressions `(x)`
+/// (those are NOT tuples in Aiken; only `(a, b)` and longer are).
+fn parse_tuple_literal(expr: &str) -> Option<Vec<String>> {
+    let expr = expr.trim();
+    let inner = expr.strip_prefix('(')?.strip_suffix(')')?;
+    // Top-level paren match: the trailing `)` must close the
+    // leading `(` at depth 0, with nothing past it.
+    let bytes = expr.as_bytes();
+    let mut depth = 0i32;
+    for (i, ch) in bytes.iter().enumerate() {
+        match ch {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 && i != expr.len() - 1 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    let parts = split_top_level_commas(inner);
+    if parts.len() < 2 {
+        return None;
+    }
+    Some(parts)
+}
+
+/// Recognise an Aiken record literal `Type { field: value, ... }` and
+/// return the type name plus a `Vec<(field_name, value_expr)>`.
+///
+/// The type name must be a simple identifier starting with an upper-
+/// case letter (Aiken convention).  Each field entry must have the
+/// shape `<simple-ident>: <expr>` separated by top-level commas.
+/// Returns `None` for non-record-shaped input.
+fn parse_record_literal(expr: &str) -> Option<(String, Vec<(String, String)>)> {
+    let expr = expr.trim();
+    let brace_open = expr.find('{')?;
+    if !expr.ends_with('}') {
+        return None;
+    }
+    let type_name = expr[..brace_open].trim().to_string();
+    if type_name.is_empty() || !is_simple_identifier(&type_name) {
+        return None;
+    }
+    let first = type_name.chars().next().unwrap();
+    if !first.is_uppercase() {
+        return None;
+    }
+    let inner = &expr[brace_open + 1..expr.len() - 1];
+    let parts = split_top_level_commas(inner);
+    let mut out = Vec::with_capacity(parts.len());
+    for p in parts {
+        let colon = p.find(':')?;
+        let fname = p[..colon].trim().to_string();
+        let fexpr = p[colon + 1..].trim().to_string();
+        if fname.is_empty() || fexpr.is_empty() || !is_simple_identifier(&fname) {
+            return None;
+        }
+        out.push((fname, fexpr));
+    }
+    Some((type_name, out))
 }
 
 #[cfg(test)]

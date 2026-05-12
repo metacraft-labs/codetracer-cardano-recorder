@@ -657,16 +657,20 @@ fn test_control_flow_test_via_ct_print_full() {
     //   1 outer  (the implicit start-of-trace step at line 1)
     //   1 dispatch (`compute() == 602` in the test body)
     //   6 in compute (5 let-bindings + 1 trailing `result` expr)
+    //   1 param-intro step in classify (binds `n=7`, emitted at the
+    //                  function's signature line so the value lands
+    //                  in the variable stream)
     //   6 in classify (`if n < 0 {`, `-1`, `} else if n == 0 {`, `0`,
     //                  `} else {`, `1` — the hand-rolled parser
     //                  treats each non-`}` body line as its own
     //                  Statement::Expr, "last evaluable line wins"
     //                  for the function's return value)
+    //   1 param-intro step in pick (binds `tag=1`)
     //   4 in pick (`when tag is {` + three arms recognised by the new
     //              `find_top_level_arrow` helper)
-    //   = 18 steps total.
+    //   = 20 steps total.
     let counts = &doc["counts"];
-    assert_eq!(counts["steps"].as_u64(), Some(18), "steps; counts={counts}");
+    assert_eq!(counts["steps"].as_u64(), Some(20), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
@@ -675,13 +679,13 @@ fn test_control_flow_test_via_ct_print_full() {
     );
     assert_eq!(
         counts["values"].as_u64(),
-        Some(18),
+        Some(20),
         "values; counts={counts}"
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 18 steps + 3 call_entry + 3 call_exit = 24 events.
-    assert_eq!(events.len(), 24, "events.len()");
+    // 20 steps + 3 call_entry + 3 call_exit = 26 events.
+    assert_eq!(events.len(), 26, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
@@ -697,9 +701,12 @@ fn test_control_flow_test_via_ct_print_full() {
     );
 
     // ----- Decoded variable values ------------------------------------
-    // All five let-bindings now surface as decoded Ints:
+    // All five let-bindings plus the two callees' parameters now
+    // surface as decoded Ints:
     //   raw=7 (literal)
+    //   n=7 (classify's param-intro step — bound from `raw`)
     //   sign=classify(7)=1 (last-evaluable-line == else-branch literal)
+    //   tag=1 (pick's param-intro step — bound from `sign`)
     //   bonus=pick(1)=300 (last `when` arm value)
     //   combined=sign+bonus=301
     //   result=combined*2=602
@@ -707,7 +714,9 @@ fn test_control_flow_test_via_ct_print_full() {
         observed_var_sequence(&doc),
         vec![
             ("raw".to_string(), 7),
+            ("n".to_string(), 7),
             ("sign".to_string(), 1),
+            ("tag".to_string(), 1),
             ("bonus".to_string(), 300),
             ("combined".to_string(), 301),
             ("result".to_string(), 602),
@@ -722,9 +731,17 @@ fn test_control_flow_test_full_chain_decodes() {
     else {
         return;
     };
+    // Each non-test function with parameters now emits a
+    // param-intro step that binds the formal-parameter names so
+    // their values appear in the variable stream (rather than
+    // only being threaded through arithmetic).  For
+    // `control_flow_test.ak` this surfaces `n=7` after `raw=7`
+    // (classify(7)) and `tag=1` after `sign=1` (pick(1)).
     let expected: Vec<(String, i64)> = vec![
         ("raw".into(), 7),
+        ("n".into(), 7),
         ("sign".into(), 1),
+        ("tag".into(), 1),
         ("bonus".into(), 300),
         ("combined".into(), 301),
         ("result".into(), 602),
@@ -834,13 +851,16 @@ fn test_nested_calls_test_via_ct_print_full() {
 
 // --- collections_test.ak ---------------------------------------------------
 
-/// Records `collections_test.ak` and asserts on the present-day
-/// shape.  RECORDER BUG: collection literals (lists, tuples,
-/// records) are completely opaque to the recorder.  Function calls
-/// with arguments (`sum_pair((10, 20))`, `point_distance_sq(...)`)
-/// are not parsed as calls.  The only call that lands is
-/// `list_total()` (zero arguments), and the only decoded values are
-/// the Int let-bindings inside it.
+/// Records `collections_test.ak` and pins the full event shape now
+/// that the recorder decodes Aiken's structured literals.  The
+/// recorder lifts list literals (`[1, 2, 3, 4]`) into
+/// `ValueRecord::Sequence`, tuple literals (`(10, 20)`) into
+/// `ValueRecord::Tuple`, and record literals (`Point { x: 3, y: 4 }`)
+/// into `ValueRecord::Struct`, threads them through argumentful
+/// function calls (`sum_pair`, `point_distance_sq`), supports tuple
+/// destructuring (`let (a, b) = p`) and record-field access
+/// (`p.x * p.x`), and computes the same scalar result as the on-chain
+/// program (`compute() == 60`).
 #[test]
 fn test_collections_test_via_ct_print_full() {
     let Some((doc, source_path)) =
@@ -857,51 +877,167 @@ fn test_collections_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    // RECORDER BUG: spec wants {collections, compute, sum_pair,
-    // point_distance_sq, list_total} — argumentful calls are dropped.
-    assert_eq!(functions, vec!["collections", "compute", "list_total"]);
+    assert_eq!(
+        functions,
+        vec!["collections", "compute", "sum_pair", "point_distance_sq", "list_total"],
+        "function table must include the full chain — `sum_pair` and \
+         `point_distance_sq` are called with structured arguments which \
+         the recorder now parses end-to-end",
+    );
 
     let counts = &doc["counts"];
-    assert_eq!(counts["steps"].as_u64(), Some(11), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(counts["steps"].as_u64(), Some(16), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
         "io_events; counts={counts}"
     );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(16),
+        "values; counts={counts}"
+    );
 
     let events = doc["events"].as_array().expect("events array");
-    // 11 step events + 2 call_entry + 2 call_exit = 15 events.
-    assert_eq!(events.len(), 15, "events.len()");
+    // 16 step events + 4 call_entry + 4 call_exit = 24 events.
+    assert_eq!(events.len(), 24, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["compute".to_string(), "list_total".to_string()],
+        vec![
+            "compute".to_string(),
+            "sum_pair".to_string(),
+            "point_distance_sq".to_string(),
+            "list_total".to_string(),
+        ],
     );
 
-    // RECORDER BUG: a spec-compliant trace would expose ValueRecord
-    // variants for List/Sequence (xs = [1,2,3,4]), Tuple ((10,20),
-    // and Struct (Point{x:3,y:4}).  Today the recorder emits only
-    // Int values, and only for the integer let-bindings inside the
-    // zero-arg `list_total` callee + the scalar passthrough in
-    // compute().
+    // ----- Structured variable shapes ---------------------------------
+    // Walk the step events in emission order and pin the (name,
+    // ValueRecord::kind) pair for every variable.  This is stricter
+    // than `observed_int_vars` (which only accepts Int) because the
+    // collections fixture deliberately exercises Sequence / Tuple /
+    // Struct shapes that must NOT silently downgrade to Int.
+    let var_sequence: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    (
+                        v["varname"].as_str().expect("varname").to_string(),
+                        v["value"]["kind"].as_str().expect("value.kind").to_string(),
+                    )
+                })
+        })
+        .collect();
     assert_eq!(
-        observed_var_sequence(&doc),
+        var_sequence,
         vec![
-            ("head_val".into(), 1),
-            ("len".into(), 4),
-            ("list_total_val".into(), 5),
+            // sum_pair: param `p` is the (10,20) tuple, then
+            // destructured into `a=10`, `b=20`.
+            ("p".into(), "Tuple".into()),
+            ("a".into(), "Int".into()),
+            ("b".into(), "Int".into()),
+            // back in compute: sum_pair returned 30.
+            ("pair_total".into(), "Int".into()),
+            // point_distance_sq: param `p` is the Point struct.
+            ("p".into(), "Struct".into()),
+            // back in compute: point_distance_sq returned 3*3+4*4=25.
+            ("pt_total".into(), "Int".into()),
+            // list_total: `xs` is the list literal Sequence.
+            ("xs".into(), "Sequence".into()),
+            ("head_val".into(), "Int".into()),
+            ("len".into(), "Int".into()),
+            // back in compute: list_total returned 1+4=5.
+            ("list_total_val".into(), "Int".into()),
+            // compute's final binding before its trailing expression.
+            ("grand_total".into(), "Int".into()),
         ],
+    );
+
+    // ----- Spot-check the structured payloads --------------------------
+    let p_tuple_value = find_var_value(&doc, "p", "Tuple");
+    let elems = p_tuple_value["elements"]
+        .as_array()
+        .expect("Tuple elements array");
+    let int_at = |i: usize| {
+        assert_eq!(elems[i]["kind"].as_str(), Some("Int"));
+        elems[i]["i"].as_i64().expect("Int.i")
+    };
+    assert_eq!(int_at(0), 10);
+    assert_eq!(int_at(1), 20);
+
+    let p_struct_value = find_var_value(&doc, "p", "Struct");
+    let fields = p_struct_value["field_values"]
+        .as_array()
+        .expect("Struct field_values array");
+    let f_int_at = |i: usize| {
+        assert_eq!(fields[i]["kind"].as_str(), Some("Int"));
+        fields[i]["i"].as_i64().expect("Int.i")
+    };
+    assert_eq!(f_int_at(0), 3);
+    assert_eq!(f_int_at(1), 4);
+
+    let xs_sequence = find_var_value(&doc, "xs", "Sequence");
+    let xs_elems = xs_sequence["elements"]
+        .as_array()
+        .expect("Sequence elements array");
+    let xs_int_at = |i: usize| {
+        assert_eq!(xs_elems[i]["kind"].as_str(), Some("Int"));
+        xs_elems[i]["i"].as_i64().expect("Int.i")
+    };
+    assert_eq!(xs_int_at(0), 1);
+    assert_eq!(xs_int_at(1), 2);
+    assert_eq!(xs_int_at(2), 3);
+    assert_eq!(xs_int_at(3), 4);
+    assert_eq!(
+        xs_sequence["is_slice"].as_bool(),
+        Some(false),
+        "list literals are NOT slices; the recorder must emit \
+         is_slice=false to distinguish them from sliced borrows",
+    );
+
+    // ----- Final scalar invariant -------------------------------------
+    // The on-chain test asserts `compute() == 60`.  The trace's
+    // last Int variable in compute() is `grand_total = pair_total
+    // (30) + pt_total (25) + list_total_val (5) = 60`.
+    let grand = find_var_value(&doc, "grand_total", "Int");
+    assert_eq!(grand["i"].as_i64(), Some(60));
+}
+
+/// Locate the first `vars[].value` entry in the trace whose
+/// `varname` matches `name` and whose `value.kind` matches
+/// `expected_kind`.  Panics with a precise message if no such
+/// entry exists — that's by design: callers use this to pin a
+/// specific shape, and a missing entry is a real recorder
+/// regression.
+fn find_var_value(doc: &serde_json::Value, name: &str, expected_kind: &str) -> serde_json::Value {
+    for ev in doc["events"].as_array().expect("events array") {
+        if ev["kind"] != "step" {
+            continue;
+        }
+        for v in ev["vars"].as_array().cloned().unwrap_or_default() {
+            if v["varname"].as_str() == Some(name)
+                && v["value"]["kind"].as_str() == Some(expected_kind)
+            {
+                return v["value"].clone();
+            }
+        }
+    }
+    panic!(
+        "expected a `{name}` variable with value.kind == {expected_kind:?} \
+         in the trace; got none"
     );
 }
 
 #[test]
-#[ignore = "RECORDER BUG: list/tuple/record literals are not encoded \
-            as ValueRecord::Sequence / Tuple / Struct; argumentful \
-            function calls are not traced.  Spec-compliant output \
-            should surface xs as Sequence, the (10,20) pair as Tuple, \
-            and Point{x:3,y:4} as Struct."]
 fn test_collections_test_value_kinds_present() {
     let Some((doc, _)) =
         record_and_dump_full("test_collections_test_value_kinds_present", "collections_test.ak")
