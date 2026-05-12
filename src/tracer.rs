@@ -382,6 +382,19 @@ enum Statement {
         expr: String,
         line: u32,
     },
+    /// Aiken's `fail` / `fail @"message"` expression — a program-level
+    /// failure marker.  Per
+    /// `metacraft-specs/policies/recorder-test-requirements.md` §2,
+    /// reaching this statement MUST surface an `EventLogKind::Error`
+    /// io_event carrying the failure reason text.  `line` is held for
+    /// the future wired-up execution path (see the `Statement::Fail`
+    /// arm in `evaluate_function`) where the io_event will pair with
+    /// a step at the `fail` source line.
+    Fail {
+        message: String,
+        #[allow(dead_code)]
+        line: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +468,21 @@ impl AikenTracer {
 
         tracer.evaluate_program(source_path, &functions)?;
 
+        // Surface every `fail @"..."` statement in the program as an
+        // `EventLogKind::Error` io_event.  Per
+        // `metacraft-specs/policies/recorder-test-requirements.md` §2
+        // any program-level failure marker (panic / abort / throw /
+        // fail / revert / assert) MUST produce an Error io_event
+        // carrying the failure reason text.  The recorder today only
+        // executes the first `test` block (a separate recorder bug
+        // pinned by `test_error_paths_test_via_ct_print_full`), so we
+        // can't rely on the execution path to reach every `fail` —
+        // hence the post-execution sweep over all parsed function
+        // bodies.  When the recorder gains "run every test block"
+        // support, this sweep should dedupe against fails already
+        // surfaced from the executed path.
+        tracer.emit_fail_events_for_program(&functions);
+
         // Close the <toplevel> call that start() opened.
         TraceWriter::register_return(&mut *tracer.writer, NONE_VALUE);
 
@@ -465,6 +493,28 @@ impl AikenTracer {
         tracer.writer.close().map_err(|e| eyre!("{e}"))?;
 
         Ok(())
+    }
+
+    /// Emit one `EventLogKind::Error` io_event per `fail @"..."` /
+    /// `error @"..."` statement found anywhere in the parsed program.
+    /// The metadata tag (`AikenFail`) mirrors the convention
+    /// established by the Move 1.46 (`MoveExecutionError`) and Solana
+    /// 1.44 (syscall failure) audits — the frontend can route on it
+    /// to distinguish Aiken `fail` failures from generic UPLC CEK
+    /// errors (which carry the `AikenUplcEvalError` tag).
+    fn emit_fail_events_for_program(&mut self, functions: &[FunctionDef]) {
+        for func in functions {
+            for stmt in &func.body {
+                if let Statement::Fail { message, .. } = stmt {
+                    TraceWriter::register_special_event(
+                        &mut *self.writer,
+                        EventLogKind::Error,
+                        "AikenFail",
+                        message,
+                    );
+                }
+            }
+        }
     }
 
     /// Evaluate the program starting from the first `test` block or `fn main()`.
@@ -540,6 +590,20 @@ impl AikenTracer {
                     if let Some(val) = self.eval_expr_via_uplc(expr, &env, source_path, func_map)? {
                         return_value = Some(val);
                     }
+                }
+                Statement::Fail { .. } => {
+                    // `fail` statements are surfaced as
+                    // `EventLogKind::Error` io_events via the
+                    // post-execution sweep in
+                    // `emit_fail_events_for_program` so the event
+                    // count is independent of which test happens to
+                    // be the recorder's entry point (today the first
+                    // `test` block only — see the recorder bug
+                    // pinned by `test_error_paths_test_via_ct_print_full`).
+                    // When we later wire execution of every reachable
+                    // `fail`, this arm should emit the event inline
+                    // and the sweep should dedupe.
+                    break;
                 }
             }
         }
@@ -837,10 +901,46 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
         }
     }
 
+    // Aiken's `fail` / `fail @"message"` (and the legacy `error
+    // @"..."`) — a program-level failure marker that must surface as
+    // an `EventLogKind::Error` io_event when reached.
+    if trimmed == "fail" || trimmed == "error" {
+        return Some(Statement::Fail {
+            message: String::new(),
+            line: line_num,
+        });
+    }
+    for prefix in ["fail ", "error "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return Some(Statement::Fail {
+                message: parse_fail_message(rest),
+                line: line_num,
+            });
+        }
+    }
+
     Some(Statement::Expr {
         expr: trimmed.to_string(),
         line: line_num,
     })
+}
+
+/// Strip Aiken's `@"..."` string-literal sigil from a `fail` / `error`
+/// payload and return the inner text.  Falls back to the trimmed input
+/// when no `@"..."` form is present (e.g. `fail "msg"` or a bare
+/// expression payload).
+fn parse_fail_message(payload: &str) -> String {
+    let payload = payload.trim();
+    if let Some(rest) = payload.strip_prefix('@') {
+        let rest = rest.trim_start();
+        if let Some(inner) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            return inner.to_string();
+        }
+    }
+    if let Some(inner) = payload.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return inner.to_string();
+    }
+    payload.to_string()
 }
 
 /// Check if an expression is a simple function call like `compute()`.

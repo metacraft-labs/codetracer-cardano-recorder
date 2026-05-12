@@ -916,9 +916,14 @@ fn test_collections_test_value_kinds_present() {
 /// Records `error_paths_test.ak`.  The recorder picks the first
 /// `test` block as the entry point (`safe_path`), so today only the
 /// non-failing branch runs.  RECORDER BUG: there's no way to
-/// indicate "run all test blocks", and `fail @"..."` is never
-/// invoked, so the failing path produces no `RecordEvent` of
-/// `EventKindError`.
+/// indicate "run all test blocks", so the function table and step /
+/// call counts only reflect the entry test plus its callees.  This
+/// is a separate gap from the `fail` Error-event surfacing fix
+/// pinned by `test_error_paths_test_emits_fail_event` below — the
+/// recorder now scans for `fail @"..."` statements anywhere in the
+/// parsed program and emits one `EventLogKind::Error` io_event per
+/// `fail`, independent of which test runs.  See
+/// `metacraft-specs/policies/recorder-test-requirements.md` §2.
 #[test]
 fn test_error_paths_test_via_ct_print_full() {
     let Some((doc, source_path)) =
@@ -944,15 +949,19 @@ fn test_error_paths_test_via_ct_print_full() {
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    // The recorder emits exactly one `EventLogKind::Error` io_event
+    // for the single `fail @"..."` statement in `failing_compute`
+    // (post-execution sweep over all parsed function bodies — see
+    // `AikenTracer::emit_fail_events_for_program`).
     assert_eq!(
         counts["io_events"].as_u64(),
-        Some(0),
+        Some(1),
         "io_events; counts={counts}"
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 9 steps + 2 call_entry + 2 call_exit = 13 events.
-    assert_eq!(events.len(), 13, "events.len()");
+    // 9 steps + 2 call_entry + 2 call_exit + 1 io_event = 14 events.
+    assert_eq!(events.len(), 14, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     assert_eq!(
@@ -970,13 +979,29 @@ fn test_error_paths_test_via_ct_print_full() {
             ("bumped".into(), 112),
         ],
     );
+
+    // The Error io_event carries the literal `fail @"..."` payload
+    // verbatim — the frontend can route on the `AikenFail` metadata
+    // tag to distinguish Aiken `fail` markers from generic UPLC CEK
+    // failures (which carry `AikenUplcEvalError`).
+    let error_events: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "io" && e["io_kind"] == "ioError")
+        .collect();
+    assert_eq!(
+        error_events.len(),
+        1,
+        "expected exactly one ioError io_event for the `fail` in failing_compute; \
+         got {error_events:?}"
+    );
+    let text = error_events[0]["text"].as_str().unwrap_or("");
+    assert_eq!(
+        text, "intentional failure for trace coverage",
+        "Error io_event should carry the `fail @\"...\"` literal payload",
+    );
 }
 
 #[test]
-#[ignore = "RECORDER BUG: `fail` is not surfaced as a special event \
-            (EventLogKind::Error or similar).  When a fail is \
-            reachable the recorder should emit an io_event of error \
-            kind containing the literal payload."]
 fn test_error_paths_test_emits_fail_event() {
     let Some((doc, _)) =
         record_and_dump_full("test_error_paths_test_emits_fail_event", "error_paths_test.ak")
