@@ -388,6 +388,17 @@ enum Value {
         type_name: String,
         fields: Vec<(String, Value)>,
     },
+    /// Aiken variant / sum-type constructor — emitted as
+    /// `ValueRecord::Variant`.  `discriminator` is the constructor
+    /// name (`Some`, `None`, `Ok`, `Error`, or a user-defined
+    /// variant); `fields` carries any payload (positional or named).
+    /// For nullary variants like `None`, `fields` is empty.  See
+    /// `variant_constructors_test.ak` for the canonical exercise.
+    Variant {
+        type_name: String,
+        discriminator: String,
+        fields: Vec<(String, Value)>,
+    },
 }
 
 impl Value {
@@ -452,6 +463,19 @@ enum Statement {
         label: String,
         value: String,
         #[allow(dead_code)]
+        line: u32,
+    },
+    /// A single `when` arm — `<pattern> -> <expr>`.  Distinguished
+    /// from `Statement::Expr` so the evaluator can match the arm
+    /// pattern against the scrutinee value from the immediately
+    /// preceding `when <scrutinee> is {` line.  Recognised patterns
+    /// today: integer literals (`0 -> ...`), the wildcard `_`, and
+    /// constructor patterns like `Some(x)` / `None` (the constructor
+    /// name is matched; field-binding is not yet wired through —
+    /// pinned by `pattern_match_test.ak`).
+    WhenArm {
+        pattern: String,
+        expr: String,
         line: u32,
     },
 }
@@ -727,6 +751,49 @@ impl AikenTracer {
                     type_id,
                 }
             }
+            Value::Variant {
+                type_name,
+                discriminator,
+                fields,
+            } => {
+                // Encode the variant payload as a `Struct` of its
+                // field values so the on-wire shape carries the
+                // constructor's positional / named data inside the
+                // `contents` slot of `ValueRecord::Variant`.  Nullary
+                // variants (`None`, `Burn`, etc.) get an empty
+                // `Struct`.  The discriminator is the constructor
+                // name; the outer `type_id` points at the sum type
+                // (registered as `TypeKind::Variant`).
+                let field_values: Vec<ValueRecord> = fields
+                    .iter()
+                    .map(|(_n, v)| self.value_to_record(v))
+                    .collect();
+                let inner_type_id = self
+                    .type_ids
+                    .get("Tuple")
+                    .copied()
+                    .unwrap_or(TypeId(0));
+                let contents = ValueRecord::Struct {
+                    field_values,
+                    type_id: inner_type_id,
+                };
+                let type_id = if let Some(id) = self.type_ids.get(type_name).copied() {
+                    id
+                } else {
+                    let id = TraceWriter::ensure_type_id(
+                        &mut *self.writer,
+                        TypeKind::Variant,
+                        type_name,
+                    );
+                    self.type_ids.insert(type_name.clone(), id);
+                    id
+                };
+                ValueRecord::Variant {
+                    discriminator: discriminator.clone(),
+                    contents: Box::new(contents),
+                    type_id,
+                }
+            }
         }
     }
 
@@ -802,8 +869,28 @@ impl AikenTracer {
             }
         }
         let mut return_value: Option<Value> = None;
+        // Tracks the scrutinee `Value` of the most recently opened
+        // `when <scrutinee> is {` block.  `None` means we're not
+        // inside a when block (or the scrutinee couldn't be resolved,
+        // in which case we fall back to the legacy "last arm wins"
+        // behaviour).  Reset whenever we leave a when block (i.e.
+        // hit a statement that isn't a `WhenArm`).
+        let mut when_scrutinee: Option<Value> = None;
+        // `Some(true)` once an arm in the current when block has
+        // matched and contributed to `return_value`; subsequent arms
+        // in the same block must not overwrite it.  `Some(false)`
+        // means we're in a block but no arm has matched yet.  `None`
+        // means we're not in a block.
+        let mut when_matched: Option<bool> = None;
 
         for stmt in &func.body {
+            // Track when-block context.  Leaving a contiguous run of
+            // `WhenArm` statements ends the block.
+            if !matches!(stmt, Statement::WhenArm { .. }) {
+                when_scrutinee = None;
+                when_matched = None;
+            }
+
             match stmt {
                 Statement::LetBinding { name, expr, line } => {
                     TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
@@ -858,10 +945,62 @@ impl AikenTracer {
                 Statement::Expr { expr, line } => {
                     TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
+                    // Detect a `when <scrutinee> is {` opener so the
+                    // following contiguous run of `WhenArm`s can be
+                    // matched against the scrutinee's value.  We
+                    // resolve the scrutinee in the current env; if
+                    // resolution fails, we leave `when_scrutinee`
+                    // as `None` and the arms fall back to the legacy
+                    // "last arm wins" behaviour.
+                    if let Some(scrutinee_expr) = parse_when_opener(expr) {
+                        when_scrutinee = self
+                            .eval_expr_to_value(scrutinee_expr, &env, source_path, func_map)?;
+                        when_matched = Some(false);
+                        continue;
+                    }
+
                     if let Some(val) =
                         self.eval_expr_to_value(expr, &env, source_path, func_map)?
                     {
                         return_value = Some(val);
+                    }
+                }
+                Statement::WhenArm { pattern, expr, line } => {
+                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
+
+                    // If we have a scrutinee value, evaluate the arm
+                    // only when the pattern matches.  Once one arm
+                    // matches, subsequent arms in the same block
+                    // don't contribute to `return_value`.
+                    let should_eval = match (&when_scrutinee, when_matched) {
+                        (Some(scrut), Some(false)) => {
+                            // Try literal-integer match, wildcard,
+                            // identifier-binding match, or
+                            // constructor-name match.  Returns true
+                            // when the pattern matches and binds any
+                            // captured identifiers into the local env.
+                            let matched =
+                                match_pattern_against_value(pattern, scrut, &mut env);
+                            if matched {
+                                when_matched = Some(true);
+                            }
+                            matched
+                        }
+                        (None, _) => {
+                            // No scrutinee — legacy "last arm wins"
+                            // behaviour.  Always evaluate, last
+                            // assignment to `return_value` sticks.
+                            true
+                        }
+                        _ => false,
+                    };
+
+                    if should_eval {
+                        if let Some(val) =
+                            self.eval_expr_to_value(expr, &env, source_path, func_map)?
+                        {
+                            return_value = Some(val);
+                        }
                     }
                 }
                 Statement::Fail { .. } => {
@@ -936,6 +1075,14 @@ impl AikenTracer {
         let expr = expr.trim();
         if expr.is_empty() {
             return Ok(None);
+        }
+
+        // Pipe-operator desugaring — same shape as in
+        // `eval_expr_to_value`.  Needed here so e.g.
+        // `compute() == 34` (where the int-path runs) still folds
+        // any embedded `x |> f` before further parsing.
+        if let Some(rewritten) = desugar_pipe_lhs(expr) {
+            return self.eval_expr_via_uplc(&rewritten, env, source_path, func_map);
         }
 
         // Field-access pre-pass: rewrite every `<ident>.<field>`
@@ -1057,6 +1204,17 @@ impl AikenTracer {
             return Ok(None);
         }
 
+        // 0. Pipe-operator desugaring: `x |> f(args)` → `f(x, args)`.
+        // Handle the leftmost top-level `|>` so chained pipes
+        // (`a |> f(b) |> g(c)`) desugar left-associatively into
+        // `g(f(a, b), c)` after repeated rewrites.  Real Aiken code
+        // pivots heavily on `|>` (see the gift_card example), so
+        // surfacing each stage is essential for the
+        // pipe_operator_test fixture.
+        if let Some(rewritten) = desugar_pipe_lhs(expr) {
+            return self.eval_expr_to_value(&rewritten, env, source_path, func_map);
+        }
+
         // 1. List literal: `[a, b, c]`.
         if let Some(elems) = parse_list_literal(expr) {
             let mut out = Vec::with_capacity(elems.len());
@@ -1129,6 +1287,48 @@ impl AikenTracer {
                     }
                     _ => {}
                 }
+            }
+        }
+
+        // 5b. Variant constructor `Some(x)` / `None` / `Ok(v)` /
+        // `Error(e)` / user-defined `Pending` / `Active(n)`.  We
+        // distinguish a variant constructor from a function call by
+        // the leading uppercase letter (Aiken convention: types and
+        // constructors are PascalCase, functions are snake_case).
+        // Nullary variants are simple identifiers (handled in case 4
+        // for `None` / `Pending`, but those identifiers would clash
+        // with env lookups — so we handle the uppercase-bare case
+        // here too).  We emit `Value::Variant { type_name: <name>,
+        // discriminator: <name>, fields }`; the per-sum-type name
+        // resolution (e.g. `Option` for `Some` / `None`) happens at
+        // ct-print time off the type_id table.
+        if is_simple_identifier(expr) {
+            let first = expr.chars().next().unwrap();
+            if first.is_uppercase() && env.get(expr).is_none() {
+                return Ok(Some(Value::Variant {
+                    type_name: expr.to_string(),
+                    discriminator: expr.to_string(),
+                    fields: vec![],
+                }));
+            }
+        }
+        if let Some((ctor_name, arg_exprs)) = parse_function_call(expr) {
+            let first = ctor_name.chars().next().unwrap_or('a');
+            if first.is_uppercase() && !func_map.contains_key(&ctor_name) {
+                let mut field_vals: Vec<(String, Value)> =
+                    Vec::with_capacity(arg_exprs.len());
+                for (idx, arg) in arg_exprs.iter().enumerate() {
+                    if let Some(v) = self.eval_expr_to_value(arg, env, source_path, func_map)? {
+                        field_vals.push((format!("{idx}"), v));
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                return Ok(Some(Value::Variant {
+                    type_name: ctor_name.clone(),
+                    discriminator: ctor_name,
+                    fields: field_vals,
+                }));
             }
         }
 
@@ -1310,20 +1510,92 @@ fn resolve_field_accesses(expr: &str, env: &HashMap<String, Value>) -> String {
 // Aiken source parser helpers
 // ---------------------------------------------------------------------------
 
-/// Parse function definitions (`fn`) and test blocks (`test`) from Aiken source.
+/// Aiken `validator` entry-point keywords.  When we're inside a
+/// `validator <name> { ... }` block, lines starting with one of
+/// these followed by `(` are treated as function definitions
+/// (they're the validator's handler functions).  `else` is the
+/// fallback handler (Aiken catch-all when no other entry matches).
+const VALIDATOR_ENTRY_KEYWORDS: &[&str] = &[
+    "spend", "mint", "withdraw", "publish", "vote", "propose", "else",
+];
+
+/// Recognise whether a (trimmed) line opens a validator entry-point
+/// function — `spend(...)`, `mint(...)`, etc.  Returns the rest of
+/// the line after the keyword (including the opening `(`) so the
+/// caller can reuse the existing fn-parse machinery.
+fn try_validator_entry(trimmed: &str) -> Option<&str> {
+    for kw in VALIDATOR_ENTRY_KEYWORDS {
+        if let Some(rest) = trimmed.strip_prefix(kw) {
+            // Must be immediately followed by `(` to count.
+            if rest.starts_with('(') {
+                // The downstream parser expects `<name>(args)` shape;
+                // we return the WHOLE trimmed line (which already has
+                // `<keyword>(args)` shape) so its name/params/return
+                // type extraction works unchanged.
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
+/// Parse function definitions (`fn`), test blocks (`test`), and
+/// validator entry points (`spend(...)`, `mint(...)`, etc. inside
+/// `validator <name> { ... }`) from Aiken source.
 fn parse_functions(source: &str) -> Vec<FunctionDef> {
     let mut functions = Vec::new();
     let lines: Vec<&str> = source.lines().collect();
     let mut i = 0;
+    // True while we're inside a `validator <name> { ... }` outer
+    // block.  Cleared when the matching closing brace is found.
+    let mut in_validator = false;
+    let mut validator_brace_depth = 0i32;
 
     while i < lines.len() {
         let trimmed = lines[i].trim();
         let line_num = (i + 1) as u32;
 
+        // Track validator-block enter/exit.  We do this BEFORE the
+        // fn/test-prefix check so a `validator gift_card {` opener
+        // line doesn't get mistaken for a free-floating identifier.
+        //
+        // Brace counting is per-outer-line only: the function-body
+        // parser below consumes lines through to its own closing
+        // brace, so we only see lines BETWEEN entry-point function
+        // definitions here (typically blank lines or the
+        // validator's own closing `}` line).  A bare `}` line at
+        // outer scope closes the validator.
+        if !in_validator {
+            if let Some(rest) = trimmed.strip_prefix("validator ") {
+                if rest.contains('{') {
+                    in_validator = true;
+                    validator_brace_depth = 1;
+                    i += 1;
+                    continue;
+                }
+            }
+        } else if trimmed == "}" {
+            validator_brace_depth -= 1;
+            if validator_brace_depth <= 0 {
+                in_validator = false;
+            }
+            i += 1;
+            continue;
+        }
+
         let (is_test, after_keyword) = if let Some(rest) = trimmed.strip_prefix("fn ") {
             (false, rest)
         } else if let Some(rest) = trimmed.strip_prefix("test ") {
             (true, rest)
+        } else if in_validator {
+            // Inside a validator block, look for entry-point fn-shaped
+            // lines like `spend(args) -> Int {`.
+            if let Some(entry) = try_validator_entry(trimmed) {
+                (false, entry)
+            } else {
+                i += 1;
+                continue;
+            }
         } else {
             i += 1;
             continue;
@@ -1520,7 +1792,8 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
         let lhs = trimmed[..arrow_pos].trim();
         let rhs = trimmed[arrow_pos + 2..].trim();
         if !lhs.is_empty() && !rhs.is_empty() && !lhs.starts_with("fn ") {
-            return Some(Statement::Expr {
+            return Some(Statement::WhenArm {
+                pattern: lhs.to_string(),
                 expr: rhs.to_string(),
                 line: line_num,
             });
@@ -1531,6 +1804,221 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
         expr: trimmed.to_string(),
         line: line_num,
     })
+}
+
+/// Desugar a top-level `|>` pipe.  If `expr` contains a top-level
+/// `|>` operator, return `Some(rewritten)` where the leftmost stage
+/// has been folded into the next stage's argument list:
+///
+/// * `x |> f` → `f(x)` (bare-name stage, no argument list yet)
+/// * `x |> f(y)` → `f(x, y)` (single-arg stage)
+/// * `x |> f(y, z)` → `f(x, y, z)`
+///
+/// Chained pipes (`a |> f(b) |> g(c)`) are rewritten in left-to-
+/// right order by repeated application — the caller is expected
+/// to re-invoke this function recursively on the result.
+///
+/// Returns `None` when no top-level `|>` is present.
+fn desugar_pipe_lhs(expr: &str) -> Option<String> {
+    let pos = find_top_level_pipe(expr)?;
+    let lhs = expr[..pos].trim();
+    let rhs = expr[pos + 2..].trim();
+    if lhs.is_empty() || rhs.is_empty() {
+        return None;
+    }
+    // Find the START of the next pipe so we only fold one stage at
+    // a time (left-associativity).
+    let next_pipe = find_top_level_pipe(rhs);
+    let (stage, tail) = match next_pipe {
+        Some(p) => (rhs[..p].trim(), Some(rhs[p..].trim())),
+        None => (rhs.trim(), None),
+    };
+    // Rewrite the single stage.
+    let rewritten_stage = if let Some(open) = stage.find('(') {
+        if stage.ends_with(')') {
+            let name = stage[..open].trim();
+            let args_inner = stage[open + 1..stage.len() - 1].trim();
+            if args_inner.is_empty() {
+                format!("{name}({lhs})")
+            } else {
+                format!("{name}({lhs}, {args_inner})")
+            }
+        } else {
+            // Malformed — leave as-is.
+            return None;
+        }
+    } else {
+        // Bare-name stage: `x |> f` → `f(x)`.
+        format!("{stage}({lhs})")
+    };
+    Some(match tail {
+        Some(t) => format!("{rewritten_stage} {t}"),
+        None => rewritten_stage,
+    })
+}
+
+/// Find the byte offset of a top-level `|>` (paren-depth 0).  We
+/// scan from the left so the leftmost pipe stage is folded first,
+/// giving left-associative desugaring for chained pipes.
+fn find_top_level_pipe(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i + 2 <= bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'|' if depth == 0 && bytes.get(i + 1).copied() == Some(b'>') => {
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Recognise an Aiken `when <scrutinee> is {` opening line and
+/// return the scrutinee expression substring.  The trailing `{` is
+/// stripped, as is any whitespace.  Returns `None` for non-opener
+/// lines so the caller can fall through to the regular `Expr`
+/// handling.  Examples:
+///
+/// * `when n is {` → `Some("n")`
+/// * `when tag is {` → `Some("tag")`
+/// * `when xs is {` → `Some("xs")`
+fn parse_when_opener(expr: &str) -> Option<&str> {
+    let expr = expr.trim();
+    let rest = expr.strip_prefix("when ")?;
+    let is_pos = find_top_level_is(rest)?;
+    let scrutinee = rest[..is_pos].trim();
+    let after_is = rest[is_pos + 2..].trim();
+    if !after_is.starts_with('{') {
+        return None;
+    }
+    if scrutinee.is_empty() {
+        return None;
+    }
+    Some(scrutinee)
+}
+
+/// Find a top-level ` is ` keyword inside a `when` opener, returning
+/// the byte offset of the `i`.  The space delimiters keep it from
+/// matching identifiers like `is_even`.
+fn find_top_level_is(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b' ' if depth == 0
+                && bytes.get(i + 1).copied() == Some(b'i')
+                && bytes.get(i + 2).copied() == Some(b's')
+                && bytes.get(i + 3).copied() == Some(b' ') =>
+            {
+                return Some(i + 1);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Match a when-arm pattern against the scrutinee `Value`.  Returns
+/// true when the pattern matches; mutates `env` to bind any captured
+/// identifiers (e.g. `Some(x)` binds `x` to the variant payload).
+///
+/// Recognised patterns:
+///
+/// * Wildcard `_` — always matches.
+/// * Integer literal `0`, `-1`, `42` — matches `Value::Int` with
+///   equal numeric value.
+/// * Bare identifier `x` — always matches and binds the identifier
+///   to the scrutinee value (the catch-all binding form, NOT a name
+///   lookup — Aiken pattern semantics).
+/// * Constructor `None` — matches a `Value::Variant { discriminator:
+///   "None", .. }`.
+/// * Constructor with payload `Some(x)`, `Ok(v)`, `Error(e)` —
+///   matches a `Value::Variant` with the same discriminator and
+///   binds the single payload identifier to the inner contents.
+fn match_pattern_against_value(
+    pattern: &str,
+    scrutinee: &Value,
+    env: &mut HashMap<String, Value>,
+) -> bool {
+    let pattern = pattern.trim();
+    if pattern == "_" {
+        return true;
+    }
+    // Integer literal pattern.
+    if let Ok(n) = pattern.parse::<i64>() {
+        return match scrutinee {
+            Value::Int(v) => *v == n,
+            _ => false,
+        };
+    }
+    // Constructor pattern: `Name` or `Name(arg)`.
+    if let Some(open) = pattern.find('(') {
+        if pattern.ends_with(')') {
+            let ctor = pattern[..open].trim();
+            let inner = pattern[open + 1..pattern.len() - 1].trim();
+            if let Value::Variant {
+                discriminator,
+                fields,
+                ..
+            } = scrutinee
+            {
+                if ctor == discriminator {
+                    // Bind the single inner identifier (if any) to
+                    // the first field of the variant payload.
+                    if is_simple_identifier(inner) && !fields.is_empty() {
+                        env.insert(inner.to_string(), fields[0].1.clone());
+                        return true;
+                    }
+                    // Nullary payload syntax `Name()` is rare but
+                    // valid.
+                    if inner.is_empty() {
+                        return true;
+                    }
+                    // Non-trivial inner patterns (nested constructor
+                    // `Some(Foo { .. })`, list rest `[h, ..t]`, tuple
+                    // `(a, b)`) are NOT decoded — we report
+                    // non-match so the wildcard arm fires.  This is
+                    // the recorder bug pinned by
+                    // `pattern_match_test.ak`.
+                    return false;
+                }
+                return false;
+            }
+            return false;
+        }
+    }
+    // Bare constructor name (no payload) — e.g. `None`.  We
+    // distinguish it from a bare identifier by the first letter
+    // being uppercase (Aiken convention).
+    if is_simple_identifier(pattern) {
+        let first = pattern.chars().next().unwrap();
+        if first.is_uppercase() {
+            return match scrutinee {
+                Value::Variant { discriminator, .. } => discriminator == pattern,
+                _ => false,
+            };
+        }
+        // Bare lowercase identifier — catch-all binding.
+        env.insert(pattern.to_string(), scrutinee.clone());
+        return true;
+    }
+    // Empty list literal `[]`.
+    if pattern == "[]" {
+        return match scrutinee {
+            Value::List(xs) => xs.is_empty(),
+            _ => false,
+        };
+    }
+    false
 }
 
 /// Find the byte offset of a top-level `->` (paren-depth 0).  Used by
