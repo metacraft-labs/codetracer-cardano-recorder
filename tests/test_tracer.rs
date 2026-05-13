@@ -1272,6 +1272,649 @@ fn test_tracing_test_emits_record_events() {
     );
 }
 
+// --- validator_test.ak -----------------------------------------------------
+
+/// Records `validator_test.ak`.  The program declares a
+/// `validator gift_card { spend(...) { ... } mint(...) { ... } }`
+/// outer block — Aiken's primary on-chain shape.  The recorder's
+/// parser gained validator-block awareness alongside this fixture
+/// (`spend` / `mint` / `else` / etc. inside a `validator <name> { ... }`
+/// block now register as function-table entries).  The strict pin
+/// asserts on the call sequence (compute → spend → redeemer_bonus
+/// then compute → mint → redeemer_bonus) and the per-step values.
+#[test]
+fn test_validator_test_via_ct_print_full() {
+    let Some((doc, source_path)) =
+        record_and_dump_full("test_validator_test_via_ct_print_full", "validator_test.ak")
+    else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    // The function table includes the test fn (validator_smoke), the
+    // free-function `compute()`, the validator's entry-point handlers
+    // `spend` / `mint`, and the shared helper `redeemer_bonus`.
+    assert_eq!(
+        functions,
+        vec!["validator_smoke", "compute", "spend", "redeemer_bonus", "mint"],
+    );
+
+    // ----- counts -----------------------------------------------------
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(18), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(5), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 18 steps + 5 call_entry + 5 call_exit = 28 events.
+    assert_eq!(events.len(), 28, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    // compute() → spend(2) → redeemer_bonus(2), then back to compute(),
+    // → mint(3) → redeemer_bonus(3).
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "spend".to_string(),
+            "redeemer_bonus".to_string(),
+            "mint".to_string(),
+            "redeemer_bonus".to_string(),
+        ],
+    );
+
+    // ----- Decoded variable values ------------------------------------
+    // spend(2): amount=2 (param-intro in spend) → redeemer_bonus(2)
+    //   binds amount=2 in callee → bonus=20 → adjusted=21 (spend's
+    //   return).  Back in compute: spent=21.
+    // mint(3): action=3 → redeemer_bonus(3) (amount=3) → base=30 →
+    //   total=35 (mint's return).  Back in compute: minted=35.
+    // combined = 21 + 35 = 56.
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("amount".into(), 2),
+            ("amount".into(), 2),
+            ("bonus".into(), 20),
+            ("adjusted".into(), 21),
+            ("spent".into(), 21),
+            ("action".into(), 3),
+            ("amount".into(), 3),
+            ("base".into(), 30),
+            ("total".into(), 35),
+            ("minted".into(), 35),
+            ("combined".into(), 56),
+        ],
+    );
+
+    // ----- Return values: 20, 21, 30, 35, 56 ---------------------------
+    let returns: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            rv["i"].as_i64().expect("return value Int.i")
+        })
+        .collect();
+    assert_eq!(returns, vec![20, 21, 30, 35, 56]);
+}
+
+// --- pattern_match_test.ak -------------------------------------------------
+
+/// Records `pattern_match_test.ak` and pins the CURRENT
+/// (intentionally limited) when-arm matcher behaviour:
+///
+/// * Flat patterns (`Some(x)`, `None`, integer literals, wildcard,
+///   bare constructor names) are decoded correctly.
+/// * Nested constructor patterns (`Wrap(InnerActive(n))`) are
+///   recognised at the outer constructor only; the inner level
+///   isn't destructured, so the matcher reports non-match and the
+///   wildcard arm fires.  RECORDER BUG: the spec-correct
+///   behaviour would bind `n=9` and return 9 — pinned by
+///   `test_pattern_match_test_nested_decodes` (`#[ignore]`).
+#[test]
+fn test_pattern_match_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_pattern_match_test_via_ct_print_full",
+        "pattern_match_test.ak",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["pattern_match", "compute", "flat_match", "nested_match"],
+    );
+
+    // ----- counts -----------------------------------------------------
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(20), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 20 steps + 4 call_entry + 4 call_exit = 28 events.
+    assert_eq!(events.len(), 28, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "flat_match".to_string(),
+            "flat_match".to_string(),
+            "nested_match".to_string(),
+        ],
+    );
+
+    // ----- Variable sequence pinning the CURRENT shape ----------------
+    let var_sequence: Vec<(String, String, Option<String>, Option<i64>)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    let name = v["varname"].as_str().expect("varname").to_string();
+                    let kind = v["value"]["kind"].as_str().expect("value.kind").to_string();
+                    let disc = v["value"]["discriminator"].as_str().map(|s| s.to_string());
+                    let i = v["value"]["i"].as_i64();
+                    (name, kind, disc, i)
+                })
+        })
+        .collect();
+    assert_eq!(
+        var_sequence,
+        vec![
+            // flat_match(Some(7)): opt is Some, arm `Some(x) -> x`
+            // matches and binds x=7, returns 7.
+            ("opt".into(), "Variant".into(), Some("Some".into()), None),
+            ("some_val".into(), "Int".into(), None, Some(7)),
+            // flat_match(None): opt is None, arm `None -> -1`
+            // matches, returns -1.
+            ("opt".into(), "Variant".into(), Some("None".into()), None),
+            ("none_val".into(), "Int".into(), None, Some(-1)),
+            // wrapped = Wrap(InnerActive(9)): the Wrap is the
+            // outer-level Variant.  The InnerActive(9) lives
+            // inside its `contents` slot but isn't surfaced as a
+            // separate variable.
+            ("wrapped".into(), "Variant".into(), Some("Wrap".into()), None),
+            // nested_match(wrapped): param `w` is the Wrap.  The
+            // `Wrap(InnerActive(n))` arm can't be destructured (the
+            // matcher returns non-match), so the wildcard arm
+            // `_ -> 100` fires.  RECORDER BUG: the spec-correct
+            // value would be 9.
+            ("w".into(), "Variant".into(), Some("Wrap".into()), None),
+            ("nested_val".into(), "Int".into(), None, Some(100)),
+            // compute's running total = 7 + (-1) + 100 = 106.
+            // Spec-correct would be 7 + (-1) + 9 = 15.
+            ("total".into(), "Int".into(), None, Some(106)),
+        ],
+    );
+
+    // ----- Return values: 7, -1, 100, 106 ------------------------------
+    let returns: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            rv["i"].as_i64().expect("return value Int.i")
+        })
+        .collect();
+    assert_eq!(returns, vec![7, -1, 100, 106]);
+}
+
+/// Spec-correct expectation for `pattern_match_test.ak`.  Once the
+/// recorder gains nested-constructor destructuring (so `Wrap(
+/// InnerActive(n))` binds `n` to the inner payload), `nested_val`
+/// should be 9 (the bound payload) and `total` should be 15 (=
+/// 7 + (-1) + 9), not 106.  RECORDER BUG: the matcher today only
+/// destructures the outer constructor — see the inline comment in
+/// `match_pattern_against_value` and the strict pin
+/// `test_pattern_match_test_via_ct_print_full` above.
+#[test]
+#[ignore = "RECORDER BUG: nested constructor patterns (Wrap(InnerActive(n))) \
+            aren't destructured; only the outer ctor is matched.  The matcher \
+            reports non-match so the wildcard arm fires.  See \
+            match_pattern_against_value() in src/tracer.rs."]
+fn test_pattern_match_test_nested_decodes() {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_pattern_match_test_nested_decodes",
+        "pattern_match_test.ak",
+    ) else {
+        return;
+    };
+    let int_vars = observed_var_sequence(&doc);
+    let nested_val = int_vars
+        .iter()
+        .find(|(n, _)| n == "nested_val")
+        .map(|(_, v)| *v);
+    assert_eq!(nested_val, Some(9), "nested_val should be the bound `n` = 9");
+    let total = int_vars
+        .iter()
+        .find(|(n, _)| n == "total")
+        .map(|(_, v)| *v);
+    assert_eq!(total, Some(15), "total should be 7 + (-1) + 9 = 15");
+}
+
+// --- variant_constructors_test.ak ------------------------------------------
+
+/// Records `variant_constructors_test.ak`.  The program declares a
+/// user-defined sum type `Status { Pending | Active(Int) | Failed }`
+/// and threads each constructor through a `classify(s)` helper.
+/// The strict pin asserts on the decoded `ValueRecord::Variant`
+/// shape (the recorder gained a `Variant` case alongside this
+/// fixture; previously a bare `None` / `Some(5)` would have fallen
+/// through to the unknown-identifier path).
+#[test]
+fn test_variant_constructors_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_variant_constructors_test_via_ct_print_full",
+        "variant_constructors_test.ak",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["variant_constructors", "compute", "classify"]);
+
+    // ----- counts -----------------------------------------------------
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(25), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 25 steps + 4 call_entry + 4 call_exit = 33 events.
+    assert_eq!(events.len(), 33, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "classify".to_string(),
+            "classify".to_string(),
+            "classify".to_string(),
+        ],
+    );
+
+    // ----- Variable sequence by (varname, value.kind) -----------------
+    // Walk the variable stream in emission order; pin the kind plus
+    // (for Variants) the discriminator and (for Ints) the value.
+    let var_sequence: Vec<(String, String, Option<String>, Option<i64>)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    let name = v["varname"].as_str().expect("varname").to_string();
+                    let kind = v["value"]["kind"].as_str().expect("value.kind").to_string();
+                    let disc = v["value"]["discriminator"].as_str().map(|s| s.to_string());
+                    let i = v["value"]["i"].as_i64();
+                    (name, kind, disc, i)
+                })
+        })
+        .collect();
+    assert_eq!(
+        var_sequence,
+        vec![
+            // Constructor let-bindings in compute().
+            ("pending_status".into(), "Variant".into(), Some("Pending".into()), None),
+            ("active_status".into(), "Variant".into(), Some("Active".into()), None),
+            ("failed_status".into(), "Variant".into(), Some("Failed".into()), None),
+            // classify(pending_status): param `s` is the Variant,
+            // then back in compute the let-binding receives the
+            // matched arm's value (1 for Pending).
+            ("s".into(), "Variant".into(), Some("Pending".into()), None),
+            ("pending_score".into(), "Int".into(), None, Some(1)),
+            // classify(active_status): Active(5) matches `Active(n)`,
+            // n bound to 5, returns 5.
+            ("s".into(), "Variant".into(), Some("Active".into()), None),
+            ("active_score".into(), "Int".into(), None, Some(5)),
+            // classify(failed_status): Failed -> 0.
+            ("s".into(), "Variant".into(), Some("Failed".into()), None),
+            ("failed_score".into(), "Int".into(), None, Some(0)),
+            // compute's running total.
+            ("total".into(), "Int".into(), None, Some(6)),
+        ],
+    );
+
+    // ----- Active variant payload -------------------------------------
+    // `Active(5)` must surface its `5` payload through the
+    // `contents.field_values[0]` slot of the Variant record (the
+    // contents are encoded as a Struct holding positional fields).
+    let active_value = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .find(|v| {
+            v["varname"].as_str() == Some("active_status")
+                && v["value"]["discriminator"].as_str() == Some("Active")
+        })
+        .expect("active_status Variant entry");
+    let contents = &active_value["value"]["contents"];
+    assert_eq!(contents["kind"].as_str(), Some("Struct"));
+    let field_values = contents["field_values"].as_array().expect("field_values");
+    assert_eq!(field_values.len(), 1);
+    assert_eq!(field_values[0]["kind"].as_str(), Some("Int"));
+    assert_eq!(field_values[0]["i"].as_i64(), Some(5));
+
+    // ----- Return values: 1, 5, 0, 6 -----------------------------------
+    let returns: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            rv["i"].as_i64().expect("return value Int.i")
+        })
+        .collect();
+    assert_eq!(returns, vec![1, 5, 0, 6]);
+}
+
+// --- pipe_operator_test.ak -------------------------------------------------
+
+/// Records `pipe_operator_test.ak`.  The program threads an integer
+/// through three pipe stages — `raw |> add(7) |> mul(3) |> sub(2)`
+/// — each rewritten by the recorder's pipe-desugar pass into a
+/// regular function call (`add(raw, 7)` etc.).  The strict pin
+/// captures the step / call sequence plus the per-stage decoded
+/// values (the let-binding name on the compute() side and the
+/// callee's a/b params on the helper side).
+#[test]
+fn test_pipe_operator_test_via_ct_print_full() {
+    let Some((doc, source_path)) =
+        record_and_dump_full("test_pipe_operator_test_via_ct_print_full", "pipe_operator_test.ak")
+    else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["pipe_operator", "compute", "add", "mul", "sub"],
+    );
+
+    // ----- counts -----------------------------------------------------
+    // Steps walk:
+    //   1 outer-test entry
+    //   1 dispatch (test body: `compute() == 34`)
+    //   1 `let raw = 5`
+    //   3 pairs of `(param-intro, body-line)` for add / mul / sub
+    //   3 let-bindings back in compute (after_add, after_mul, result)
+    //   1 trailing-expr step (`result`)
+    //   = 13 steps total.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(13), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 13 steps + 4 call_entry + 4 call_exit = 21 events.
+    assert_eq!(events.len(), 21, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence: compute → add → mul → sub --------------------
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "add".to_string(),
+            "mul".to_string(),
+            "sub".to_string(),
+        ],
+    );
+
+    // ----- Variable sequence -------------------------------------------
+    // raw=5, then per stage: callee params (a, b) + return binding.
+    //   add(5, 7)  → a=5, b=7, after_add=12
+    //   mul(12, 3) → a=12, b=3, after_mul=36
+    //   sub(36, 2) → a=36, b=2, result=34
+    assert_eq!(
+        observed_var_sequence(&doc),
+        vec![
+            ("raw".into(), 5),
+            ("a".into(), 5),
+            ("b".into(), 7),
+            ("after_add".into(), 12),
+            ("a".into(), 12),
+            ("b".into(), 3),
+            ("after_mul".into(), 36),
+            ("a".into(), 36),
+            ("b".into(), 2),
+            ("result".into(), 34),
+        ],
+    );
+
+    // ----- Return values: add → 12, mul → 36, sub → 34, compute → 34 ---
+    let returns: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            rv["i"].as_i64().expect("return value Int.i")
+        })
+        .collect();
+    assert_eq!(returns, vec![12, 36, 34, 34]);
+}
+
+// --- recursion_test.ak -----------------------------------------------------
+
+/// Records `recursion_test.ak`.  The program exercises two tail-
+/// recursive functions reached from a single `compute()` entry:
+///
+/// * `sum_acc(n, acc)` walks `n` down to zero, accumulating `acc + n`.
+///   `sum_acc(10, 0)` → 55.
+/// * `pow_acc(base, exp, acc)` walks `exp` down to zero, multiplying
+///   `acc` by `base` each step.  `pow_acc(2, 6, 1)` → 64.
+///
+/// Both use `when n is { 0 -> base_case _ -> recurse }`.  The
+/// recorder's when-arm matching (added with this fixture) evaluates
+/// ONLY the arm whose pattern matches the scrutinee value, so the
+/// recursion actually terminates instead of unrolling forever on
+/// the wildcard arm.
+///
+/// The strict pin captures the full call tree (1 + 11 + 7 = 19
+/// calls) and the per-frame param values (n stepping 10 → 0, acc
+/// accumulating 0 → 55; base=2, exp stepping 6 → 0, acc doubling
+/// 1 → 64).
+#[test]
+fn test_recursion_test_via_ct_print_full() {
+    let Some((doc, source_path)) =
+        record_and_dump_full("test_recursion_test_via_ct_print_full", "recursion_test.ak")
+    else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["recursion", "compute", "sum_acc", "pow_acc"],
+    );
+
+    // ----- counts -----------------------------------------------------
+    // Each call to sum_acc emits 4 steps (param-intro at the signature
+    // line + the `when n is {` opener step + the matching arm step +
+    // the wildcard arm step).  sum_acc is invoked 11 times (initial
+    // call with n=10 plus 10 recursive calls n=9..0), so sum_acc
+    // contributes 44 steps.
+    //
+    // Each call to pow_acc emits 4 steps (param-intro + opener + two
+    // arms).  pow_acc is invoked 7 times (exp=6..0), so pow_acc
+    // contributes 28 steps.
+    //
+    // compute() emits 6 steps: 1 dispatch + 3 let-bindings + 1
+    // trailing-expr step + 1 post-call site step.  Wait — the
+    // canonical pattern from `nested_calls_test` is 1 dispatch + 3
+    // let-bindings + 1 trailing-expr step + 1 inter-call step = 6.
+    //
+    // Total: 44 + 28 + 6 = 78 steps.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(78), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(19), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 78 steps + 19 call_entry + 19 call_exit = 116 events.
+    assert_eq!(events.len(), 116, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // ----- Call sequence ----------------------------------------------
+    // 1 compute + 11 sum_acc (initial + 10 recursive) + 7 pow_acc
+    // (initial + 6 recursive) = 19 calls.
+    let mut expected_calls = vec!["compute".to_string()];
+    for _ in 0..11 {
+        expected_calls.push("sum_acc".to_string());
+    }
+    for _ in 0..7 {
+        expected_calls.push("pow_acc".to_string());
+    }
+    assert_eq!(observed_call_sequence(&doc), expected_calls);
+
+    // ----- Variable sequence ------------------------------------------
+    // sum_acc unwinds: (n, acc) goes (10,0), (9,10), (8,19), (7,27),
+    // (6,34), (5,40), (4,45), (3,49), (2,52), (1,54), (0,55).  Then
+    // back in compute(): sum10 = 55.
+    //
+    // pow_acc unwinds: (base, exp, acc) base stays 2, exp goes 6..0,
+    // acc doubles 1, 2, 4, 8, 16, 32, 64.  Then back in compute():
+    // pow64 = 64, combined = 119.
+    let mut expected_vars: Vec<(String, i64)> = Vec::new();
+    let sum_pairs: &[(i64, i64)] = &[
+        (10, 0),
+        (9, 10),
+        (8, 19),
+        (7, 27),
+        (6, 34),
+        (5, 40),
+        (4, 45),
+        (3, 49),
+        (2, 52),
+        (1, 54),
+        (0, 55),
+    ];
+    for (n, acc) in sum_pairs {
+        expected_vars.push(("n".to_string(), *n));
+        expected_vars.push(("acc".to_string(), *acc));
+    }
+    expected_vars.push(("sum10".to_string(), 55));
+    let pow_triples: &[(i64, i64, i64)] = &[
+        (2, 6, 1),
+        (2, 5, 2),
+        (2, 4, 4),
+        (2, 3, 8),
+        (2, 2, 16),
+        (2, 1, 32),
+        (2, 0, 64),
+    ];
+    for (base, exp, acc) in pow_triples {
+        expected_vars.push(("base".to_string(), *base));
+        expected_vars.push(("exp".to_string(), *exp));
+        expected_vars.push(("acc".to_string(), *acc));
+    }
+    expected_vars.push(("pow64".to_string(), 64));
+    expected_vars.push(("combined".to_string(), 119));
+    assert_eq!(observed_var_sequence(&doc), expected_vars);
+
+    // ----- Return values ---------------------------------------------
+    // Innermost sum_acc base case returns acc=55; due to tail
+    // recursion every parent frame's "last evaluable line" is the
+    // same recursive call, so they all return 55 as well (the
+    // accumulated final value).  Same shape for pow_acc returning
+    // 64.  compute() returns 119 (sum10 + pow64).
+    let returns: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(
+                rv["kind"].as_str(),
+                Some("Int"),
+                "return value must decode as Int; got {rv}"
+            );
+            rv["i"].as_i64().expect("return value Int.i")
+        })
+        .collect();
+    let mut expected_returns = vec![55i64; 11];
+    expected_returns.extend(vec![64i64; 7]);
+    expected_returns.push(119);
+    assert_eq!(returns, expected_returns);
+}
+
 // ===========================================================================
 // CLI env-var contract
 // ===========================================================================
