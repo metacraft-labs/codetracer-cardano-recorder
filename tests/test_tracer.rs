@@ -423,9 +423,7 @@ fn test_recorded_trace_via_ct_print_json() {
     ];
     for (name, value) in expected {
         assert!(
-            observed_vars
-                .iter()
-                .any(|(n, v)| n == name && v == value),
+            observed_vars.iter().any(|(n, v)| n == name && v == value),
             "expected step variable `{name}` = {value} in --full output; \
              observed = {observed_vars:?}"
         );
@@ -512,8 +510,8 @@ fn record_and_dump_full(test_name: &str, program: &str) -> Option<(serde_json::V
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let doc: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .expect("ct-print --full should emit valid JSON");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("ct-print --full should emit valid JSON");
 
     // Preserve the temp dir until after the JSON is parsed, then drop.
     drop(tmp_dir);
@@ -621,9 +619,10 @@ fn assert_metadata_program_ends_with(doc: &serde_json::Value, source_path: &Path
 /// upstream parser gains real support.
 #[test]
 fn test_control_flow_test_via_ct_print_full() {
-    let Some((doc, source_path)) =
-        record_and_dump_full("test_control_flow_test_via_ct_print_full", "control_flow_test.ak")
-    else {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_control_flow_test_via_ct_print_full",
+        "control_flow_test.ak",
+    ) else {
         return;
     };
 
@@ -726,9 +725,10 @@ fn test_control_flow_test_via_ct_print_full() {
 
 #[test]
 fn test_control_flow_test_full_chain_decodes() {
-    let Some((doc, _)) =
-        record_and_dump_full("test_control_flow_test_full_chain_decodes", "control_flow_test.ak")
-    else {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_control_flow_test_full_chain_decodes",
+        "control_flow_test.ak",
+    ) else {
         return;
     };
     // Each non-test function with parameters now emits a
@@ -758,9 +758,10 @@ fn test_control_flow_test_full_chain_decodes() {
 /// `compute → outer → middle → inner` is captured end-to-end.
 #[test]
 fn test_nested_calls_test_via_ct_print_full() {
-    let Some((doc, source_path)) =
-        record_and_dump_full("test_nested_calls_test_via_ct_print_full", "nested_calls_test.ak")
-    else {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_nested_calls_test_via_ct_print_full",
+        "nested_calls_test.ak",
+    ) else {
         return;
     };
 
@@ -863,9 +864,10 @@ fn test_nested_calls_test_via_ct_print_full() {
 /// program (`compute() == 60`).
 #[test]
 fn test_collections_test_via_ct_print_full() {
-    let Some((doc, source_path)) =
-        record_and_dump_full("test_collections_test_via_ct_print_full", "collections_test.ak")
-    else {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_collections_test_via_ct_print_full",
+        "collections_test.ak",
+    ) else {
         return;
     };
 
@@ -879,7 +881,13 @@ fn test_collections_test_via_ct_print_full() {
         .collect();
     assert_eq!(
         functions,
-        vec!["collections", "compute", "sum_pair", "point_distance_sq", "list_total"],
+        vec![
+            "collections",
+            "compute",
+            "sum_pair",
+            "point_distance_sq",
+            "list_total"
+        ],
         "function table must include the full chain — `sum_pair` and \
          `point_distance_sq` are called with structured arguments which \
          the recorder now parses end-to-end",
@@ -1039,9 +1047,10 @@ fn find_var_value(doc: &serde_json::Value, name: &str, expected_kind: &str) -> s
 
 #[test]
 fn test_collections_test_value_kinds_present() {
-    let Some((doc, _)) =
-        record_and_dump_full("test_collections_test_value_kinds_present", "collections_test.ak")
-    else {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_collections_test_value_kinds_present",
+        "collections_test.ak",
+    ) else {
         return;
     };
     let mut kinds = std::collections::BTreeSet::new();
@@ -1078,9 +1087,10 @@ fn test_collections_test_value_kinds_present() {
 /// `metacraft-specs/policies/recorder-test-requirements.md` §2.
 #[test]
 fn test_error_paths_test_via_ct_print_full() {
-    let Some((doc, source_path)) =
-        record_and_dump_full("test_error_paths_test_via_ct_print_full", "error_paths_test.ak")
-    else {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_error_paths_test_via_ct_print_full",
+        "error_paths_test.ak",
+    ) else {
         return;
     };
 
@@ -1155,9 +1165,10 @@ fn test_error_paths_test_via_ct_print_full() {
 
 #[test]
 fn test_error_paths_test_emits_fail_event() {
-    let Some((doc, _)) =
-        record_and_dump_full("test_error_paths_test_emits_fail_event", "error_paths_test.ak")
-    else {
+    let Some((doc, _)) = record_and_dump_full(
+        "test_error_paths_test_emits_fail_event",
+        "error_paths_test.ak",
+    ) else {
         return;
     };
     let counts = &doc["counts"];
@@ -1221,11 +1232,7 @@ fn test_tracing_test_via_ct_print_full() {
     // a, b, sum_val.
     assert_eq!(
         observed_var_sequence(&doc),
-        vec![
-            ("a".into(), 4),
-            ("b".into(), 5),
-            ("sum_val".into(), 9),
-        ],
+        vec![("a".into(), 4), ("b".into(), 5), ("sum_val".into(), 9),],
     );
 
     // Each `trace @"label": value` surfaces as an `ioStdout` io_event
@@ -1303,7 +1310,13 @@ fn test_validator_test_via_ct_print_full() {
     // `spend` / `mint`, and the shared helper `redeemer_bonus`.
     assert_eq!(
         functions,
-        vec!["validator_smoke", "compute", "spend", "redeemer_bonus", "mint"],
+        vec![
+            "validator_smoke",
+            "compute",
+            "spend",
+            "redeemer_bonus",
+            "mint"
+        ],
     );
 
     // ----- counts -----------------------------------------------------
@@ -1466,7 +1479,12 @@ fn test_pattern_match_test_via_ct_print_full() {
             // outer-level Variant.  The InnerActive(9) lives
             // inside its `contents` slot but isn't surfaced as a
             // separate variable.
-            ("wrapped".into(), "Variant".into(), Some("Wrap".into()), None),
+            (
+                "wrapped".into(),
+                "Variant".into(),
+                Some("Wrap".into()),
+                None
+            ),
             // nested_match(wrapped): param `w` is the Wrap.  The
             // `Wrap(InnerActive(n))` arm now destructures
             // recursively: the outer pattern matches the `Wrap`
@@ -1572,7 +1590,10 @@ fn test_variant_constructors_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(functions, vec!["variant_constructors", "compute", "classify"]);
+    assert_eq!(
+        functions,
+        vec!["variant_constructors", "compute", "classify"]
+    );
 
     // ----- counts -----------------------------------------------------
     let counts = &doc["counts"];
@@ -1624,9 +1645,24 @@ fn test_variant_constructors_test_via_ct_print_full() {
         var_sequence,
         vec![
             // Constructor let-bindings in compute().
-            ("pending_status".into(), "Variant".into(), Some("Pending".into()), None),
-            ("active_status".into(), "Variant".into(), Some("Active".into()), None),
-            ("failed_status".into(), "Variant".into(), Some("Failed".into()), None),
+            (
+                "pending_status".into(),
+                "Variant".into(),
+                Some("Pending".into()),
+                None
+            ),
+            (
+                "active_status".into(),
+                "Variant".into(),
+                Some("Active".into()),
+                None
+            ),
+            (
+                "failed_status".into(),
+                "Variant".into(),
+                Some("Failed".into()),
+                None
+            ),
             // classify(pending_status): param `s` is the Variant,
             // then back in compute the let-binding receives the
             // matched arm's value (1 for Pending).
@@ -1694,9 +1730,10 @@ fn test_variant_constructors_test_via_ct_print_full() {
 /// callee's a/b params on the helper side).
 #[test]
 fn test_pipe_operator_test_via_ct_print_full() {
-    let Some((doc, source_path)) =
-        record_and_dump_full("test_pipe_operator_test_via_ct_print_full", "pipe_operator_test.ak")
-    else {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_pipe_operator_test_via_ct_print_full",
+        "pipe_operator_test.ak",
+    ) else {
         return;
     };
 
@@ -1933,6 +1970,601 @@ fn test_recursion_test_via_ct_print_full() {
     expected_returns.extend(vec![64i64; 7]);
     expected_returns.push(119);
     assert_eq!(returns, expected_returns);
+}
+
+// --- higher_order_test.ak --------------------------------------------------
+
+/// Records `higher_order_test.ak`.  Pins the new closure +
+/// `list.map` paths:
+///
+///   * Lambda literal `fn(x) { x + 1 }` parses as
+///     `Value::Closure { params, body_expr }` and surfaces in the
+///     trace as a `String` ValueRecord (`"fn(x) { x + 1 }"`).
+///   * Closure invocation `inc(5)` dispatches via
+///     `eval_closure_call`, which emits a Call/Return pair under
+///     the function name `<closure>` with the bound param value
+///     attached to the call_entry step.
+///   * `list.map([1,2,3], fn(x) { x + 100 })` is recognised in
+///     `eval_list_map` and dispatches the closure over each list
+///     element, surfacing one Call/Return per iteration.
+///
+/// The strict pin captures the call sequence (compute + 2 closure
+/// inc(...) calls + 3 list.map closure calls = 6) and the per-call
+/// return values.
+#[test]
+fn test_higher_order_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_higher_order_test_via_ct_print_full",
+        "higher_order_test.ak",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    // Function-table entries: entry test, compute(), and a single
+    // synthetic `<closure>` entry that all closure invocations share.
+    assert_eq!(functions, vec!["higher_order", "compute", "<closure>"],);
+
+    let counts = &doc["counts"];
+    // 6 calls = 1 compute + 2 inc(...) closure invocations + 3
+    // list.map iterations.
+    assert_eq!(counts["calls"].as_u64(), Some(6), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "<closure>".to_string(), // inc(5)
+            "<closure>".to_string(), // inc(10)
+            "<closure>".to_string(), // list.map iteration 1
+            "<closure>".to_string(), // list.map iteration 2
+            "<closure>".to_string(), // list.map iteration 3
+        ],
+    );
+
+    // ----- Per-call return values -------------------------------------
+    // inc(5) → 6, inc(10) → 11, list.map iterations → 101/102/103,
+    // compute → 323.
+    let returns: Vec<i64> = doc["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            rv["i"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("return value should decode as Int.i; got {rv}"))
+        })
+        .collect();
+    assert_eq!(returns, vec![6, 11, 101, 102, 103, 323]);
+
+    // ----- Closure value surfaces as a String ValueRecord -------------
+    let inc_value = doc["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .find(|v| v["varname"].as_str() == Some("inc"))
+        .expect("inc Closure entry");
+    assert_eq!(inc_value["value"]["kind"].as_str(), Some("String"));
+    let text = inc_value["value"]["text"].as_str().unwrap_or("");
+    assert!(
+        text.starts_with("fn(") && text.contains("x + 1"),
+        "closure text should render as `fn(x) {{ x + 1 }}`; got {text:?}"
+    );
+}
+
+// --- builtins_test.ak ------------------------------------------------------
+
+/// Records `builtins_test.ak`.  The program calls two Aiken
+/// builtins (`length_of_bytearray` and `verify_ed25519_signature`)
+/// and sums their results.
+///
+/// Because the recorder doesn't link a real cryptographic
+/// implementation, builtin invocations surface as synthetic
+/// Call/Return event pairs (`emit_builtin_call`) with placeholder
+/// return values chosen to match the spec-correct kind:
+///
+///   * `length_of_bytearray(#"deadbeef")` → `Int(4)` (real length
+///     of the 4-byte hex literal).
+///   * `verify_ed25519_signature(...)` → `Int(1)` (Bool true,
+///     modelled as Int per the writer's pre-registered Bool type).
+///
+/// The strict pin asserts on the function-table entries (each
+/// builtin name registered exactly once), the call sequence
+/// including the builtin call sites, and the synthesised return
+/// values.
+#[test]
+fn test_builtins_test_via_ct_print_full() {
+    let Some((doc, source_path)) =
+        record_and_dump_full("test_builtins_test_via_ct_print_full", "builtins_test.ak")
+    else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    // Function-table order: entry test, compute(), then each helper
+    // and builtin in the order they were first invoked.
+    assert_eq!(
+        functions,
+        vec![
+            "builtins",
+            "compute",
+            "payload_len",
+            "length_of_bytearray",
+            "signature_check",
+            "verify_ed25519_signature",
+        ],
+    );
+
+    let counts = &doc["counts"];
+    // 5 calls = 1 compute + 2 helpers (payload_len, signature_check) +
+    // 2 builtins (length_of_bytearray, verify_ed25519_signature).
+    assert_eq!(counts["calls"].as_u64(), Some(5), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "payload_len".to_string(),
+            "length_of_bytearray".to_string(),
+            "signature_check".to_string(),
+            "verify_ed25519_signature".to_string(),
+        ],
+    );
+
+    // ----- Return values per call_exit -------------------------------
+    // payload_len → 4, length_of_bytearray → 4 (the synthesised
+    // builtin result), signature_check → 1,
+    // verify_ed25519_signature → 1, compute → 5.
+    let returns: Vec<i64> = doc["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            rv["i"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("return value should decode as Int.i; got {rv}"))
+        })
+        .collect();
+    assert_eq!(
+        returns,
+        vec![4, 4, 1, 1, 5],
+        "compute → payload_len → length_of_bytearray → signature_check \
+         → verify_ed25519_signature → outer return chain",
+    );
+}
+
+// --- expect_refinement_test.ak ---------------------------------------------
+
+/// Records `expect_refinement_test.ak`.  Pins the new
+/// `Statement::Expect` paths:
+///
+///   * Runtime: `expect Some(x) = some_val` matches the pattern
+///     against the resolved RHS and binds the captured identifier
+///     (`x = 13`) into the function-local env, so the trace
+///     surfaces `x` as a step variable just like a let-binding.
+///   * Static sweep (`emit_expect_events_for_program`): one
+///     `EventLogKind::Error` io_event tagged `AikenExpectFailure`
+///     per `expect` line in the parsed program — mirrors the
+///     `Statement::Fail` static-sweep.  The fixture contains 3
+///     expect statements (2 reached, 1 in unreached
+///     `failing_extract()`), so 3 io_events surface.
+#[test]
+fn test_expect_refinement_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_expect_refinement_test_via_ct_print_full",
+        "expect_refinement_test.ak",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["expect_refinement", "compute", "safe_extract", "safe_field"],
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
+    // Three `expect` statements parsed from the program (2 in
+    // executed helpers + 1 in unreached `failing_extract`); each
+    // contributes one `EventLogKind::Error` io_event via the static
+    // sweep.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(3),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "safe_extract".to_string(),
+            "safe_field".to_string(),
+        ],
+    );
+
+    // ----- Variable sequence: pattern bindings surface as step vars ---
+    // safe_extract: some_val = Some(13) → expect Some(x) binds x=13
+    //   → return 13.  Back in compute: a=13.
+    // safe_field: boxed_val = Boxed(29) → expect Boxed(value) binds
+    //   value=29 → return 29.  Back in compute: b=29.
+    // compute: total = a + b = 42.
+    let var_sequence: Vec<(String, String, Option<String>, Option<i64>)> = doc["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    let name = v["varname"].as_str().expect("varname").to_string();
+                    let kind = v["value"]["kind"].as_str().expect("value.kind").to_string();
+                    let disc = v["value"]["discriminator"].as_str().map(|s| s.to_string());
+                    let i = v["value"]["i"].as_i64();
+                    (name, kind, disc, i)
+                })
+        })
+        .collect();
+    assert_eq!(
+        var_sequence,
+        vec![
+            // safe_extract bindings
+            (
+                "some_val".into(),
+                "Variant".into(),
+                Some("Some".into()),
+                None
+            ),
+            ("x".into(), "Int".into(), None, Some(13)),
+            ("a".into(), "Int".into(), None, Some(13)),
+            // safe_field bindings
+            (
+                "boxed_val".into(),
+                "Variant".into(),
+                Some("Boxed".into()),
+                None
+            ),
+            ("value".into(), "Int".into(), None, Some(29)),
+            ("b".into(), "Int".into(), None, Some(29)),
+            // compute total
+            ("total".into(), "Int".into(), None, Some(42)),
+        ],
+    );
+
+    // ----- Static-sweep io_events: tagged AikenExpectFailure ----------
+    let events = doc["events"].as_array().expect("events array");
+    let expect_errors: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "io" && e["io_kind"] == "ioError")
+        .collect();
+    assert_eq!(
+        expect_errors.len(),
+        3,
+        "expected 3 ioError io_events (one per expect statement); got {expect_errors:?}",
+    );
+    // Every error message should mention `expect`.
+    for ev in &expect_errors {
+        let text = ev["text"].as_str().unwrap_or("");
+        assert!(
+            text.starts_with("expect "),
+            "ioError text should start with `expect `; got {text:?}"
+        );
+    }
+}
+
+// --- opaque_generic_test.ak ------------------------------------------------
+
+/// Records `opaque_generic_test.ak`.  The program declares an
+/// `opaque type Wrapper { inner: Int }` plus two regular helpers
+/// (`unwrap` for the opaque value and `pair_first` for tuple
+/// projection) and threads concrete values through both.
+///
+/// The recorder pre-scans for `opaque type` declarations
+/// (`collect_opaque_type_names`) and labels the registered type id
+/// with a `" (opaque)"` suffix so consumers can distinguish opaque-
+/// wrapped values from plain records.  The wire-format kind stays
+/// `Struct` (opaque is an Aiken access-control feature, not a
+/// runtime distinction); the inner field still surfaces verbatim
+/// via the Struct's `field_values` slot.
+#[test]
+fn test_opaque_generic_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_opaque_generic_test_via_ct_print_full",
+        "opaque_generic_test.ak",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec![
+            "opaque_generic",
+            "compute",
+            "unwrap",
+            "extract_first",
+            "pair_first",
+        ],
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "unwrap".to_string(),
+            "extract_first".to_string(),
+            "pair_first".to_string(),
+        ],
+    );
+
+    // ----- Opaque type label ------------------------------------------
+    // The `Wrapper` record landed in the trace via
+    // `let wrapped = Wrapper { inner: 42 }`.  Its type id is
+    // registered with the `" (opaque)"` suffix; pull the types
+    // table out of the trace document and assert the label.
+    let types: Vec<String> = doc["types"]
+        .as_array()
+        .expect("types array")
+        .iter()
+        .filter_map(|t| t.as_str().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        types.iter().any(|t| t == "Wrapper (opaque)"),
+        "expected `Wrapper (opaque)` in types table; got {types:?}"
+    );
+    // The non-opaque suffix label MUST NOT also appear (we'd have
+    // double-registered).
+    assert!(
+        !types.iter().any(|t| t == "Wrapper"),
+        "plain `Wrapper` label must not be registered alongside the \
+         opaque-suffixed one; got {types:?}"
+    );
+
+    // ----- Wrapped value carries the inner Int through Struct.field_values
+    let events = doc["events"].as_array().expect("events array");
+    let wrapped_value = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .find(|v| v["varname"].as_str() == Some("wrapped"))
+        .expect("wrapped Struct entry");
+    assert_eq!(
+        wrapped_value["value"]["kind"].as_str(),
+        Some("Struct"),
+        "wrapped should decode as Struct; got {wrapped_value}"
+    );
+    let field_values = wrapped_value["value"]["field_values"]
+        .as_array()
+        .expect("field_values");
+    assert_eq!(field_values.len(), 1);
+    assert_eq!(field_values[0]["kind"].as_str(), Some("Int"));
+    assert_eq!(field_values[0]["i"].as_i64(), Some(42));
+
+    // ----- Final return value should be 49 ----------------------------
+    let returns: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            rv["i"].as_i64().expect("return value Int.i")
+        })
+        .collect();
+    // unwrap → 42, pair_first → 7, extract_first → 7, compute → 49.
+    assert_eq!(returns, vec![42, 7, 7, 49]);
+}
+
+// --- bytearray_string_test.ak ---------------------------------------------
+
+/// Records `bytearray_string_test.ak`.  The program declares two
+/// literal forms — a hex byte literal `#"deadbeef"` and a UTF-8
+/// string literal `"FOO"` — and threads each through a helper that
+/// returns the literal's byte length as an `Int` so the existing
+/// UPLC-CEK arithmetic pipeline can drive the test body
+/// (`compute() == 7`).
+///
+/// The recorder gained `Value::ByteArray(Vec<u8>)` and
+/// `Value::String(String)` alongside this fixture; both surface as
+/// `ValueRecord::String` on the wire but with distinct `text`
+/// payloads so the renderer can pick the right shape:
+///
+///   * `Value::ByteArray([0xde,0xad,0xbe,0xef])` →
+///     `String { text: "#\"deadbeef\"" }` (hex form preserved).
+///   * `Value::String("FOO")` → `String { text: "FOO" }`.
+///
+/// The strict pin asserts on (a) the exact byte texts of each
+/// literal binding and (b) the same `kind: "String"` for both forms
+/// (the wire-format collapse), proving the recorder no longer drops
+/// non-Int let-binding RHSs from the substitution map.
+#[test]
+fn test_bytearray_string_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_bytearray_string_test_via_ct_print_full",
+        "bytearray_string_test.ak",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["bytearray_string", "compute", "payload_len", "name_len"],
+    );
+
+    // ----- counts -----------------------------------------------------
+    // compute(): 1 dispatch + 3 let-bindings + 1 trailing-expr step = 5
+    // payload_len(): 1 param-intro is suppressed (no params), 2 let
+    //   steps + 1 trailing-expr = 3 steps.
+    // name_len(): same shape = 3 steps.
+    // Total: 5 + 3 + 3 = 11.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(12), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 12 steps + 3 call_entry + 3 call_exit = 18 events.
+    assert_eq!(events.len(), 18, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "payload_len".to_string(),
+            "name_len".to_string(),
+        ],
+    );
+
+    // ----- Variable sequence by (varname, value.kind, optional text/i) -
+    // Walk the variable stream in emission order.  We pin the kind plus
+    // the textual representation for `String` shapes and the integer
+    // value for `Int` shapes.
+    let var_sequence: Vec<(String, String, Option<String>, Option<i64>)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    let name = v["varname"].as_str().expect("varname").to_string();
+                    let kind = v["value"]["kind"].as_str().expect("value.kind").to_string();
+                    let text = v["value"]["text"].as_str().map(|s| s.to_string());
+                    let i = v["value"]["i"].as_i64();
+                    (name, kind, text, i)
+                })
+        })
+        .collect();
+    // The interleaving (callee var, then caller's `let p = callee()`
+    // before the next call) reflects the recorder's variable-stream
+    // emission order: each `register_variable_with_full_value` lands
+    // on the most-recent step event, so the let-binding step in
+    // compute() picks up `p` immediately after payload_len() returns,
+    // before the next step (the let-binding for `q`) opens.
+    assert_eq!(
+        var_sequence,
+        vec![
+            // payload_len: hex literal preserved as `#"deadbeef"` text.
+            (
+                "payload".into(),
+                "String".into(),
+                Some("#\"deadbeef\"".into()),
+                None
+            ),
+            ("n".into(), "Int".into(), None, Some(4)),
+            // p = payload_len() — lands on the same step in compute()
+            // before the next call dispatches.
+            ("p".into(), "Int".into(), None, Some(4)),
+            // name_len: text literal "FOO" preserved as text.
+            ("name".into(), "String".into(), Some("FOO".into()), None),
+            ("n".into(), "Int".into(), None, Some(3)),
+            ("q".into(), "Int".into(), None, Some(3)),
+            ("total".into(), "Int".into(), None, Some(7)),
+        ],
+    );
+
+    // ----- Return values: 4, 3, 7 -------------------------------------
+    let returns: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            rv["i"].as_i64().expect("return value Int.i")
+        })
+        .collect();
+    assert_eq!(returns, vec![4, 3, 7]);
 }
 
 // ===========================================================================

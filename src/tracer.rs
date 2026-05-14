@@ -399,6 +399,26 @@ enum Value {
         discriminator: String,
         fields: Vec<(String, Value)>,
     },
+    /// Aiken hex byte literal `#"deadbeef"` — emitted as
+    /// `ValueRecord::String { text: "#\"deadbeef\"" }` so the source-
+    /// shape (hex form) survives into the trace and is distinguishable
+    /// from a UTF-8 text literal that happens to share the same byte
+    /// sequence.  See `bytearray_string_test.ak`.
+    ByteArray(Vec<u8>),
+    /// Aiken UTF-8 string literal `"FOO"` — emitted as
+    /// `ValueRecord::String { text: "FOO" }`.  Distinct from
+    /// `ByteArray` so the trace renderer can show each in its source
+    /// shape.  See `bytearray_string_test.ak`.
+    String(String),
+    /// Aiken closure literal `fn(x) { x + 1 }` — emitted as
+    /// `ValueRecord::String { text: "<closure>" }` when it lands in
+    /// the trace as a let-binding RHS.  At call time the captured
+    /// `body_expr` is evaluated with `params` bound to the actual
+    /// arguments.  See `higher_order_test.ak`.
+    Closure {
+        params: Vec<String>,
+        body_expr: String,
+    },
 }
 
 impl Value {
@@ -478,6 +498,31 @@ enum Statement {
         expr: String,
         line: u32,
     },
+    /// Aiken's `expect <pattern> = <expr>` — a refinement / pattern-
+    /// asserting binding.  Semantically distinct from `let`: on a
+    /// pattern-match failure the entire validator aborts (same shape
+    /// as `fail`), making `expect` the canonical way to assert a
+    /// refinement type.
+    ///
+    /// Evaluation semantics:
+    /// * On success the pattern binds (e.g. `expect Some(x) = opt`
+    ///   binds `x` to the inner payload).
+    /// * On failure the function aborts and the recorder emits an
+    ///   `EventLogKind::Error` io_event tagged `AikenExpectFailure`.
+    ///
+    /// The post-execution sweep in
+    /// `emit_expect_events_for_program` ALSO emits one Error event
+    /// per syntactically-present `expect` statement (parallel to the
+    /// `Statement::Fail` static-sweep — see
+    /// `emit_fail_events_for_program`), so the failure surface is
+    /// visible regardless of which expect actually ran or failed at
+    /// recorder time.  See `expect_refinement_test.ak`.
+    Expect {
+        pattern: String,
+        expr: String,
+        #[allow(dead_code)]
+        line: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -488,6 +533,12 @@ enum Statement {
 pub struct AikenTracer {
     writer: Box<dyn TraceWriter + Send>,
     type_ids: HashMap<String, codetracer_trace_types::TypeId>,
+    /// Names of types declared with `opaque type Name { ... }`.  When a
+    /// `Value::Record { type_name }` for one of these names lands in the
+    /// trace, the type id is registered with a `" (opaque)"` suffix so
+    /// downstream consumers can distinguish opaque-wrapped values from
+    /// plain records.  See `opaque_generic_test.ak`.
+    opaque_type_names: std::collections::HashSet<String>,
 }
 
 impl AikenTracer {
@@ -512,6 +563,7 @@ impl AikenTracer {
         let format = TraceEventsFileFormat::Ctfs;
         let _source_map = SourceMap::from_source(source_path, source_code);
         let functions = parse_functions(source_code);
+        let opaque_type_names = collect_opaque_type_names(source_code);
 
         eprintln!("Parsed {} functions", functions.len());
 
@@ -519,6 +571,7 @@ impl AikenTracer {
         let mut tracer = AikenTracer {
             writer: create_trace_writer(&program_str, &[], format),
             type_ids: HashMap::new(),
+            opaque_type_names,
         };
 
         std::fs::create_dir_all(out_dir)
@@ -589,6 +642,15 @@ impl AikenTracer {
         // the executed path.
         tracer.emit_trace_events_for_program(&functions);
 
+        // Surface every `expect <pat> = <expr>` statement in the
+        // program as an `EventLogKind::Error` io_event tagged
+        // `AikenExpectFailure`.  Mirrors the `emit_fail_events_for_
+        // program` static-sweep pattern: every `expect` is a
+        // potential program-terminating refinement, so the failure
+        // surface is visible regardless of which expect actually
+        // failed at recorder time.  See `expect_refinement_test.ak`.
+        tracer.emit_expect_events_for_program(&functions);
+
         // Close the <toplevel> call that start() opened.
         TraceWriter::register_return(&mut *tracer.writer, NONE_VALUE);
 
@@ -639,6 +701,31 @@ impl AikenTracer {
     /// literal source-level expression text (e.g. `"after-a: a"`)
     /// rather than the resolved integer — same static-sweep
     /// limitation called out for `emit_fail_events_for_program`.
+    /// Emit one `EventLogKind::Error` io_event per `expect <pat> =
+    /// <expr>` statement found anywhere in the parsed program, tagged
+    /// `AikenExpectFailure`.  Mirrors `emit_fail_events_for_program`
+    /// — every `expect` is a potential program-terminating
+    /// refinement, so the failure surface is visible regardless of
+    /// which expect actually failed at recorder time.  When the
+    /// recorder later evaluates every reachable expect inline, this
+    /// sweep should dedupe against expects already surfaced from the
+    /// executed path.  See `expect_refinement_test.ak`.
+    fn emit_expect_events_for_program(&mut self, functions: &[FunctionDef]) {
+        for func in functions {
+            for stmt in &func.body {
+                if let Statement::Expect { pattern, .. } = stmt {
+                    let message = format!("expect {pattern} = <expr>");
+                    TraceWriter::register_special_event(
+                        &mut *self.writer,
+                        EventLogKind::Error,
+                        "AikenExpectFailure",
+                        &message,
+                    );
+                }
+            }
+        }
+    }
+
     fn emit_trace_events_for_program(&mut self, functions: &[FunctionDef]) {
         for func in functions {
             for stmt in &func.body {
@@ -699,21 +786,13 @@ impl AikenTracer {
     fn value_to_record(&mut self, val: &Value) -> ValueRecord {
         match val {
             Value::Int(i) => {
-                let type_id = self
-                    .type_ids
-                    .get("Int")
-                    .copied()
-                    .unwrap_or(TypeId(0));
+                let type_id = self.type_ids.get("Int").copied().unwrap_or(TypeId(0));
                 ValueRecord::Int { i: *i, type_id }
             }
             Value::List(elements) => {
                 let elements: Vec<ValueRecord> =
                     elements.iter().map(|v| self.value_to_record(v)).collect();
-                let type_id = self
-                    .type_ids
-                    .get("List")
-                    .copied()
-                    .unwrap_or(TypeId(0));
+                let type_id = self.type_ids.get("List").copied().unwrap_or(TypeId(0));
                 ValueRecord::Sequence {
                     elements,
                     is_slice: false,
@@ -723,11 +802,7 @@ impl AikenTracer {
             Value::Tuple(elements) => {
                 let elements: Vec<ValueRecord> =
                     elements.iter().map(|v| self.value_to_record(v)).collect();
-                let type_id = self
-                    .type_ids
-                    .get("Tuple")
-                    .copied()
-                    .unwrap_or(TypeId(0));
+                let type_id = self.type_ids.get("Tuple").copied().unwrap_or(TypeId(0));
                 ValueRecord::Tuple { elements, type_id }
             }
             Value::Record { type_name, fields } => {
@@ -735,15 +810,23 @@ impl AikenTracer {
                     .iter()
                     .map(|(_n, v)| self.value_to_record(v))
                     .collect();
-                let type_id = if let Some(id) = self.type_ids.get(type_name).copied() {
+                // Opaque types are tagged with a `" (opaque)"` suffix
+                // on the type-id label so consumers can distinguish
+                // opaque-wrapped values from plain records.  The
+                // wire-format kind stays `Struct` — opaque is an
+                // Aiken access-control feature, not a runtime
+                // distinction.  See `opaque_generic_test.ak`.
+                let label = if self.opaque_type_names.contains(type_name) {
+                    format!("{type_name} (opaque)")
+                } else {
+                    type_name.clone()
+                };
+                let type_id = if let Some(id) = self.type_ids.get(&label).copied() {
                     id
                 } else {
-                    let id = TraceWriter::ensure_type_id(
-                        &mut *self.writer,
-                        TypeKind::Struct,
-                        type_name,
-                    );
-                    self.type_ids.insert(type_name.clone(), id);
+                    let id =
+                        TraceWriter::ensure_type_id(&mut *self.writer, TypeKind::Struct, &label);
+                    self.type_ids.insert(label.clone(), id);
                     id
                 };
                 ValueRecord::Struct {
@@ -768,11 +851,7 @@ impl AikenTracer {
                     .iter()
                     .map(|(_n, v)| self.value_to_record(v))
                     .collect();
-                let inner_type_id = self
-                    .type_ids
-                    .get("Tuple")
-                    .copied()
-                    .unwrap_or(TypeId(0));
+                let inner_type_id = self.type_ids.get("Tuple").copied().unwrap_or(TypeId(0));
                 let contents = ValueRecord::Struct {
                     field_values,
                     type_id: inner_type_id,
@@ -791,6 +870,35 @@ impl AikenTracer {
                 ValueRecord::Variant {
                     discriminator: discriminator.clone(),
                     contents: Box::new(contents),
+                    type_id,
+                }
+            }
+            Value::ByteArray(bytes) => {
+                // Render the hex form back into the trace so the
+                // source-shape (`#"deadbeef"`) is distinguishable from
+                // a UTF-8 text literal.  The leading `#` and quotes
+                // are kept verbatim — the consumer routes on them.
+                let mut hex = String::with_capacity(bytes.len() * 2 + 3);
+                hex.push('#');
+                hex.push('"');
+                for b in bytes {
+                    hex.push_str(&format!("{:02x}", b));
+                }
+                hex.push('"');
+                let type_id = self.type_ids.get("ByteArray").copied().unwrap_or(TypeId(0));
+                ValueRecord::String { text: hex, type_id }
+            }
+            Value::String(s) => {
+                let type_id = self.type_ids.get("String").copied().unwrap_or(TypeId(0));
+                ValueRecord::String {
+                    text: s.clone(),
+                    type_id,
+                }
+            }
+            Value::Closure { params, body_expr } => {
+                let type_id = self.type_ids.get("String").copied().unwrap_or(TypeId(0));
+                ValueRecord::String {
+                    text: format!("fn({}) {{ {body_expr} }}", params.join(", ")),
                     type_id,
                 }
             }
@@ -851,11 +959,7 @@ impl AikenTracer {
             // attach their variables to a real step event (the
             // backend's variable-buffering model expects every
             // variable to belong to the most-recent step).
-            TraceWriter::register_step(
-                &mut *self.writer,
-                source_path,
-                Line(func.line as i64),
-            );
+            TraceWriter::register_step(&mut *self.writer, source_path, Line(func.line as i64));
         }
         for ((param_name, _param_type), arg_val) in func.params.iter().zip(args.iter()) {
             env.insert(param_name.clone(), arg_val.clone());
@@ -883,7 +987,11 @@ impl AikenTracer {
         // means we're not in a block.
         let mut when_matched: Option<bool> = None;
 
+        let mut aborted_by_expect = false;
         for stmt in &func.body {
+            if aborted_by_expect {
+                break;
+            }
             // Track when-block context.  Leaving a contiguous run of
             // `WhenArm` statements ends the block.
             if !matches!(stmt, Statement::WhenArm { .. }) {
@@ -907,9 +1015,7 @@ impl AikenTracer {
                             self.eval_expr_to_value(expr, &env, source_path, func_map)?
                         {
                             if let Value::Tuple(parts) = &rhs {
-                                for (pname, pval) in
-                                    pattern_names.iter().zip(parts.iter())
-                                {
+                                for (pname, pval) in pattern_names.iter().zip(parts.iter()) {
                                     env.insert(pname.clone(), pval.clone());
                                     let value = self.value_to_record(pval);
                                     TraceWriter::register_variable_with_full_value(
@@ -930,9 +1036,7 @@ impl AikenTracer {
                     // historical i64-only UPLC path inside
                     // `eval_expr_to_value` when the expression is
                     // pure arithmetic.
-                    if let Some(val) =
-                        self.eval_expr_to_value(expr, &env, source_path, func_map)?
-                    {
+                    if let Some(val) = self.eval_expr_to_value(expr, &env, source_path, func_map)? {
                         let value = self.value_to_record(&val);
                         env.insert(name.clone(), val);
                         TraceWriter::register_variable_with_full_value(
@@ -953,19 +1057,21 @@ impl AikenTracer {
                     // as `None` and the arms fall back to the legacy
                     // "last arm wins" behaviour.
                     if let Some(scrutinee_expr) = parse_when_opener(expr) {
-                        when_scrutinee = self
-                            .eval_expr_to_value(scrutinee_expr, &env, source_path, func_map)?;
+                        when_scrutinee =
+                            self.eval_expr_to_value(scrutinee_expr, &env, source_path, func_map)?;
                         when_matched = Some(false);
                         continue;
                     }
 
-                    if let Some(val) =
-                        self.eval_expr_to_value(expr, &env, source_path, func_map)?
-                    {
+                    if let Some(val) = self.eval_expr_to_value(expr, &env, source_path, func_map)? {
                         return_value = Some(val);
                     }
                 }
-                Statement::WhenArm { pattern, expr, line } => {
+                Statement::WhenArm {
+                    pattern,
+                    expr,
+                    line,
+                } => {
                     TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
                     // If we have a scrutinee value, evaluate the arm
@@ -979,8 +1085,7 @@ impl AikenTracer {
                             // constructor-name match.  Returns true
                             // when the pattern matches and binds any
                             // captured identifiers into the local env.
-                            let matched =
-                                match_pattern_against_value(pattern, scrut, &mut env);
+                            let matched = match_pattern_against_value(pattern, scrut, &mut env);
                             if matched {
                                 when_matched = Some(true);
                             }
@@ -1033,6 +1138,47 @@ impl AikenTracer {
                     // support, this arm should emit the io_event
                     // inline and the sweep should dedupe.
                     TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
+                }
+                Statement::Expect {
+                    pattern,
+                    expr,
+                    line,
+                } => {
+                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
+
+                    // Runtime semantics: bind on success, abort on
+                    // mismatch.  The Error io_event for failure
+                    // surfaces is emitted from
+                    // `emit_expect_events_for_program` (static-sweep
+                    // pattern, mirrors `emit_fail_events_for_program`).
+                    if let Some(rhs) = self.eval_expr_to_value(expr, &env, source_path, func_map)? {
+                        let mut tentative_env = env.clone();
+                        let matched =
+                            match_pattern_against_value(pattern, &rhs, &mut tentative_env);
+                        if matched {
+                            // Emit one step variable per newly-bound
+                            // identifier (the pattern's captured
+                            // payload).
+                            for (k, v) in &tentative_env {
+                                if !env.contains_key(k) {
+                                    let value = self.value_to_record(v);
+                                    TraceWriter::register_variable_with_full_value(
+                                        &mut *self.writer,
+                                        k,
+                                        value,
+                                    );
+                                }
+                            }
+                            env = tentative_env;
+                        } else {
+                            // Pattern didn't match — abort the
+                            // function (Aiken's `expect` panics).
+                            // The Error io_event is emitted by the
+                            // static sweep, so we don't double-emit
+                            // here.
+                            aborted_by_expect = true;
+                        }
+                    }
                 }
             }
         }
@@ -1098,7 +1244,9 @@ impl AikenTracer {
         let expr_str: &str = &resolved;
 
         // Check for comparison with function call: compute() == 94
-        if let Some(result) = self.eval_comparison_with_call(expr_str, env, source_path, func_map)? {
+        if let Some(result) =
+            self.eval_comparison_with_call(expr_str, env, source_path, func_map)?
+        {
             return Ok(Some(result));
         }
 
@@ -1215,6 +1363,51 @@ impl AikenTracer {
             return self.eval_expr_to_value(&rewritten, env, source_path, func_map);
         }
 
+        // 0aa. Lambda literal `fn(x) { x + 1 }` — Aiken's anonymous
+        // function form.  We capture the parameter list and the body
+        // expression as a `Value::Closure` so subsequent `f(args)`
+        // invocations can dispatch via `eval_closure_call`.  Only
+        // single-expression bodies are supported (sufficient for the
+        // `higher_order_test` fixture); multi-statement bodies fall
+        // through and surface as an unknown identifier.
+        if let Some((params, body_expr)) = parse_lambda_literal(expr) {
+            return Ok(Some(Value::Closure { params, body_expr }));
+        }
+
+        // 0ab. `list.map(xs, fn_value)` higher-order builtin.  We
+        // intercept the dotted call here (the regular
+        // `parse_function_call` rejects `.` in identifiers) and
+        // dispatch the closure over each list element, surfacing
+        // each iteration as its own Call/Return event pair so the
+        // trace shows the per-element invocation.  See
+        // `higher_order_test.ak`.
+        if let Some((list_val, closure_val)) =
+            self.eval_list_map(expr, env, source_path, func_map)?
+        {
+            let mut out: Vec<Value> = Vec::with_capacity(list_val.len());
+            for elem in list_val {
+                let result =
+                    self.eval_closure_call(source_path, &closure_val, &[elem], func_map, env)?;
+                out.push(result.unwrap_or(Value::Int(0)));
+            }
+            return Ok(Some(Value::List(out)));
+        }
+
+        // 0a. Hex byte literal `#"deadbeef"` — Aiken's ByteArray syntax.
+        // Decoded to `Value::ByteArray(Vec<u8>)` so the trace can
+        // distinguish it from a UTF-8 text literal that may render
+        // identically.  See `bytearray_string_test.ak`.
+        if let Some(bytes) = parse_hex_bytearray(expr) {
+            return Ok(Some(Value::ByteArray(bytes)));
+        }
+
+        // 0b. UTF-8 string literal `"FOO"` — Aiken's text-form
+        // ByteArray.  Distinct from the hex form at the `Value` layer
+        // so the trace renderer can pick the right rendering.
+        if let Some(s) = parse_string_literal(expr) {
+            return Ok(Some(Value::String(s)));
+        }
+
         // 1. List literal: `[a, b, c]`.
         if let Some(elems) = parse_list_literal(expr) {
             let mut out = Vec::with_capacity(elems.len());
@@ -1269,9 +1462,7 @@ impl AikenTracer {
         // and `<field>` is either a field name (Record) or numeric
         // index (Tuple).
         if let Some((lhs, field)) = split_top_level_dot(expr) {
-            if let Some(base) =
-                self.eval_expr_to_value(lhs, env, source_path, func_map)?
-            {
+            if let Some(base) = self.eval_expr_to_value(lhs, env, source_path, func_map)? {
                 match (&base, field) {
                     (Value::Record { fields, .. }, fname) => {
                         if let Some((_, v)) = fields.iter().find(|(n, _)| n == fname) {
@@ -1315,8 +1506,7 @@ impl AikenTracer {
         if let Some((ctor_name, arg_exprs)) = parse_function_call(expr) {
             let first = ctor_name.chars().next().unwrap_or('a');
             if first.is_uppercase() && !func_map.contains_key(&ctor_name) {
-                let mut field_vals: Vec<(String, Value)> =
-                    Vec::with_capacity(arg_exprs.len());
+                let mut field_vals: Vec<(String, Value)> = Vec::with_capacity(arg_exprs.len());
                 for (idx, arg) in arg_exprs.iter().enumerate() {
                     if let Some(v) = self.eval_expr_to_value(arg, env, source_path, func_map)? {
                         field_vals.push((format!("{idx}"), v));
@@ -1329,6 +1519,68 @@ impl AikenTracer {
                     discriminator: ctor_name,
                     fields: field_vals,
                 }));
+            }
+        }
+
+        // 5b1. Closure invocation: `f(arg)` where `f` is bound in
+        // env to a `Value::Closure`.  Each invocation surfaces as a
+        // synthetic Call/Return event pair so the trace shows the
+        // per-call site (mirrors the `emit_builtin_call` shape).
+        // See `higher_order_test.ak`.
+        if let Some((call_name, arg_exprs)) = parse_function_call(expr) {
+            if let Some(closure) = env.get(&call_name).cloned() {
+                if matches!(closure, Value::Closure { .. }) {
+                    let mut arg_vals: Vec<Value> = Vec::with_capacity(arg_exprs.len());
+                    let mut ok = true;
+                    for arg_expr in &arg_exprs {
+                        match self.eval_expr_to_value(arg_expr, env, source_path, func_map)? {
+                            Some(v) => arg_vals.push(v),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        let result = self.eval_closure_call(
+                            source_path,
+                            &closure,
+                            &arg_vals,
+                            func_map,
+                            env,
+                        )?;
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+
+        // 5c. Aiken builtin call: `blake2b_256(...)`,
+        // `verify_ed25519_signature(...)`, `slice_bytearray(...)`,
+        // `length_of_bytearray(...)`.  Each surfaces as a synthetic
+        // Call/Return pair so the trace shows the builtin invocation
+        // even though the recorder doesn't run a real cryptographic
+        // implementation.  The synthesised return values are
+        // sufficient for downstream arithmetic in the test body
+        // (e.g. `length_of_bytearray(#"deadbeef")` returns the
+        // literal 4).  See `builtins_test.ak`.
+        if let Some((call_name, arg_exprs)) = parse_function_call(expr) {
+            if is_aiken_builtin(&call_name) {
+                let mut arg_vals: Vec<Value> = Vec::with_capacity(arg_exprs.len());
+                let mut all_ok = true;
+                for arg_expr in &arg_exprs {
+                    match self.eval_expr_to_value(arg_expr, env, source_path, func_map)? {
+                        Some(v) => arg_vals.push(v),
+                        None => {
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if all_ok {
+                    let result = self.emit_builtin_call(source_path, &call_name, &arg_vals);
+                    return Ok(Some(result));
+                }
             }
         }
 
@@ -1370,6 +1622,105 @@ impl AikenTracer {
         // resulting `i64` (if any) back into a `Value::Int`.
         let result = self.eval_expr_via_uplc(expr, env, source_path, func_map)?;
         Ok(result.map(Value::Int))
+    }
+
+    /// Dispatch a `Value::Closure` invocation: bind formal params to
+    /// `args`, evaluate the body expression, emit a synthetic
+    /// Call/Return event pair under the function name `<closure>`.
+    /// Captured-environment access falls back to the caller's `env`
+    /// (the recorder's lambdas don't capture by value yet — for
+    /// `higher_order_test.ak` the body uses only its formal params).
+    fn eval_closure_call(
+        &mut self,
+        source_path: &Path,
+        closure: &Value,
+        args: &[Value],
+        func_map: &HashMap<String, &FunctionDef>,
+        outer_env: &HashMap<String, Value>,
+    ) -> Result<Option<Value>> {
+        let (params, body_expr) = match closure {
+            Value::Closure { params, body_expr } => (params.clone(), body_expr.clone()),
+            _ => return Ok(None),
+        };
+        let fn_id =
+            TraceWriter::ensure_function_id(&mut *self.writer, "<closure>", source_path, Line(0));
+        TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
+
+        // Build the call-local env: outer env (captured) + params.
+        let mut local_env = outer_env.clone();
+        for (param, arg) in params.iter().zip(args.iter()) {
+            local_env.insert(param.clone(), arg.clone());
+            let value = self.value_to_record(arg);
+            TraceWriter::register_variable_with_full_value(&mut *self.writer, param, value);
+        }
+        let result = self.eval_expr_to_value(&body_expr, &local_env, source_path, func_map)?;
+        let return_record = match &result {
+            Some(v) => self.value_to_record(v),
+            None => NONE_VALUE,
+        };
+        TraceWriter::register_return(&mut *self.writer, return_record);
+        Ok(result)
+    }
+
+    /// Recognise and dispatch `list.map(<list_expr>, <closure_expr>)`.
+    /// Returns `Some((list, closure))` when the call shape matches —
+    /// the caller then drives per-element invocation in
+    /// `eval_expr_to_value`.  See `higher_order_test.ak`.
+    fn eval_list_map(
+        &mut self,
+        expr: &str,
+        env: &HashMap<String, Value>,
+        source_path: &Path,
+        func_map: &HashMap<String, &FunctionDef>,
+    ) -> Result<Option<(Vec<Value>, Value)>> {
+        let expr = expr.trim();
+        let Some(after_prefix) = expr.strip_prefix("list.map(") else {
+            return Ok(None);
+        };
+        if !after_prefix.ends_with(')') {
+            return Ok(None);
+        }
+        let inner = &after_prefix[..after_prefix.len() - 1];
+        let parts = split_top_level_commas(inner);
+        if parts.len() != 2 {
+            return Ok(None);
+        }
+        let list_val = match self.eval_expr_to_value(&parts[0], env, source_path, func_map)? {
+            Some(Value::List(xs)) => xs,
+            _ => return Ok(None),
+        };
+        let closure_val = match self.eval_expr_to_value(&parts[1], env, source_path, func_map)? {
+            Some(v @ Value::Closure { .. }) => v,
+            _ => return Ok(None),
+        };
+        Ok(Some((list_val, closure_val)))
+    }
+
+    /// Emit a synthetic Call/Return pair for an Aiken builtin call
+    /// and return the synthesised result `Value`.  The recorder
+    /// doesn't run a real cryptographic implementation; the result
+    /// shapes are chosen so downstream arithmetic in test bodies
+    /// (e.g. `length_of_bytearray(#"deadbeef") == 4`) still drives
+    /// the existing UPLC-CEK pipeline.  See `builtins_test.ak`.
+    fn emit_builtin_call(&mut self, source_path: &Path, name: &str, args: &[Value]) -> Value {
+        let arg_records: Vec<ValueRecord> = args.iter().map(|v| self.value_to_record(v)).collect();
+        // The builtin is registered as a function-table entry with
+        // line 0 (no source line — it's a primitive).
+        let fn_id = TraceWriter::ensure_function_id(&mut *self.writer, name, source_path, Line(0));
+        TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
+        // Per-arg variable so the call_entry shows what was passed.
+        for (i, rec) in arg_records.iter().enumerate() {
+            let varname = format!("arg{i}");
+            TraceWriter::register_variable_with_full_value(
+                &mut *self.writer,
+                &varname,
+                rec.clone(),
+            );
+        }
+        let result = synthesize_builtin_result(name, args);
+        let result_record = self.value_to_record(&result);
+        TraceWriter::register_return(&mut *self.writer, result_record);
+        result
     }
 
     /// Try to evaluate a comparison expression that may contain function calls.
@@ -1459,9 +1810,7 @@ fn resolve_field_accesses(expr: &str, env: &HashMap<String, Value>) -> String {
         };
         if at_word_boundary && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
             let ident_start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
             let ident = &expr[ident_start..i];
@@ -1469,9 +1818,7 @@ fn resolve_field_accesses(expr: &str, env: &HashMap<String, Value>) -> String {
                 // `<ident>.<field>` — gather the field run (alnum / _).
                 let field_start = i + 1;
                 let mut j = field_start;
-                while j < bytes.len()
-                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
-                {
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
                     j += 1;
                 }
                 if j > field_start {
@@ -1542,6 +1889,32 @@ fn try_validator_entry(trimmed: &str) -> Option<&str> {
 /// Parse function definitions (`fn`), test blocks (`test`), and
 /// validator entry points (`spend(...)`, `mint(...)`, etc. inside
 /// `validator <name> { ... }`) from Aiken source.
+/// Scan an Aiken source file for `opaque type Name { ... }` (or
+/// `pub opaque type Name { ... }`) declarations and return the set
+/// of opaque type names.  Used by `AikenTracer::value_to_record` to
+/// label the registered type id with a `" (opaque)"` suffix for
+/// downstream consumers.  Generic parameter lists (`<a, b>`) are
+/// stripped from the recognised name.
+fn collect_opaque_type_names(source: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let after_pub = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+        let Some(rest) = after_pub.strip_prefix("opaque type ") else {
+            continue;
+        };
+        // Strip generic params and trailing `{`.
+        let name_end = rest
+            .find(|c: char| c == '<' || c == '{' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        let name = rest[..name_end].trim();
+        if !name.is_empty() && is_simple_identifier(name) {
+            out.insert(name.to_string());
+        }
+    }
+    out
+}
+
 fn parse_functions(source: &str) -> Vec<FunctionDef> {
     let mut functions = Vec::new();
     let lines: Vec<&str> = source.lines().collect();
@@ -1731,6 +2104,24 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
             if !name.is_empty() && !expr.is_empty() {
                 return Some(Statement::LetBinding {
                     name,
+                    expr,
+                    line: line_num,
+                });
+            }
+        }
+    }
+
+    // Aiken's `expect <pattern> = <expr>` — refinement binding.  The
+    // pattern is everything between `expect ` and the first top-level
+    // `=`; the expression is everything after.  See
+    // `expect_refinement_test.ak`.
+    if let Some(after_expect) = trimmed.strip_prefix("expect ") {
+        if let Some(eq_pos) = after_expect.find('=') {
+            let pattern = after_expect[..eq_pos].trim().to_string();
+            let expr = after_expect[eq_pos + 1..].trim().to_string();
+            if !pattern.is_empty() && !expr.is_empty() {
+                return Some(Statement::Expect {
+                    pattern,
                     expr,
                     line: line_num,
                 });
@@ -2407,6 +2798,187 @@ fn parse_record_literal(expr: &str) -> Option<(String, Vec<(String, String)>)> {
     Some((type_name, out))
 }
 
+/// Parse an Aiken lambda literal `fn(x, y) { body }` into the
+/// parameter names + body expression text.  Multi-statement bodies
+/// aren't supported (the body must fit between the braces as a
+/// single expression).  Used by `eval_expr_to_value` to capture
+/// closures as `Value::Closure { params, body_expr }`.  See
+/// `higher_order_test.ak`.
+fn parse_lambda_literal(expr: &str) -> Option<(Vec<String>, String)> {
+    let expr = expr.trim();
+    let after_fn = expr.strip_prefix("fn(")?;
+    // Find the matching `)` for the param list.
+    let mut depth = 1i32;
+    let mut close = None;
+    for (i, ch) in after_fn.bytes().enumerate() {
+        match ch {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let params_str = &after_fn[..close];
+    let after_params = after_fn[close + 1..].trim_start();
+    let body_section = after_params.strip_prefix('{')?;
+    let body_section = body_section.trim();
+    let body = body_section.strip_suffix('}')?.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let params: Vec<String> = if params_str.trim().is_empty() {
+        vec![]
+    } else {
+        params_str
+            .split(',')
+            .map(|p| {
+                // Strip optional `: Type` annotation.
+                let p = p.trim();
+                if let Some(colon) = p.find(':') {
+                    p[..colon].trim().to_string()
+                } else {
+                    p.to_string()
+                }
+            })
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    Some((params, body.to_string()))
+}
+
+/// Recognise an Aiken builtin call name.  Drives the synthetic-call
+/// path in `eval_expr_to_value` so builtin invocations surface as
+/// Call/Return events even though the recorder doesn't run a real
+/// cryptographic implementation.  See `builtins_test.ak`.
+fn is_aiken_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "blake2b_256"
+            | "blake2b_224"
+            | "sha2_256"
+            | "sha3_256"
+            | "verify_ed25519_signature"
+            | "slice_bytearray"
+            | "length_of_bytearray"
+            | "append_bytearray"
+            | "encode_utf8"
+            | "decode_utf8"
+    )
+}
+
+/// Synthesise a `Value` result for an Aiken builtin call.  The
+/// return shapes are intentionally non-cryptographic (the recorder
+/// doesn't link a hash library) but match the spec-correct kind so
+/// downstream `let h = blake2b_256(payload)` bindings surface as
+/// `Value::ByteArray` and arithmetic on `length_of_bytearray(...)`
+/// still drives the UPLC-CEK pipeline.
+fn synthesize_builtin_result(name: &str, args: &[Value]) -> Value {
+    match name {
+        // Hash builtins: return a 32-byte zeroed ByteArray (real
+        // implementations would feed `args[0]` through the
+        // corresponding crypto primitive).
+        "blake2b_256" | "sha2_256" | "sha3_256" => Value::ByteArray(vec![0u8; 32]),
+        "blake2b_224" => Value::ByteArray(vec![0u8; 28]),
+        // Signature verification: returns Bool.  We model Bool as
+        // Int in the recorder (the writer pre-registers Bool at the
+        // type-id table as TypeKind::Int — see `trace_program`).
+        "verify_ed25519_signature" => Value::Int(1),
+        "slice_bytearray" => {
+            // (start, end, bytes) → bytes[start..end]
+            if args.len() == 3 {
+                if let (Some(start), Some(end), Value::ByteArray(bytes)) =
+                    (args[0].as_i64(), args[1].as_i64(), &args[2])
+                {
+                    let s = start.max(0) as usize;
+                    let e = (end.max(0) as usize).min(bytes.len());
+                    if s <= e {
+                        return Value::ByteArray(bytes[s..e].to_vec());
+                    }
+                }
+            }
+            Value::ByteArray(vec![])
+        }
+        "length_of_bytearray" => {
+            if let Some(Value::ByteArray(bytes)) = args.first() {
+                Value::Int(bytes.len() as i64)
+            } else if let Some(Value::String(s)) = args.first() {
+                Value::Int(s.len() as i64)
+            } else {
+                Value::Int(0)
+            }
+        }
+        "append_bytearray" => {
+            if args.len() == 2 {
+                let mut out = Vec::new();
+                for arg in args {
+                    if let Value::ByteArray(bytes) = arg {
+                        out.extend_from_slice(bytes);
+                    }
+                }
+                return Value::ByteArray(out);
+            }
+            Value::ByteArray(vec![])
+        }
+        "encode_utf8" => {
+            if let Some(Value::String(s)) = args.first() {
+                return Value::ByteArray(s.as_bytes().to_vec());
+            }
+            Value::ByteArray(vec![])
+        }
+        "decode_utf8" => {
+            if let Some(Value::ByteArray(bytes)) = args.first() {
+                if let Ok(s) = std::str::from_utf8(bytes) {
+                    return Value::String(s.to_string());
+                }
+            }
+            Value::String(String::new())
+        }
+        _ => Value::Int(0),
+    }
+}
+
+/// Parse an Aiken hex byte literal `#"deadbeef"` into the decoded
+/// byte sequence.  Returns `None` for non-hex literals or malformed
+/// inputs (odd-length hex, non-hex chars).  See
+/// `bytearray_string_test.ak` for the canonical exercise.
+fn parse_hex_bytearray(expr: &str) -> Option<Vec<u8>> {
+    let expr = expr.trim();
+    let rest = expr.strip_prefix('#')?;
+    let inner = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"'))?;
+    if inner.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(inner.len() / 2);
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let high = (bytes[i] as char).to_digit(16)?;
+        let low = (bytes[i + 1] as char).to_digit(16)?;
+        out.push(((high << 4) | low) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
+/// Parse an Aiken UTF-8 string literal `"FOO"` into its inner text.
+/// Returns `None` if the input isn't a quoted string or carries an
+/// embedded `"` (no escape handling — sufficient for the `bytearray_
+/// string_test` fixture and avoids a full mini-lexer).
+fn parse_string_literal(expr: &str) -> Option<String> {
+    let expr = expr.trim();
+    let inner = expr.strip_prefix('"').and_then(|s| s.strip_suffix('"'))?;
+    if inner.contains('"') {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2560,7 +3132,10 @@ test flow_test() {
         // Multi-argument call: top-level commas split.
         assert_eq!(
             parse_function_call("combine(a, b + 1)"),
-            Some(("combine".to_string(), vec!["a".to_string(), "b + 1".to_string()]))
+            Some((
+                "combine".to_string(),
+                vec!["a".to_string(), "b + 1".to_string()]
+            ))
         );
         // Nested call inside an arg keeps the inner parens intact and
         // is NOT split on the inner comma.
