@@ -1944,6 +1944,9 @@ fn find_top_level_is(s: &str) -> Option<usize> {
 /// * Constructor with payload `Some(x)`, `Ok(v)`, `Error(e)` —
 ///   matches a `Value::Variant` with the same discriminator and
 ///   binds the single payload identifier to the inner contents.
+/// * Nested constructor patterns `Wrap(InnerActive(n))` —
+///   recursively destructures each constructor level, binding any
+///   identifier patterns to the corresponding payload value.
 fn match_pattern_against_value(
     pattern: &str,
     scrutinee: &Value,
@@ -1960,38 +1963,46 @@ fn match_pattern_against_value(
             _ => false,
         };
     }
-    // Constructor pattern: `Name` or `Name(arg)`.
+    // Constructor pattern: `Name` or `Name(arg1, arg2, ...)`.  The
+    // inner argument list is split at top-level commas so each sub-
+    // pattern can recurse — that's how nested forms like
+    // `Wrap(InnerActive(n))` get destructured (the outer `Wrap` arm
+    // matches the outer Variant, then the recursion matches
+    // `InnerActive(n)` against the inner payload and binds `n`).
     if let Some(open) = pattern.find('(') {
         if pattern.ends_with(')') {
             let ctor = pattern[..open].trim();
             let inner = pattern[open + 1..pattern.len() - 1].trim();
+            // Reject malformed prefixes (e.g. an empty constructor
+            // name or a non-identifier prefix) so we don't silently
+            // mis-match on grouped sub-expressions.
+            if !is_simple_identifier(ctor) {
+                return false;
+            }
             if let Value::Variant {
                 discriminator,
                 fields,
                 ..
             } = scrutinee
             {
-                if ctor == discriminator {
-                    // Bind the single inner identifier (if any) to
-                    // the first field of the variant payload.
-                    if is_simple_identifier(inner) && !fields.is_empty() {
-                        env.insert(inner.to_string(), fields[0].1.clone());
-                        return true;
-                    }
-                    // Nullary payload syntax `Name()` is rare but
-                    // valid.
-                    if inner.is_empty() {
-                        return true;
-                    }
-                    // Non-trivial inner patterns (nested constructor
-                    // `Some(Foo { .. })`, list rest `[h, ..t]`, tuple
-                    // `(a, b)`) are NOT decoded — we report
-                    // non-match so the wildcard arm fires.  This is
-                    // the recorder bug pinned by
-                    // `pattern_match_test.ak`.
+                if ctor != discriminator {
                     return false;
                 }
-                return false;
+                // Nullary payload syntax `Name()` — accepted iff the
+                // variant carries no fields.
+                if inner.is_empty() {
+                    return fields.is_empty();
+                }
+                let sub_patterns = split_top_level_commas(inner);
+                if sub_patterns.len() != fields.len() {
+                    return false;
+                }
+                for (sub_pat, (_, sub_val)) in sub_patterns.iter().zip(fields.iter()) {
+                    if !match_pattern_against_value(sub_pat, sub_val, env) {
+                        return false;
+                    }
+                }
+                return true;
             }
             return false;
         }
