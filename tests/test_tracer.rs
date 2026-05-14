@@ -1374,17 +1374,17 @@ fn test_validator_test_via_ct_print_full() {
 
 // --- pattern_match_test.ak -------------------------------------------------
 
-/// Records `pattern_match_test.ak` and pins the CURRENT
-/// (intentionally limited) when-arm matcher behaviour:
+/// Records `pattern_match_test.ak` and pins the when-arm matcher
+/// behaviour:
 ///
 /// * Flat patterns (`Some(x)`, `None`, integer literals, wildcard,
 ///   bare constructor names) are decoded correctly.
 /// * Nested constructor patterns (`Wrap(InnerActive(n))`) are
-///   recognised at the outer constructor only; the inner level
-///   isn't destructured, so the matcher reports non-match and the
-///   wildcard arm fires.  RECORDER BUG: the spec-correct
-///   behaviour would bind `n=9` and return 9 — pinned by
-///   `test_pattern_match_test_nested_decodes` (`#[ignore]`).
+///   destructured recursively — the outer arm matches the outer
+///   `Wrap` Variant, then the inner pattern matches the
+///   `InnerActive(n)` payload and binds `n` to the inner integer.
+///   The spec-correct behaviour (`nested_val=9`, `total=15`) is
+///   also pinned by `test_pattern_match_test_nested_decodes`.
 #[test]
 fn test_pattern_match_test_via_ct_print_full() {
     let Some((doc, source_path)) = record_and_dump_full(
@@ -1468,19 +1468,19 @@ fn test_pattern_match_test_via_ct_print_full() {
             // separate variable.
             ("wrapped".into(), "Variant".into(), Some("Wrap".into()), None),
             // nested_match(wrapped): param `w` is the Wrap.  The
-            // `Wrap(InnerActive(n))` arm can't be destructured (the
-            // matcher returns non-match), so the wildcard arm
-            // `_ -> 100` fires.  RECORDER BUG: the spec-correct
-            // value would be 9.
+            // `Wrap(InnerActive(n))` arm now destructures
+            // recursively: the outer pattern matches the `Wrap`
+            // Variant, the inner `InnerActive(n)` matches the
+            // payload Variant and binds `n=9`, so the arm body
+            // returns 9.
             ("w".into(), "Variant".into(), Some("Wrap".into()), None),
-            ("nested_val".into(), "Int".into(), None, Some(100)),
-            // compute's running total = 7 + (-1) + 100 = 106.
-            // Spec-correct would be 7 + (-1) + 9 = 15.
-            ("total".into(), "Int".into(), None, Some(106)),
+            ("nested_val".into(), "Int".into(), None, Some(9)),
+            // compute's running total = 7 + (-1) + 9 = 15.
+            ("total".into(), "Int".into(), None, Some(15)),
         ],
     );
 
-    // ----- Return values: 7, -1, 100, 106 ------------------------------
+    // ----- Return values: 7, -1, 9, 15 ---------------------------------
     let returns: Vec<i64> = events
         .iter()
         .filter(|e| e["kind"] == "call_exit")
@@ -1490,22 +1490,16 @@ fn test_pattern_match_test_via_ct_print_full() {
             rv["i"].as_i64().expect("return value Int.i")
         })
         .collect();
-    assert_eq!(returns, vec![7, -1, 100, 106]);
+    assert_eq!(returns, vec![7, -1, 9, 15]);
 }
 
-/// Spec-correct expectation for `pattern_match_test.ak`.  Once the
-/// recorder gains nested-constructor destructuring (so `Wrap(
-/// InnerActive(n))` binds `n` to the inner payload), `nested_val`
-/// should be 9 (the bound payload) and `total` should be 15 (=
-/// 7 + (-1) + 9), not 106.  RECORDER BUG: the matcher today only
-/// destructures the outer constructor — see the inline comment in
-/// `match_pattern_against_value` and the strict pin
-/// `test_pattern_match_test_via_ct_print_full` above.
+/// Spec-correct expectation for `pattern_match_test.ak`.  The
+/// nested-constructor matcher in `match_pattern_against_value`
+/// (`src/tracer.rs`) recursively destructures the `Wrap(
+/// InnerActive(n))` arm and binds `n=9`, so `nested_val == 9` and
+/// `total == 7 + (-1) + 9 == 15`.  This complements the
+/// shape-pinning `test_pattern_match_test_via_ct_print_full` above.
 #[test]
-#[ignore = "RECORDER BUG: nested constructor patterns (Wrap(InnerActive(n))) \
-            aren't destructured; only the outer ctor is matched.  The matcher \
-            reports non-match so the wildcard arm fires.  See \
-            match_pattern_against_value() in src/tracer.rs."]
 fn test_pattern_match_test_nested_decodes() {
     let Some((doc, _)) = record_and_dump_full(
         "test_pattern_match_test_nested_decodes",
@@ -1513,16 +1507,42 @@ fn test_pattern_match_test_nested_decodes() {
     ) else {
         return;
     };
-    let int_vars = observed_var_sequence(&doc);
+    // Walk the per-step `vars` arrays directly (the program emits a
+    // mix of `Variant` and `Int` values, so we can't reuse the
+    // `observed_var_sequence` Int-only helper).  We only need the
+    // two Int bindings produced by the nested pattern match.
+    let int_vars: Vec<(String, i64)> = doc["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| {
+                    let name = v["varname"].as_str()?.to_string();
+                    let kind = v["value"]["kind"].as_str()?;
+                    if kind != "Int" {
+                        return None;
+                    }
+                    let i = v["value"]["i"].as_i64()?;
+                    Some((name, i))
+                })
+        })
+        .collect();
     let nested_val = int_vars
         .iter()
         .find(|(n, _)| n == "nested_val")
         .map(|(_, v)| *v);
-    assert_eq!(nested_val, Some(9), "nested_val should be the bound `n` = 9");
-    let total = int_vars
-        .iter()
-        .find(|(n, _)| n == "total")
-        .map(|(_, v)| *v);
+    assert_eq!(
+        nested_val,
+        Some(9),
+        "nested_val should be the bound `n` = 9"
+    );
+    let total = int_vars.iter().find(|(n, _)| n == "total").map(|(_, v)| *v);
     assert_eq!(total, Some(15), "total should be 7 + (-1) + 9 = 15");
 }
 

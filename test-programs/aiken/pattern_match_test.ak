@@ -1,30 +1,26 @@
 // Exercises deep pattern matching.  The recorder's when-arm matcher
-// (added alongside `recursion_test.ak`) handles three pattern shapes
-// today:
+// (added alongside `recursion_test.ak`) handles these pattern shapes:
 //
 //   1. Integer literal patterns: `0 -> ...`, `-1 -> ...`.
 //   2. Wildcard `_` — always matches.
 //   3. Bare constructor names and single-payload constructors:
 //      `None`, `Some(x)`, `Pending`, `Active(n)`.
+//   4. Nested constructor patterns: `Wrap(InnerActive(n))` —
+//      destructured recursively so the inner `n` binds to the
+//      payload of the inner Variant.
 //
-// Nested constructor patterns (`Some(Foo { x, .. })`), list rest
-// patterns (`[head, ..tail]`), and tuple patterns (`(a, b, c)`) are
-// NOT decoded — they fall through to the wildcard arm.  This
-// fixture pins the CURRENT behaviour for both the well-handled
-// shapes (a flat `Option<Int>` switch) and the not-yet-handled
-// nested shapes (a `Wrapped<Inner>` two-level switch where the
-// inner discriminator is invisible to the matcher).
+// List rest patterns (`[head, ..tail]`) and tuple patterns
+// (`(a, b, c)`) are not yet decoded and still fall through to the
+// wildcard arm.  This fixture pins the well-handled shapes plus the
+// nested-constructor case.
 //
 // Flow:
 //
 //   * `flat_match(Some(7))` → 7  (integer-payload binding works)
 //   * `flat_match(None)`    → -1 (nullary-constructor match works)
-//   * `nested_match(Wrapped(InnerActive(9)))` should ideally
-//     bind `n=9` and return `9`, but the matcher today can't
-//     destructure the inner constructor, so the `_ -> 100`
-//     wildcard fires.  Captured as 100 here; the spec-correct
-//     value (9) is pinned by `test_pattern_match_test_nested_decodes`
-//     with `#[ignore]`.
+//   * `nested_match(Wrap(InnerActive(9)))` → 9 (the inner pattern
+//     binds `n=9`).  The wildcard `_ -> 100` arm is dead.
+//   * `compute()` totals 7 + (-1) + 9 = 15.
 
 type WInner {
   InnerActive(Int)
@@ -59,5 +55,5 @@ fn compute() -> Int {
 }
 
 test pattern_match() {
-  compute() == 106
+  compute() == 15
 }
