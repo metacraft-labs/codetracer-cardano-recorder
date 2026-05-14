@@ -157,8 +157,11 @@ fn compile_expr_to_uplc(expr: &str, known: &HashMap<String, i64>) -> Option<Term
         return Some(Term::Constant(Rc::new(Constant::Bool(false))));
     }
 
-    // Integer literal.
-    if let Ok(val) = expr.parse::<i64>() {
+    // Integer literal.  Aiken accepts `_` as a thousands separator
+    // (e.g. `1_000_000`); strip them before delegating to the
+    // standard i64 parser, which doesn't understand the underscore
+    // form.  Also accept negative literals via a leading `-`.
+    if let Some(val) = parse_int_literal(expr) {
         return Some(uplc_int(val));
     }
 
@@ -443,6 +446,14 @@ struct FunctionDef {
     params: Vec<(String, String)>,
     body: Vec<Statement>,
     line: u32,
+    /// Source file the function was defined in.  `None` for functions
+    /// parsed from the program's primary source file (the recorder
+    /// then uses the path passed into `evaluate_function`).  `Some`
+    /// for functions parsed from imported modules (loaded by the
+    /// `use` directive follower); the override is what makes
+    /// cross-module step events carry the imported file's path on
+    /// the wire.  See `module_imports_test.ak`.
+    source_path: Option<std::path::PathBuf>,
 }
 
 /// A parsed statement in an Aiken function body.
@@ -539,6 +550,13 @@ pub struct AikenTracer {
     /// downstream consumers can distinguish opaque-wrapped values from
     /// plain records.  See `opaque_generic_test.ak`.
     opaque_type_names: std::collections::HashSet<String>,
+    /// Top-level `const NAME = EXPR` declarations evaluated up-front
+    /// in source order (see `evaluate_consts`).  Seeded into every
+    /// function-local env at function entry so const references
+    /// resolve at runtime regardless of whether the function is the
+    /// program's entry point or a nested callee.  See
+    /// `const_bindings_test.ak`.
+    consts: HashMap<String, Value>,
 }
 
 impl AikenTracer {
@@ -562,8 +580,16 @@ impl AikenTracer {
         // CTFS exclusively.
         let format = TraceEventsFileFormat::Ctfs;
         let _source_map = SourceMap::from_source(source_path, source_code);
-        let functions = parse_functions(source_code);
+        let mut functions = parse_functions(source_code);
+        // Follow `use module/path.{names}` directives and merge in
+        // any imported modules' `pub fn` declarations.  Each imported
+        // function is tagged with its source path so cross-module
+        // step events carry the right path on the wire.  See
+        // `module_imports_test.ak`.
+        let imported = load_imported_modules(source_path, source_code);
+        functions.extend(imported);
         let opaque_type_names = collect_opaque_type_names(source_code);
+        let const_decls = parse_const_declarations(source_code);
 
         eprintln!("Parsed {} functions", functions.len());
 
@@ -572,6 +598,7 @@ impl AikenTracer {
             writer: create_trace_writer(&program_str, &[], format),
             type_ids: HashMap::new(),
             opaque_type_names,
+            consts: HashMap::new(),
         };
 
         std::fs::create_dir_all(out_dir)
@@ -608,6 +635,18 @@ impl AikenTracer {
             let type_id = TraceWriter::ensure_type_id(&mut *tracer.writer, *kind, type_name);
             tracer.type_ids.insert(type_name.to_string(), type_id);
         }
+
+        // Evaluate top-level `const NAME = EXPR` declarations BEFORE
+        // any function executes so const references resolve at
+        // runtime.  The result is stored on the tracer and seeded
+        // into every function-local env at function entry — see
+        // `evaluate_function`.  Pre-this-fixture (`const_bindings_
+        // test.ak`) the recorder ignored `const` declarations and
+        // any reference from a function body resolved as an unknown
+        // identifier.
+        let func_map_for_consts: HashMap<String, &FunctionDef> =
+            functions.iter().map(|f| (f.name.clone(), f)).collect();
+        tracer.consts = tracer.evaluate_consts(source_path, &const_decls, &func_map_for_consts)?;
 
         tracer.evaluate_program(source_path, &functions)?;
 
@@ -747,25 +786,85 @@ impl AikenTracer {
         }
     }
 
+    /// Evaluate every top-level `const NAME = EXPR` declaration in
+    /// source order, returning a `Value` env that the per-function
+    /// evaluator seeds itself with so const references resolve at
+    /// runtime.  Pre-this-fixture (`const_bindings_test.ak`) the
+    /// recorder ignored `const` declarations entirely; any reference
+    /// from a function body resolved as an unknown identifier and the
+    /// let-binding RHS surfaced no value in the trace.
+    ///
+    /// Each const is evaluated through the same `eval_expr_to_value`
+    /// pipeline that handles let-binding RHSs, with the running
+    /// `consts_env` as the scope — so a later const can reference an
+    /// earlier one (the canonical use case is
+    /// `const half_supply: Int = max_supply / 2`).
+    fn evaluate_consts(
+        &mut self,
+        source_path: &Path,
+        consts: &[ConstDecl],
+        func_map: &HashMap<String, &FunctionDef>,
+    ) -> Result<HashMap<String, Value>> {
+        let mut consts_env: HashMap<String, Value> = HashMap::new();
+        for decl in consts {
+            if let Some(val) =
+                self.eval_expr_to_value(&decl.expr, &consts_env, source_path, func_map)?
+            {
+                consts_env.insert(decl.name.clone(), val);
+            }
+        }
+        Ok(consts_env)
+    }
+
     /// Evaluate the program starting from the first `test` block or `fn main()`.
+    ///
+    /// Multi-test files (no `main`, 2+ `test` blocks — the canonical
+    /// shape that `multi_test_entry_test.ak` exercises) run EVERY test
+    /// block, each wrapped in its own Call/Return event pair so the
+    /// trace surfaces one Function entry per test.  Single-entry files
+    /// (a `main` function, or a single `test` block) keep the legacy
+    /// "merge entry into <toplevel>" behaviour: TraceWriter::start()
+    /// already created <toplevel> at depth 0, and emitting a
+    /// register_call for the sole entry function would push all steps
+    /// to depth 1, breaking step-over from the initial position.
+    ///
+    /// Top-level `const` declarations are evaluated up-front in
+    /// `trace_program` and stored on `self.consts`; `evaluate_function`
+    /// seeds every function-local env with them so const references
+    /// resolve at runtime.  See `const_bindings_test.ak`.
     fn evaluate_program(&mut self, source_path: &Path, functions: &[FunctionDef]) -> Result<()> {
         let func_map: HashMap<String, &FunctionDef> =
             functions.iter().map(|f| (f.name.clone(), f)).collect();
 
-        let entry = func_map
-            .get("main")
-            .copied()
-            .or_else(|| functions.iter().find(|f| f.is_test));
+        // Prefer `main` when present.
+        if let Some(main_fn) = func_map.get("main").copied() {
+            let mut env: HashMap<String, Value> = HashMap::new();
+            self.evaluate_function(source_path, main_fn, &func_map, &mut env, true, &[])?;
+            return Ok(());
+        }
 
-        let entry_fn =
-            entry.ok_or_else(|| eyre!("no main function or test block found in Aiken program"))?;
+        let test_fns: Vec<&FunctionDef> = functions.iter().filter(|f| f.is_test).collect();
+        if test_fns.is_empty() {
+            return Err(eyre!(
+                "no main function or test block found in Aiken program"
+            ));
+        }
 
-        let mut env: HashMap<String, Value> = HashMap::new();
-        // Merge the entry-point function into <toplevel> by skipping its
-        // Call/Return events. TraceWriter::start() already created <toplevel>
-        // at depth 0. Emitting register_call for the entry function would push
-        // all steps to depth 1, breaking step-over from the initial position.
-        self.evaluate_function(source_path, entry_fn, &func_map, &mut env, true, &[])?;
+        if test_fns.len() == 1 {
+            // Legacy single-test path: merge into <toplevel>.
+            let mut env: HashMap<String, Value> = HashMap::new();
+            self.evaluate_function(source_path, test_fns[0], &func_map, &mut env, true, &[])?;
+            return Ok(());
+        }
+
+        // Multi-test path: each test gets its own Call/Return pair so
+        // the trace surfaces one Function entry per test.  `is_entry_
+        // point=false` flips on the register_call/register_return
+        // bookkeeping in `evaluate_function`.
+        for test_fn in &test_fns {
+            let mut env: HashMap<String, Value> = HashMap::new();
+            self.evaluate_function(source_path, test_fn, &func_map, &mut env, false, &[])?;
+        }
 
         Ok(())
     }
@@ -925,21 +1024,36 @@ impl AikenTracer {
         source_path: &Path,
         func: &FunctionDef,
         func_map: &HashMap<String, &FunctionDef>,
-        _parent_env: &mut HashMap<String, Value>,
+        parent_env: &mut HashMap<String, Value>,
         is_entry_point: bool,
         args: &[Value],
     ) -> Result<Option<Value>> {
+        // Functions imported via a `use` directive carry their own
+        // source path (set by `load_imported_modules` when the
+        // module's `pub fn` declarations are merged into the function
+        // table).  All steps, function-id registrations, and
+        // expression evaluations inside the function body should use
+        // that path so cross-module step events surface with the
+        // imported file's path on the wire.  See
+        // `module_imports_test.ak`.
+        let effective_path: &Path = func.source_path.as_deref().unwrap_or(source_path);
         let fn_id = TraceWriter::ensure_function_id(
             &mut *self.writer,
             &func.name,
-            source_path,
+            effective_path,
             Line(func.line as i64),
         );
         if !is_entry_point {
             TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
         }
 
-        let mut env: HashMap<String, Value> = HashMap::new();
+        // Seed the local env with the program's top-level `const`
+        // declarations so const references resolve at runtime,
+        // regardless of whether this is the program entry point or a
+        // nested callee.  Locals (let-bindings) shadow any const of
+        // the same name as expected.
+        let _ = parent_env; // historical no-op slot, kept for future use.
+        let mut env: HashMap<String, Value> = self.consts.clone();
         // Bind formal params to actual arg values and emit each as a
         // step variable so structured arguments (tuple / record /
         // list) actually surface in the trace's variable stream.
@@ -959,7 +1073,7 @@ impl AikenTracer {
             // attach their variables to a real step event (the
             // backend's variable-buffering model expects every
             // variable to belong to the most-recent step).
-            TraceWriter::register_step(&mut *self.writer, source_path, Line(func.line as i64));
+            TraceWriter::register_step(&mut *self.writer, effective_path, Line(func.line as i64));
         }
         for ((param_name, _param_type), arg_val) in func.params.iter().zip(args.iter()) {
             env.insert(param_name.clone(), arg_val.clone());
@@ -1001,7 +1115,11 @@ impl AikenTracer {
 
             match stmt {
                 Statement::LetBinding { name, expr, line } => {
-                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
+                    TraceWriter::register_step(
+                        &mut *self.writer,
+                        effective_path,
+                        Line(*line as i64),
+                    );
 
                     // `let (a, b) = <expr>` — Aiken tuple-destructuring
                     // pattern.  We resolve <expr> to a `Value::Tuple`
@@ -1012,7 +1130,7 @@ impl AikenTracer {
                     // step rather than an opaque `(a, b) = ...`).
                     if let Some(pattern_names) = parse_tuple_pattern(name) {
                         if let Some(rhs) =
-                            self.eval_expr_to_value(expr, &env, source_path, func_map)?
+                            self.eval_expr_to_value(expr, &env, effective_path, func_map)?
                         {
                             if let Value::Tuple(parts) = &rhs {
                                 for (pname, pval) in pattern_names.iter().zip(parts.iter()) {
@@ -1036,7 +1154,9 @@ impl AikenTracer {
                     // historical i64-only UPLC path inside
                     // `eval_expr_to_value` when the expression is
                     // pure arithmetic.
-                    if let Some(val) = self.eval_expr_to_value(expr, &env, source_path, func_map)? {
+                    if let Some(val) =
+                        self.eval_expr_to_value(expr, &env, effective_path, func_map)?
+                    {
                         let value = self.value_to_record(&val);
                         env.insert(name.clone(), val);
                         TraceWriter::register_variable_with_full_value(
@@ -1047,7 +1167,11 @@ impl AikenTracer {
                     }
                 }
                 Statement::Expr { expr, line } => {
-                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
+                    TraceWriter::register_step(
+                        &mut *self.writer,
+                        effective_path,
+                        Line(*line as i64),
+                    );
 
                     // Detect a `when <scrutinee> is {` opener so the
                     // following contiguous run of `WhenArm`s can be
@@ -1057,13 +1181,19 @@ impl AikenTracer {
                     // as `None` and the arms fall back to the legacy
                     // "last arm wins" behaviour.
                     if let Some(scrutinee_expr) = parse_when_opener(expr) {
-                        when_scrutinee =
-                            self.eval_expr_to_value(scrutinee_expr, &env, source_path, func_map)?;
+                        when_scrutinee = self.eval_expr_to_value(
+                            scrutinee_expr,
+                            &env,
+                            effective_path,
+                            func_map,
+                        )?;
                         when_matched = Some(false);
                         continue;
                     }
 
-                    if let Some(val) = self.eval_expr_to_value(expr, &env, source_path, func_map)? {
+                    if let Some(val) =
+                        self.eval_expr_to_value(expr, &env, effective_path, func_map)?
+                    {
                         return_value = Some(val);
                     }
                 }
@@ -1072,7 +1202,11 @@ impl AikenTracer {
                     expr,
                     line,
                 } => {
-                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
+                    TraceWriter::register_step(
+                        &mut *self.writer,
+                        effective_path,
+                        Line(*line as i64),
+                    );
 
                     // If we have a scrutinee value, evaluate the arm
                     // only when the pattern matches.  Once one arm
@@ -1102,7 +1236,7 @@ impl AikenTracer {
 
                     if should_eval {
                         if let Some(val) =
-                            self.eval_expr_to_value(expr, &env, source_path, func_map)?
+                            self.eval_expr_to_value(expr, &env, effective_path, func_map)?
                         {
                             return_value = Some(val);
                         }
@@ -1137,21 +1271,31 @@ impl AikenTracer {
                     // gains "execute every reachable `trace`"
                     // support, this arm should emit the io_event
                     // inline and the sweep should dedupe.
-                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
+                    TraceWriter::register_step(
+                        &mut *self.writer,
+                        effective_path,
+                        Line(*line as i64),
+                    );
                 }
                 Statement::Expect {
                     pattern,
                     expr,
                     line,
                 } => {
-                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
+                    TraceWriter::register_step(
+                        &mut *self.writer,
+                        effective_path,
+                        Line(*line as i64),
+                    );
 
                     // Runtime semantics: bind on success, abort on
                     // mismatch.  The Error io_event for failure
                     // surfaces is emitted from
                     // `emit_expect_events_for_program` (static-sweep
                     // pattern, mirrors `emit_fail_events_for_program`).
-                    if let Some(rhs) = self.eval_expr_to_value(expr, &env, source_path, func_map)? {
+                    if let Some(rhs) =
+                        self.eval_expr_to_value(expr, &env, effective_path, func_map)?
+                    {
                         let mut tentative_env = env.clone();
                         let matched =
                             match_pattern_against_value(pattern, &rhs, &mut tentative_env);
@@ -1889,6 +2033,167 @@ fn try_validator_entry(trimmed: &str) -> Option<&str> {
 /// Parse function definitions (`fn`), test blocks (`test`), and
 /// validator entry points (`spend(...)`, `mint(...)`, etc. inside
 /// `validator <name> { ... }`) from Aiken source.
+/// A parsed `use` import directive.  Carries the qualified module
+/// path (e.g. `my_project/helpers`) and the optional list of named
+/// imports inside the trailing `.{...}` clause.  See
+/// `module_imports_test.ak`.
+#[derive(Debug, Clone)]
+struct UseDirective {
+    module_path: String,
+    #[allow(dead_code)]
+    imports: Vec<String>,
+}
+
+/// Scan an Aiken source file for top-level `use module/path[.{names}]`
+/// import directives.  The recorder follows each one to load the
+/// imported module's source and merge its `pub fn` declarations into
+/// the function table — see `load_imported_modules`.
+///
+/// Recognised forms:
+///
+///   * `use a/b/c`               — bare module import (no name list)
+///   * `use a/b/c.{name1, T2}`   — selective import; the names are
+///                                 captured but not currently
+///                                 enforced (the recorder pulls in
+///                                 every `pub fn` from the module).
+fn parse_use_directives(source: &str) -> Vec<UseDirective> {
+    let mut out = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("use ") else {
+            continue;
+        };
+        let rest = rest.trim();
+        // Split off optional `.{...}` clause.
+        let (module_path, imports) = if let Some(brace) = rest.find(".{") {
+            let module_path = rest[..brace].trim().to_string();
+            let after = &rest[brace + 2..];
+            let inner = after
+                .strip_suffix('}')
+                .unwrap_or(after)
+                .trim_end_matches(';')
+                .trim();
+            let imports: Vec<String> = inner
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            (module_path, imports)
+        } else {
+            (rest.trim_end_matches(';').trim().to_string(), Vec::new())
+        };
+        if module_path.is_empty() {
+            continue;
+        }
+        out.push(UseDirective {
+            module_path,
+            imports,
+        });
+    }
+    out
+}
+
+/// Resolve a `use` module path (e.g. `my_project/helpers`) to a
+/// concrete sibling `.ak` file.  Aiken's project layout is
+/// `<project>/lib/<module>.ak` for library modules; the recorder
+/// follows that convention by stripping the leading project-name
+/// segment and prefixing the remainder with `lib/`.  Returns `None`
+/// if the resolved file doesn't exist on disk.
+///
+/// Resolution order (first existing path wins):
+///   1. `<source_dir>/lib/<rest>.ak`        — strip leading segment.
+///   2. `<source_dir>/lib/<module_path>.ak` — keep the full path.
+///   3. `<source_dir>/<last_segment>.ak`    — bare sibling fallback.
+fn resolve_module_path(primary_source: &Path, module_path: &str) -> Option<std::path::PathBuf> {
+    let parent = primary_source.parent()?;
+    let segments: Vec<&str> = module_path.split('/').collect();
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if segments.len() >= 2 {
+        let after_first = segments[1..].join("/");
+        candidates.push(parent.join("lib").join(format!("{after_first}.ak")));
+    }
+    candidates.push(parent.join("lib").join(format!("{module_path}.ak")));
+    if let Some(last) = segments.last() {
+        candidates.push(parent.join(format!("{last}.ak")));
+    }
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// Load and parse every module reachable from the primary source via
+/// a `use` directive, returning the merged function list (each
+/// imported function tagged with its source path so cross-module
+/// step events carry the right path on the wire).  See
+/// `module_imports_test.ak`.
+fn load_imported_modules(primary_source: &Path, primary_source_code: &str) -> Vec<FunctionDef> {
+    let mut out = Vec::new();
+    for directive in parse_use_directives(primary_source_code) {
+        let Some(module_path) = resolve_module_path(primary_source, &directive.module_path) else {
+            continue;
+        };
+        let Ok(module_source) = std::fs::read_to_string(&module_path) else {
+            continue;
+        };
+        let mut funcs = parse_functions(&module_source);
+        for f in &mut funcs {
+            f.source_path = Some(module_path.clone());
+        }
+        out.extend(funcs);
+    }
+    out
+}
+
+/// A parsed top-level `const` declaration.  Carries the source-level
+/// expression text so the tracer can evaluate it through the same
+/// `eval_expr_to_value` pipeline that handles let-binding RHSs (this
+/// is what lets a const reference an earlier const, e.g.
+/// `const half_supply: Int = max_supply / 2`).
+#[derive(Debug, Clone)]
+struct ConstDecl {
+    name: String,
+    expr: String,
+}
+
+/// Scan an Aiken source file for top-level `const` declarations.
+/// Returns the list in source order so the caller can evaluate them
+/// in dependency order — `eval_expr_to_value` resolves identifier
+/// references against the running env, so an earlier const must be
+/// bound before a later one references it.
+///
+/// Recognised forms (the leading `pub` is optional):
+///
+///   * `const NAME: TYPE = EXPR`
+///   * `const NAME = EXPR`
+///
+/// Multi-line consts are NOT supported (the expression must fit on a
+/// single line); sufficient for `const_bindings_test.ak` and avoids
+/// a full mini-lexer.
+fn parse_const_declarations(source: &str) -> Vec<ConstDecl> {
+    let mut out = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let after_pub = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+        let Some(rest) = after_pub.strip_prefix("const ") else {
+            continue;
+        };
+        let Some(eq_pos) = rest.find('=') else {
+            continue;
+        };
+        let lhs = rest[..eq_pos].trim();
+        let expr = rest[eq_pos + 1..].trim().to_string();
+        // Strip optional `: TYPE` annotation from the LHS.
+        let name = if let Some(colon) = lhs.find(':') {
+            lhs[..colon].trim().to_string()
+        } else {
+            lhs.to_string()
+        };
+        if name.is_empty() || expr.is_empty() || !is_simple_identifier(&name) {
+            continue;
+        }
+        out.push(ConstDecl { name, expr });
+    }
+    out
+}
+
 /// Scan an Aiken source file for `opaque type Name { ... }` (or
 /// `pub opaque type Name { ... }`) declarations and return the set
 /// of opaque type names.  Used by `AikenTracer::value_to_record` to
@@ -1956,9 +2261,15 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
             continue;
         }
 
-        let (is_test, after_keyword) = if let Some(rest) = trimmed.strip_prefix("fn ") {
+        // Strip an optional leading `pub ` so `pub fn double(x: Int) -> Int`
+        // parses the same as the bare `fn double(x: Int) -> Int` form.
+        // Imported library modules (loaded via the `use` directive
+        // follower — see `module_imports_test.ak`) declare every
+        // exported function with `pub fn`.
+        let after_visibility = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+        let (is_test, after_keyword) = if let Some(rest) = after_visibility.strip_prefix("fn ") {
             (false, rest)
-        } else if let Some(rest) = trimmed.strip_prefix("test ") {
+        } else if let Some(rest) = after_visibility.strip_prefix("test ") {
             (true, rest)
         } else if in_validator {
             // Inside a validator block, look for entry-point fn-shaped
@@ -2054,6 +2365,7 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
                 params,
                 body,
                 line: line_num,
+                source_path: None,
             });
         }
 
@@ -2348,7 +2660,7 @@ fn match_pattern_against_value(
         return true;
     }
     // Integer literal pattern.
-    if let Ok(n) = pattern.parse::<i64>() {
+    if let Some(n) = parse_int_literal(pattern) {
         return match scrutinee {
             Value::Int(v) => *v == n,
             _ => false,
@@ -2964,6 +3276,47 @@ fn parse_hex_bytearray(expr: &str) -> Option<Vec<u8>> {
         i += 2;
     }
     Some(out)
+}
+
+/// Parse an Aiken integer literal, stripping the optional `_`
+/// thousands-separator syntax.  Returns `None` for non-integer
+/// inputs (anything containing non-digit, non-`_`, non-leading-`-`
+/// characters, or an empty digit run after stripping the
+/// underscores).  Used by `compile_expr_to_uplc` to recognise
+/// `1_000_000` alongside the bare `1000000` form.
+fn parse_int_literal(expr: &str) -> Option<i64> {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return None;
+    }
+    // Optional leading minus.
+    let (sign_chars, body) = if let Some(rest) = expr.strip_prefix('-') {
+        (1, rest)
+    } else {
+        (0, expr)
+    };
+    if body.is_empty() {
+        return None;
+    }
+    // Body must be digits + underscores only, with at least one digit.
+    let mut has_digit = false;
+    for ch in body.chars() {
+        if ch.is_ascii_digit() {
+            has_digit = true;
+        } else if ch != '_' {
+            return None;
+        }
+    }
+    if !has_digit {
+        return None;
+    }
+    let stripped: String = body.chars().filter(|c| *c != '_').collect();
+    let with_sign = if sign_chars == 1 {
+        format!("-{stripped}")
+    } else {
+        stripped
+    };
+    with_sign.parse::<i64>().ok()
 }
 
 /// Parse an Aiken UTF-8 string literal `"FOO"` into its inner text.
