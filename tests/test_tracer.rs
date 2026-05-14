@@ -1074,17 +1074,21 @@ fn test_collections_test_value_kinds_present() {
 
 // --- error_paths_test.ak ---------------------------------------------------
 
-/// Records `error_paths_test.ak`.  The recorder picks the first
-/// `test` block as the entry point (`safe_path`), so today only the
-/// non-failing branch runs.  RECORDER BUG: there's no way to
-/// indicate "run all test blocks", so the function table and step /
-/// call counts only reflect the entry test plus its callees.  This
-/// is a separate gap from the `fail` Error-event surfacing fix
-/// pinned by `test_error_paths_test_emits_fail_event` below — the
-/// recorder now scans for `fail @"..."` statements anywhere in the
-/// parsed program and emits one `EventLogKind::Error` io_event per
-/// `fail`, independent of which test runs.  See
-/// `metacraft-specs/policies/recorder-test-requirements.md` §2.
+/// Records `error_paths_test.ak`.  The fixture declares two test
+/// blocks (`safe_path` exercises the non-failing chain,
+/// `failing_path` exercises `fail @"..."`).  As of the M10
+/// `multi_test_entry_test` fixture (commit landing
+/// `evaluate_program`'s multi-test path), the recorder runs EVERY
+/// `test` block when no `main` is present and 2+ tests are declared
+/// — each test gets its own Call/Return event pair so the trace
+/// surfaces one Function entry per test.  Pre-this-change the
+/// recorder picked only the FIRST test block, leaving
+/// `failing_path` / `failing_compute` invisible at the step level.
+/// The single io_event still comes from the post-execution sweep in
+/// `emit_fail_events_for_program` (the runtime path for
+/// `Statement::Fail` does NOT emit an inline event today — it only
+/// `break`s out of the function), so the io_event count is
+/// independent of which tests actually executed.
 #[test]
 fn test_error_paths_test_via_ct_print_full() {
     let Some((doc, source_path)) = record_and_dump_full(
@@ -1102,15 +1106,39 @@ fn test_error_paths_test_via_ct_print_full() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    // RECORDER BUG: the spec-compliant function table would also
-    // include `failing_path` and `failing_compute` (they're declared
-    // and reachable from a test).  Today only the entry test plus
-    // the functions it invokes are registered.
-    assert_eq!(functions, vec!["safe_path", "compute", "safe_compute"]);
+    // Both tests now run, so the function table includes their
+    // callees too: `safe_path` → `compute` → `safe_compute` and
+    // `failing_path` → `failing_compute`.
+    assert_eq!(
+        functions,
+        vec![
+            "safe_path",
+            "compute",
+            "safe_compute",
+            "failing_path",
+            "failing_compute",
+        ],
+    );
 
     let counts = &doc["counts"];
-    assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
-    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    // safe_path branch:
+    //   * 1 dispatch step (line 29: `compute() == 112`)
+    //   * compute(): 2 let-binding steps + 1 trailing-expr step
+    //   * safe_compute(): 1 param-intro is suppressed (no params), 3
+    //     let-bindings + 1 trailing-expr = 4 steps
+    //   = 1 + 3 + 4 = 8 steps so far.
+    // failing_path branch:
+    //   * 1 dispatch step (line 33: `failing_compute() == 0`)
+    //   * failing_compute(): 1 param-intro suppressed, 2 let-bindings
+    //     before the `fail` arm `break`s out = 2 steps,
+    //     plus 1 trailing in-flight step that lands at the `fail`
+    //     line as the writer flushes pending state.
+    //   = 1 + 2 + 1 = 4 steps.
+    // Total: 8 + 4 = 12 steps.
+    assert_eq!(counts["steps"].as_u64(), Some(12), "steps; counts={counts}");
+    // 5 calls = safe_path + compute + safe_compute + failing_path +
+    // failing_compute (each test now wraps in its own Call/Return).
+    assert_eq!(counts["calls"].as_u64(), Some(5), "calls; counts={counts}");
     // The recorder emits exactly one `EventLogKind::Error` io_event
     // for the single `fail @"..."` statement in `failing_compute`
     // (post-execution sweep over all parsed function bodies — see
@@ -1122,15 +1150,30 @@ fn test_error_paths_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 9 steps + 2 call_entry + 2 call_exit + 1 io_event = 14 events.
-    assert_eq!(events.len(), 14, "events.len()");
+    // 12 steps + 5 call_entry + 5 call_exit + 1 io_event = 23 events.
+    assert_eq!(events.len(), 23, "events.len()");
     assert_step_indices_monotonic(&doc);
 
+    // call_entry order: each test fires its own outer call, then its
+    // callees in dispatch order.
     assert_eq!(
         observed_call_sequence(&doc),
-        vec!["compute".to_string(), "safe_compute".to_string()],
+        vec![
+            "safe_path".to_string(),
+            "compute".to_string(),
+            "safe_compute".to_string(),
+            "failing_path".to_string(),
+            "failing_compute".to_string(),
+        ],
     );
 
+    // Variable stream in emission order:
+    //   safe_compute: a, b, c (3 lets)
+    //   compute: safe_val (lands on the let step after safe_compute
+    //     returns), bumped
+    //   failing_compute: seen_a, then `fail` aborts; seen_b is
+    //     evaluated before the abort and its value flushes onto a
+    //     trailing step the writer commits at finalise time.
     assert_eq!(
         observed_var_sequence(&doc),
         vec![
@@ -1139,6 +1182,8 @@ fn test_error_paths_test_via_ct_print_full() {
             ("c".into(), 12),
             ("safe_val".into(), 12),
             ("bumped".into(), 112),
+            ("seen_a".into(), 1),
+            ("seen_b".into(), 2),
         ],
     );
 
@@ -1172,9 +1217,18 @@ fn test_error_paths_test_emits_fail_event() {
         return;
     };
     let counts = &doc["counts"];
-    assert!(
-        counts["io_events"].as_u64().unwrap_or(0) >= 1,
-        "expected at least one io_event for the `fail` expression; counts={counts}"
+    // Strict pin: the recorder emits exactly one `EventLogKind::Error`
+    // io_event for the single `fail @"..."` statement in
+    // `failing_compute`.  Even with the new multi-test path running
+    // both `safe_path` and `failing_path`, the io_event count stays
+    // at 1 because `emit_fail_events_for_program` is a static sweep
+    // over the parsed function bodies (one `fail` source line → one
+    // io_event) and the runtime path for `Statement::Fail` does not
+    // emit an inline event today.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(1),
+        "expected exactly one io_event for the `fail` expression; counts={counts}"
     );
 }
 
@@ -2565,6 +2619,549 @@ fn test_bytearray_string_test_via_ct_print_full() {
         })
         .collect();
     assert_eq!(returns, vec![4, 3, 7]);
+}
+
+// --- module_imports_test.ak -----------------------------------------------
+
+/// Records `module_imports_test.ak` and pins the recorder's new
+/// multi-module / `use`-directive support.  Pre-this-fixture the
+/// recorder only parsed the source file passed to
+/// `record(source_path, ...)` and would silently drop any reference
+/// to an imported function or type — `double(7)` would resolve as an
+/// unknown identifier and the let-binding RHS surfaced no value.
+///
+/// The recorder gained a `use`-directive follower alongside this
+/// fixture: it scans the primary source for `use module/path.{names}`
+/// lines, resolves each module path to a sibling `lib/<name>.ak`
+/// file, parses the imported file's `pub fn` declarations, and
+/// merges them into the function table — each tagged with the
+/// imported file's path so cross-module step events surface with
+/// the right path on the wire.
+///
+/// Strict pin (verifies the cross-module wiring end-to-end):
+///
+///   1. The trace's path table contains TWO entries: the primary
+///      source and the imported `lib/helpers.ak`.
+///   2. The function table includes the cross-module function
+///      `double` (from `lib/helpers.ak`).
+///   3. Every step event fired from inside `double` carries the
+///      `lib/helpers.ak` path (proving `evaluate_function` honours
+///      the per-function `effective_path`).
+///   4. The cross-module record literal `Pair { a: raw, b: doubled }`
+///      lands as a `Value::Struct` with two Int field values
+///      `[7, 14]` — proving the imported type name is recognised by
+///      the record-literal parser.
+///   5. `compute()` returns Int 21 (= 7 + 14).
+#[test]
+fn test_module_imports_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_module_imports_test_via_ct_print_full",
+        "module_imports_test.ak",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    // ----- Path table: primary + lib/helpers.ak ----------------------
+    let paths: Vec<String> = doc["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .filter_map(|p| p.as_str().map(|s| s.to_string()))
+        .collect();
+    assert_eq!(paths.len(), 2, "expected 2 paths; got {paths:?}");
+    assert!(
+        paths[0].ends_with("module_imports_test.ak"),
+        "primary path should be module_imports_test.ak; got {paths:?}",
+    );
+    assert!(
+        paths[1].ends_with("lib/helpers.ak"),
+        "imported path should be lib/helpers.ak; got {paths:?}",
+    );
+
+    // ----- Function table: cross-module `double` is registered ------
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["module_imports", "compute", "double"]);
+
+    // ----- counts -----------------------------------------------------
+    // compute(): 1 dispatch (line 49) + 4 let-binding steps + 1
+    //   trailing-expr step (line 45) = 6 steps.
+    // double(): 1 param-intro (line 14) + 1 let-d step (line 15) = 2
+    //   steps.
+    // Plus the implicit start-of-trace step at line 1 and a trailing
+    // step the writer commits when the toplevel call closes.
+    // Total: 10 steps.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
+    // 2 calls = compute + double.
+    assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 10 steps + 2 call_entry + 2 call_exit = 14 events.
+    assert_eq!(events.len(), 14, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["compute".to_string(), "double".to_string()],
+    );
+
+    // ----- Cross-module step paths -----------------------------------
+    // Build (path, line) pairs for every step event, then assert that
+    // the recorder partitions them correctly across the two source
+    // files: lines 14-16 are inside `double`'s body in
+    // `lib/helpers.ak` and MUST carry the helpers path; everything
+    // else (including the dispatch line 42 in compute()'s let-
+    // binding for `doubled`) MUST carry the primary file's path.
+    // This is the load-bearing assertion that proves
+    // `evaluate_function`'s `effective_path` override is honoured for
+    // imported functions.
+    let step_paths_by_line: Vec<(i64, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .map(|e| {
+            let line = e["line"].as_i64().expect("step.line");
+            let path = e["path"].as_str().expect("step.path").to_string();
+            (line, path)
+        })
+        .collect();
+    let helpers_lines: Vec<i64> = step_paths_by_line
+        .iter()
+        .filter(|(_, p)| p.ends_with("lib/helpers.ak"))
+        .map(|(l, _)| *l)
+        .collect();
+    let primary_lines: Vec<i64> = step_paths_by_line
+        .iter()
+        .filter(|(_, p)| p.ends_with("module_imports_test.ak"))
+        .map(|(l, _)| *l)
+        .collect();
+    // helpers.ak: line 14 (param-intro at the fn signature line) and
+    // line 15 (let d = x * 2).  Line 16 (the trailing `d`) is
+    // recognised as a Statement::Expr but its register_step also
+    // fires from inside `double`'s body, lifting the helpers path.
+    assert_eq!(
+        helpers_lines,
+        vec![14, 15, 16],
+        "steps fired from inside `double` should be at lines 14-16 of \
+         lib/helpers.ak; got {step_paths_by_line:?}",
+    );
+    // The remaining steps come from the primary file: line 1
+    // (start-of-trace), line 49 (test dispatch `compute() == 21`),
+    // lines 41-44 (the four let bindings in compute), the trailing
+    // expr at line 45, and a final flush step at line 50.  We pin
+    // the exact set rather than just length to catch mis-attribution.
+    assert_eq!(
+        primary_lines,
+        vec![1, 49, 41, 42, 43, 44, 45],
+        "steps from the primary file should match the let-binding / \
+         dispatch lines in module_imports_test.ak; got \
+         {step_paths_by_line:?}",
+    );
+
+    // ----- Cross-module record literal `p = Pair { a: 7, b: 14 }` ----
+    let p_var = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .find(|v| v["varname"].as_str() == Some("p"))
+        .expect("expected `p` variable for the Pair record literal");
+    assert_eq!(
+        p_var["value"]["kind"].as_str(),
+        Some("Struct"),
+        "p should decode as Struct; got {p_var}"
+    );
+    let field_values = p_var["value"]["field_values"]
+        .as_array()
+        .expect("field_values");
+    assert_eq!(field_values.len(), 2);
+    assert_eq!(field_values[0]["kind"].as_str(), Some("Int"));
+    assert_eq!(field_values[0]["i"].as_i64(), Some(7));
+    assert_eq!(field_values[1]["kind"].as_str(), Some("Int"));
+    assert_eq!(field_values[1]["i"].as_i64(), Some(14));
+
+    // ----- Per-callee return values ----------------------------------
+    // double(7) → 14, compute() → 21 (= p.a + p.b = 7 + 14).
+    let returns: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let name = e["function"].as_str().expect("function").to_string();
+            let rv = &e["return_value"];
+            assert_eq!(
+                rv["kind"].as_str(),
+                Some("Int"),
+                "return for {name} should be Int; got {rv}"
+            );
+            (name, rv["i"].as_i64().expect("rv.i"))
+        })
+        .collect();
+    assert_eq!(
+        returns,
+        vec![("double".to_string(), 14), ("compute".to_string(), 21)],
+    );
+}
+
+// --- const_bindings_test.ak -----------------------------------------------
+
+/// Records `const_bindings_test.ak`.  The fixture pins the recorder's
+/// new top-level `const` parsing + eval-environment seeding behaviour.
+/// Pre-this-fixture the parser ignored `const ... = ...` lines
+/// entirely, so any reference from a function body resolved as an
+/// unknown identifier and the let-binding RHS that referenced it
+/// surfaced no value in the trace.
+///
+/// Three consts exercise the full evaluation surface:
+///
+///   * `const max_supply: Int = 1_000_000`        — integer literal
+///     with Aiken's `_` thousands-separator notation.  Drives the
+///     `parse_int_literal` underscore-stripping path.
+///   * `const allowed_token: ByteArray = #"deadbeef"` — non-Int
+///     const surfaces with the same `ValueRecord::String { text:
+///     "#\"...\"" }` shape that `bytearray_string_test` pins.
+///   * `const half_supply: Int = max_supply / 2` — const-to-const
+///     reference; resolved when `evaluate_consts` evaluates the
+///     second const with the running env containing `max_supply`.
+///
+/// Compute path (all const lookups, plus arithmetic):
+///   * `let supply = max_supply`     → Int 1_000_000
+///   * `let half = half_supply`      → Int 500_000
+///   * `let token = allowed_token`   → String "#\"deadbeef\""
+///   * `let total = supply + half`   → Int 1_500_000
+///   * `let final = total - 500000`  → Int 1_000_000
+///
+/// Test body: `compute() == 1000000`.
+#[test]
+fn test_const_bindings_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_const_bindings_test_via_ct_print_full",
+        "const_bindings_test.ak",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["const_bindings", "compute"]);
+
+    // ----- counts -----------------------------------------------------
+    // compute(): 1 dispatch step (line 44: `compute() == 1000000`)
+    //          + 5 let-binding steps (supply, half, token, total, final)
+    //          + 1 trailing-expr step `final` (line 40)
+    //          = 7 steps.
+    // Plus the implicit start-of-trace step at line 1.
+    // Total: 8 steps.
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(8), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 8 steps + 1 call_entry + 1 call_exit = 10 events.
+    assert_eq!(events.len(), 10, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(observed_call_sequence(&doc), vec!["compute".to_string()]);
+
+    // ----- Variable stream by (varname, value.kind, optional text/i)
+    // The five let-bindings in `compute()` should each surface with the
+    // const value resolved from the running env.  The Int-typed consts
+    // (max_supply, half_supply) flow through as `Value::Int`; the
+    // ByteArray const (allowed_token) flows through as
+    // `Value::ByteArray` and renders on the wire as
+    // `String { text: "#\"deadbeef\"" }`.
+    let var_sequence: Vec<(String, String, Option<String>, Option<i64>)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    let name = v["varname"].as_str().expect("varname").to_string();
+                    let kind = v["value"]["kind"].as_str().expect("value.kind").to_string();
+                    let text = v["value"]["text"].as_str().map(|s| s.to_string());
+                    let i = v["value"]["i"].as_i64();
+                    (name, kind, text, i)
+                })
+        })
+        .collect();
+    assert_eq!(
+        var_sequence,
+        vec![
+            ("supply".into(), "Int".into(), None, Some(1_000_000)),
+            ("half".into(), "Int".into(), None, Some(500_000)),
+            (
+                "token".into(),
+                "String".into(),
+                Some("#\"deadbeef\"".into()),
+                None
+            ),
+            ("total".into(), "Int".into(), None, Some(1_500_000)),
+            ("final".into(), "Int".into(), None, Some(1_000_000)),
+        ],
+    );
+
+    // ----- compute() return value: 1_000_000 -------------------------
+    let returns: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            rv["i"].as_i64().expect("rv.i")
+        })
+        .collect();
+    assert_eq!(returns, vec![1_000_000]);
+}
+
+// --- multi_test_entry_test.ak ---------------------------------------------
+
+/// Records `multi_test_entry_test.ak`.  The fixture declares THREE
+/// independent `test` blocks (`arithmetic_path`, `pattern_match_path`,
+/// `pipeline_path`) and pins the recorder's "execute every reachable
+/// test block" behaviour: pre-this-fixture the recorder picked only
+/// the first `test` block and dropped every subsequent one on the
+/// floor.  The `evaluate_program` multi-test path landing alongside
+/// this fixture wraps each test in its own Call/Return event pair so
+/// the trace surfaces one Function entry per test.
+///
+/// The three tests exercise distinct evaluator code paths so a
+/// regression that skips one is caught both at the call-sequence
+/// assertion (which lists each test by name in dispatch order) AND
+/// at the per-test return-value assertion (each test body returns
+/// `<expr> == <const>`, which the UPLC-CEK comparison evaluates to
+/// `Int 1` on success).
+///
+/// Compute paths:
+///   * `arithmetic_path()` — `add(3, 4) == 7` → 1.
+///   * `pattern_match_path()` — `pick(Some(11)) == 11`; the `when x is
+///     { Some(n) -> n; None -> 0 }` arm matches and returns 11 → 1.
+///   * `pipeline_path()` — two `|>` stages threaded through `double`
+///     and `incr` (`5 |> double()` → 10, then `10 |> incr()` → 11)
+///     followed by `stage2 == 11` → 1.
+#[test]
+fn test_multi_test_entry_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_multi_test_entry_test_via_ct_print_full",
+        "multi_test_entry_test.ak",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    // Function table is built lazily as `ensure_function_id` fires —
+    // each test fires its outer entry first, then its callees in
+    // dispatch order.
+    assert_eq!(
+        functions,
+        vec![
+            "arithmetic_path",
+            "add",
+            "pattern_match_path",
+            "pick",
+            "pipeline_path",
+            "double",
+            "incr",
+        ],
+    );
+
+    // ----- counts -----------------------------------------------------
+    // Step accounting (per test):
+    //   arithmetic_path body `add(3,4) == 7`:
+    //     * 1 dispatch step (line 46)
+    //     * add(): 1 param-intro (line 23, binds a/b) + 1 let `sum`
+    //       + 1 trailing-expr `sum` (line 25) — but the trailing
+    //       expr coalesces with the `sum` step in the writer's
+    //       buffer, so we observe 3 steps inside add.
+    //     ≈ 4 steps.
+    //   pattern_match_path body `pick(Some(11)) == 11`:
+    //     * 1 dispatch step (line 50)
+    //     * pick(): 1 param-intro (line 28, binds x = Variant Some(11))
+    //       + 1 when-opener step (line 29) + 1 when-arm step (line 30)
+    //     ≈ 4 steps.
+    //   pipeline_path body (3 stmts):
+    //     * 1 step at line 54 (`stage1 = 5 |> double()`)
+    //     * double(): 1 param-intro (line 35) + let-d step (line 36)
+    //     * 1 step at line 55 (`stage2 = stage1 |> incr()`)
+    //     * incr(): 1 param-intro (line 40) + let-i step (line 41)
+    //     * 1 trailing step at line 56 (`stage2 == 11`)
+    //     ≈ 7 steps.
+    //   Plus the implicit start-of-trace step at line 1 and a
+    //   trailing line-1 step the writer commits when the toplevel
+    //   call closes.
+    //   Total: ~19 steps (the exact figure is the recorder's
+    //   golden-snapshot value below).
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(19), "steps; counts={counts}");
+    // 7 calls = each test's outer entry + each callee fired (add,
+    // pick, double, incr) = 3 outer + 4 callees.
+    assert_eq!(counts["calls"].as_u64(), Some(7), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 19 steps + 7 call_entry + 7 call_exit = 33 events.
+    assert_eq!(events.len(), 33, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // call_entry sequence pins each test running with its own
+    // Call/Return pair, in source order, with the callee dispatched
+    // between the outer entry and exit.
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "arithmetic_path".to_string(),
+            "add".to_string(),
+            "pattern_match_path".to_string(),
+            "pick".to_string(),
+            "pipeline_path".to_string(),
+            "double".to_string(),
+            "incr".to_string(),
+        ],
+    );
+
+    // Variable stream — pin (varname, scalar Int value) for every
+    // Int-typed variable that lands in the trace.  The Variant binding
+    // for `x` in `pick` is asserted separately below.
+    let int_vars: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .filter(|v| v["value"]["kind"].as_str() == Some("Int"))
+        .map(|v| {
+            (
+                v["varname"].as_str().expect("varname").to_string(),
+                v["value"]["i"].as_i64().expect("value.i"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        int_vars,
+        vec![
+            // arithmetic_path → add(3, 4)
+            ("a".into(), 3),
+            ("b".into(), 4),
+            ("sum".into(), 7),
+            // pipeline_path → double(5) → 10
+            ("x".into(), 5),
+            ("d".into(), 10),
+            ("stage1".into(), 10),
+            // pipeline_path → incr(10) → 11
+            ("x".into(), 10),
+            ("i".into(), 11),
+            ("stage2".into(), 11),
+        ],
+    );
+
+    // ----- Variant binding for `x` in `pick` -------------------------
+    // The pattern_match_path test passes `Some(11)` to `pick(x)`;
+    // the param-intro step in `pick` should surface `x` as a
+    // `Value::Variant { discriminator: "Some", contents: Struct[Int 11] }`.
+    let x_variant = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+        })
+        .find(|v| {
+            v["varname"].as_str() == Some("x") && v["value"]["kind"].as_str() == Some("Variant")
+        })
+        .expect("expected Variant binding for `x` in pick");
+    assert_eq!(
+        x_variant["value"]["discriminator"].as_str(),
+        Some("Some"),
+        "x discriminator; got {x_variant}"
+    );
+    let inner = &x_variant["value"]["contents"];
+    assert_eq!(
+        inner["kind"].as_str(),
+        Some("Struct"),
+        "x contents kind; got {x_variant}"
+    );
+    let field_values = inner["field_values"].as_array().expect("field_values");
+    assert_eq!(field_values.len(), 1);
+    assert_eq!(field_values[0]["kind"].as_str(), Some("Int"));
+    assert_eq!(field_values[0]["i"].as_i64(), Some(11));
+
+    // ----- Per-test return values ------------------------------------
+    // Each test's body is `<expr> == <const>`; the UPLC-CEK comparison
+    // returns `1` on equality.  Per-callee returns: add → 7,
+    // pick → 11, double → 10, incr → 11.
+    let returns: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let name = e["function"].as_str().expect("function").to_string();
+            let rv = &e["return_value"];
+            assert_eq!(
+                rv["kind"].as_str(),
+                Some("Int"),
+                "return for {name} should be Int; got {rv}"
+            );
+            (name, rv["i"].as_i64().expect("rv.i"))
+        })
+        .collect();
+    assert_eq!(
+        returns,
+        vec![
+            ("add".to_string(), 7),
+            ("arithmetic_path".to_string(), 1),
+            ("pick".to_string(), 11),
+            ("pattern_match_path".to_string(), 1),
+            ("double".to_string(), 10),
+            ("incr".to_string(), 11),
+            ("pipeline_path".to_string(), 1),
+        ],
+    );
 }
 
 // ===========================================================================
