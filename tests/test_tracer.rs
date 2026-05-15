@@ -3150,13 +3150,19 @@ fn test_multi_test_entry_test_via_ct_print_full() {
             (name, rv["i"].as_i64().expect("rv.i"))
         })
         .collect();
+    // Re-pinned against trace-format-nim eec665b
+    // (CTFS-M-CallKeyOrder: allocate call_key at call entry).  Pre-fix,
+    // call_keys were assigned at registerReturn so deepest-child got the
+    // smallest key; post-fix, parents get the smallest entry-keys and
+    // completed CallRecords are flushed in entry-key order — so each
+    // outer test fires its exit before its callee's exit.
     assert_eq!(
         returns,
         vec![
-            ("add".to_string(), 7),
             ("arithmetic_path".to_string(), 1),
-            ("pick".to_string(), 11),
+            ("add".to_string(), 7),
             ("pattern_match_path".to_string(), 1),
+            ("pick".to_string(), 11),
             ("double".to_string(), 10),
             ("incr".to_string(), 11),
             ("pipeline_path".to_string(), 1),
