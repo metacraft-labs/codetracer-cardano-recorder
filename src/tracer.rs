@@ -607,14 +607,8 @@ impl AikenTracer {
         // CTFS multi-stream container.
         let events_filename = "trace.ctfs";
         let events_path = out_dir.join(events_filename);
-        let metadata_path = out_dir.join("trace_metadata.json");
-        let paths_path = out_dir.join("trace_paths.json");
 
         TraceWriter::begin_writing_trace_events(&mut *tracer.writer, &events_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_metadata(&mut *tracer.writer, &metadata_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_paths(&mut *tracer.writer, &paths_path)
             .map_err(|e| eyre!("{e}"))?;
 
         TraceWriter::start(&mut *tracer.writer, source_path, Line(1));
@@ -694,9 +688,9 @@ impl AikenTracer {
         TraceWriter::register_return(&mut *tracer.writer, NONE_VALUE);
 
         TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
+        tracer.writer
+            .write_meta_dat("codetracer-cardano-recorder")
             .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
         tracer.writer.close().map_err(|e| eyre!("{e}"))?;
 
         Ok(())
