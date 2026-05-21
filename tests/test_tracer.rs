@@ -50,7 +50,7 @@ fn ct_print_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("codetracer-trace-format-nim")
-        .join("ct-print")
+        .join(format!("ct-print{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// Helper: collect every `.ct` file in `out_dir`.
@@ -2664,11 +2664,15 @@ fn test_module_imports_test_via_ct_print_full() {
     assert_metadata_program_ends_with(&doc, &source_path);
 
     // ----- Path table: primary + lib/helpers.ak ----------------------
+    // Normalise `\` to `/` so the `lib/helpers.ak` suffix assertions hold
+    // regardless of the host OS path separator: the recorder resolves
+    // imported modules with `Path::join`, which yields backslashes on
+    // Windows.
     let paths: Vec<String> = doc["paths"]
         .as_array()
         .expect("paths array")
         .iter()
-        .filter_map(|p| p.as_str().map(|s| s.to_string()))
+        .filter_map(|p| p.as_str().map(|s| s.replace('\\', "/")))
         .collect();
     assert_eq!(paths.len(), 2, "expected 2 paths; got {paths:?}");
     assert!(
@@ -2732,7 +2736,9 @@ fn test_module_imports_test_via_ct_print_full() {
         .filter(|e| e["kind"] == "step")
         .map(|e| {
             let line = e["line"].as_i64().expect("step.line");
-            let path = e["path"].as_str().expect("step.path").to_string();
+            // Normalise `\` to `/` so the `lib/helpers.ak` suffix filter
+            // below is host-OS-independent (see the `paths` table above).
+            let path = e["path"].as_str().expect("step.path").replace('\\', "/");
             (line, path)
         })
         .collect();
