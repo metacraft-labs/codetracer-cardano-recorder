@@ -1124,19 +1124,17 @@ impl AikenTracer {
                     // shows `a = 10` / `b = 20` at the destructuring
                     // step rather than an opaque `(a, b) = ...`).
                     if let Some(pattern_names) = parse_tuple_pattern(name) {
-                        if let Some(rhs) =
+                        if let Some(Value::Tuple(parts)) =
                             self.eval_expr_to_value(expr, &env, effective_path, func_map)?
                         {
-                            if let Value::Tuple(parts) = &rhs {
-                                for (pname, pval) in pattern_names.iter().zip(parts.iter()) {
-                                    env.insert(pname.clone(), pval.clone());
-                                    let value = self.value_to_record(pval);
-                                    TraceWriter::register_variable_with_full_value(
-                                        &mut *self.writer,
-                                        pname,
-                                        value,
-                                    );
-                                }
+                            for (pname, pval) in pattern_names.iter().zip(parts.iter()) {
+                                env.insert(pname.clone(), pval.clone());
+                                let value = self.value_to_record(pval);
+                                TraceWriter::register_variable_with_full_value(
+                                    &mut *self.writer,
+                                    pname,
+                                    value,
+                                );
                             }
                         }
                         continue;
@@ -2046,11 +2044,10 @@ struct UseDirective {
 ///
 /// Recognised forms:
 ///
-///   * `use a/b/c`               — bare module import (no name list)
-///   * `use a/b/c.{name1, T2}`   — selective import; the names are
-///                                 captured but not currently
-///                                 enforced (the recorder pulls in
-///                                 every `pub fn` from the module).
+///   * `use a/b/c` — bare module import (no name list)
+///   * `use a/b/c.{name1, T2}` — selective import; the names are
+///     captured but not currently enforced (the recorder pulls in
+///     every `pub fn` from the module).
 fn parse_use_directives(source: &str) -> Vec<UseDirective> {
     let mut out = Vec::new();
     for line in source.lines() {
@@ -2976,8 +2973,8 @@ fn split_top_level_dot(expr: &str) -> Option<(&str, &str)> {
     let bytes = expr.as_bytes();
     let mut depth = 0i32;
     let mut last_dot: Option<usize> = None;
-    for i in 0..bytes.len() {
-        match bytes[i] {
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
             b'.' if depth == 0 => last_dot = Some(i),
