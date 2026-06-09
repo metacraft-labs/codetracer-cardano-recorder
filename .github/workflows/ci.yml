@@ -1,5 +1,16 @@
 name: CI
 
+# Pilot consumer for the shared `setup-dev-env` composite action.
+#
+# CI's job is to re-play the project's deterministic dev env on
+# the runner -- the same env a developer uses locally to run
+# `nix develop -c just test`.  All toolchain bootstrapping lives
+# in `flake.nix` (or `env.ps1` on Windows); CI only materialises
+# that env and invokes `dev-exec just <target>`.
+#
+# See:
+#   https://github.com/metacraft-labs/metacraft-dev-guidelines/blob/latest/policies/ci-shared-dev-env.md
+
 on:
   push:
     branches: [main, dev, stable]
@@ -13,7 +24,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone codetracer-trace-format (Cargo path dependency)
+      - name: Clone codetracer-trace-format sibling
+        # Cargo path dependency expected at $GITHUB_WORKSPACE/../
+        # codetracer-trace-format.  The pin lives in
+        # .github/sibling-pins so dev + CI track the same SHA.
         run: |
           PINS=".github/sibling-pins"
           TF_REF="main"
@@ -31,52 +45,54 @@ jobs:
             git -C "${GITHUB_WORKSPACE}/../codetracer-trace-format" checkout "${TF_REF}"
           fi
 
-      - name: Install Nim
-        uses: jiro4989/setup-nim-action@v2
-        with:
-          nim-version: "2.2.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build Nim trace writer library
+      - name: Clone codetracer-trace-format-nim sibling
+        # The Nim FFI source is consumed both by the dev-shell-
+        # bundled trace-writer-lib build below and (on dev
+        # machines) by direct path-import.
         run: |
+          rm -rf "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
           git clone --depth 1 \
             "https://github.com/metacraft-labs/codetracer-trace-format-nim.git" \
             "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
-          cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
-          nimble install -y stew results
-          nim c --app:staticlib --mm:arc --noMain -d:release -p:src \
-            -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
-          echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "$GITHUB_ENV"
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y capnproto
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup dev env
+        # Materialises the flake.nix devShell on the runner.  The
+        # dev shell already provides nim, nimble, capnproto,
+        # zstd, rust, just -- the same toolchain a developer gets
+        # locally with `nix develop`.  After this step,
+        # `dev-exec <cmd>` runs <cmd> inside that env.
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
         with:
-          components: clippy, rustfmt
+          env-flavor: nix
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt -- --check
-
-      - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Build
-        run: cargo build --all-targets
-
-      - name: Run tests with zero-test guard
+      - name: Build Nim trace writer library (sibling artifact)
+        # codetracer_trace_writer_nim's build.rs links against
+        # libcodetracer_trace_writer.a at
+        # $CODETRACER_NIM_LIB_DIR.  Build it via the dev env so
+        # the toolchain (nim, nimble, gcc) comes from flake.nix
+        # rather than ad-hoc CI installs.
+        #
+        # TODO: once codetracer-trace-format-nim ships a
+        # `just build-trace-writer-lib` target, replace this
+        # block with `direnv exec ../codetracer-trace-format-nim
+        # just build-trace-writer-lib` per the
+        # cross-repo-builds.md policy.
         run: |
-          set -euo pipefail
-          OUTPUT=$(cargo test --all-targets 2>&1) || { echo "$OUTPUT"; exit 1; }
-          echo "$OUTPUT"
-          # Guard against silently empty test suites
-          if ! echo "$OUTPUT" | grep -qP "test result: ok\. [1-9]"; then
-            echo "::error::Zero tests passed — check that test binaries are compiling correctly"
-            exit 1
-          fi
+          dev-exec bash -c '
+            set -euo pipefail
+            cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
+            nimble install -y stew results
+            nim c --app:staticlib --mm:arc --noMain -d:release -p:src \
+              -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
+          '
+          echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "$GITHUB_ENV"
+
+      - name: Lint
+        run: dev-exec just lint
+
+      - name: Test
+        run: dev-exec just test
 
       - name: Upload test logs on failure
         if: failure()
