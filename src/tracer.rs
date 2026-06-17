@@ -9,6 +9,7 @@
 //! evaluation, not from a hand-rolled expression evaluator.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -23,6 +24,50 @@ use uplc::builtins::DefaultFunction;
 use uplc::machine::cost_model::ExBudget;
 
 use crate::source_map::SourceMap;
+
+// ---------------------------------------------------------------------------
+// Column-aware navigation helpers (FU-Column-Aware-Nav-Cardano)
+// ---------------------------------------------------------------------------
+
+/// Read per-line byte counts for `path` and return them as a flat
+/// `Vec<u32>` where entry `i` is the addressable column count of
+/// source line `i+1` (1-based numbering matching the `paths.dat`
+/// Layout A contract — see `codetracer-trace-format-spec/trace-
+/// events.md` §"paths.dat per-line offset table — Layout A").
+///
+/// Synthetic-only test paths (e.g. `<stdin>`) and missing/unreadable
+/// files degrade to an empty `Vec`; the writer treats
+/// `register_path_with_line_lengths` with an empty slice as "no per-
+/// line data", so the column resolution at read time falls back to
+/// surfacing `None` for that path — back-compat safe by the P6.5
+/// contract.
+///
+/// Ported from the Solana recorder's
+/// `recorder.rs::read_line_lengths_for_path` helper to keep the
+/// column-aware contract uniform across sibling recorders.
+pub(crate) fn read_line_lengths_for_path(path: &Path) -> Vec<u32> {
+    let lossy = path.to_string_lossy();
+    if lossy.starts_with('<') && lossy.ends_with('>') {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let mut lines: Vec<u32> = Vec::new();
+    let mut current_len: u32 = 0;
+    for byte in &bytes {
+        if *byte == b'\n' {
+            lines.push(current_len);
+            current_len = 0;
+        } else {
+            current_len = current_len.saturating_add(1);
+        }
+    }
+    if current_len > 0 || bytes.last() != Some(&b'\n') {
+        lines.push(current_len);
+    }
+    lines
+}
 
 // ---------------------------------------------------------------------------
 // UPLC evaluation helpers
@@ -446,6 +491,12 @@ struct FunctionDef {
     params: Vec<(String, String)>,
     body: Vec<Statement>,
     line: u32,
+    /// 1-based column of the first non-whitespace byte on the
+    /// function's signature line.  Used by the entry-point step
+    /// emission in `evaluate_function` so the param-binding step
+    /// surfaces a stable column for column-aware navigation
+    /// (FU-Column-Aware-Nav-Cardano).
+    column: u32,
     /// Source file the function was defined in.  `None` for functions
     /// parsed from the program's primary source file (the recorder
     /// then uses the path passed into `evaluate_function`).  `Some`
@@ -457,16 +508,29 @@ struct FunctionDef {
 }
 
 /// A parsed statement in an Aiken function body.
+///
+/// FU-Column-Aware-Nav-Cardano: each statement carries a 1-based source
+/// `column` alongside the `line`.  The column points at the first
+/// non-whitespace byte of the statement's source line so the
+/// `register_step_with_column` emissions surface a stable, source-
+/// accurate landing column for column-aware replay navigation.  Aiken
+/// canonical formatting puts one statement per line, so the column
+/// resolution is unambiguous; if a future fixture packs multiple
+/// statements onto one line, the parser will need to track per-
+/// statement byte offsets, but today's contract is sufficient for the
+/// column-aware-steps trace flag and per-step column emission.
 #[derive(Debug, Clone)]
 enum Statement {
     LetBinding {
         name: String,
         expr: String,
         line: u32,
+        column: u32,
     },
     Expr {
         expr: String,
         line: u32,
+        column: u32,
     },
     /// Aiken's `fail` / `fail @"message"` expression — a program-level
     /// failure marker.  Per
@@ -480,6 +544,8 @@ enum Statement {
         message: String,
         #[allow(dead_code)]
         line: u32,
+        #[allow(dead_code)]
+        column: u32,
     },
     /// Aiken's `trace @"label": value` expression — the language's
     /// only built-in I/O surface (the closest analogue of `stdout`
@@ -495,6 +561,7 @@ enum Statement {
         value: String,
         #[allow(dead_code)]
         line: u32,
+        column: u32,
     },
     /// A single `when` arm — `<pattern> -> <expr>`.  Distinguished
     /// from `Statement::Expr` so the evaluator can match the arm
@@ -508,6 +575,7 @@ enum Statement {
         pattern: String,
         expr: String,
         line: u32,
+        column: u32,
     },
     /// Aiken's `expect <pattern> = <expr>` — a refinement / pattern-
     /// asserting binding.  Semantically distinct from `let`: on a
@@ -533,6 +601,7 @@ enum Statement {
         expr: String,
         #[allow(dead_code)]
         line: u32,
+        column: u32,
     },
 }
 
@@ -610,6 +679,58 @@ impl AikenTracer {
 
         TraceWriter::begin_writing_trace_events(&mut *tracer.writer, &events_path)
             .map_err(|e| eyre!("{e}"))?;
+
+        // FU-Column-Aware-Nav-Cardano: opt the canonical CTFS writer
+        // into column-aware step encoding BEFORE the first
+        // `register_step` / `start` call.  `enable_column_aware_steps`
+        // is sticky for the lifetime of the trace and gates the
+        // writer's `DeltaColumn` (tag 0x07) emission path plus the
+        // `meta.dat` bit 4 flag (`FLAG_HAS_COLUMN_AWARE_STEPS`).
+        // Mirrors the Cairo / Solana / EVM recorder contract; the
+        // Aiken hand-rolled parser carries one statement per line and
+        // resolves each statement's column at parse time (see
+        // `Statement::*` and `first_nonws_column`), so every emitted
+        // step lands on the first non-whitespace byte of its source
+        // line.
+        TraceWriter::enable_column_aware_steps(&mut *tracer.writer);
+
+        // FU-Column-Aware-Nav-Cardano: register the per-line byte-
+        // length table for every source file the trace will reference
+        // BEFORE `TraceWriter::start`.  `start` internally interns the
+        // path (without line-length data), and a later
+        // `register_path_with_line_lengths` for an already-interned
+        // path is silently dropped by the Nim writer (see
+        // codetracer_trace_writer_nim's `pathLineLengths` contract) —
+        // which would drop the line-length table needed by the
+        // reader's `decodeGlobalPositionIndex`.  Registering up front
+        // populates the table and keeps the subsequent `start` a
+        // no-op for path interning.
+        //
+        // We deduplicate (multiple imported modules share basenames
+        // in the recorder's test corpus) and gate synthetic paths
+        // (`<stdin>` and similar) via the helper.
+        {
+            let mut registered: HashSet<String> = HashSet::new();
+            let primary_lengths = read_line_lengths_for_path(source_path);
+            let _ = TraceWriter::register_path_with_line_lengths(
+                &mut *tracer.writer,
+                source_path,
+                &primary_lengths,
+            );
+            registered.insert(source_path.to_string_lossy().into_owned());
+            for f in &functions {
+                if let Some(p) = &f.source_path {
+                    if registered.insert(p.to_string_lossy().into_owned()) {
+                        let lengths = read_line_lengths_for_path(p);
+                        let _ = TraceWriter::register_path_with_line_lengths(
+                            &mut *tracer.writer,
+                            p,
+                            &lengths,
+                        );
+                    }
+                }
+            }
+        }
 
         TraceWriter::start(&mut *tracer.writer, source_path, Line(1));
 
@@ -1068,7 +1189,12 @@ impl AikenTracer {
             // attach their variables to a real step event (the
             // backend's variable-buffering model expects every
             // variable to belong to the most-recent step).
-            TraceWriter::register_step(&mut *self.writer, effective_path, Line(func.line as i64));
+            TraceWriter::register_step_with_column(
+                &mut *self.writer,
+                effective_path,
+                Line(func.line as i64),
+                Some(Line(func.column as i64)),
+            );
         }
         for ((param_name, _param_type), arg_val) in func.params.iter().zip(args.iter()) {
             env.insert(param_name.clone(), arg_val.clone());
@@ -1109,11 +1235,17 @@ impl AikenTracer {
             }
 
             match stmt {
-                Statement::LetBinding { name, expr, line } => {
-                    TraceWriter::register_step(
+                Statement::LetBinding {
+                    name,
+                    expr,
+                    line,
+                    column,
+                } => {
+                    TraceWriter::register_step_with_column(
                         &mut *self.writer,
                         effective_path,
                         Line(*line as i64),
+                        Some(Line(*column as i64)),
                     );
 
                     // `let (a, b) = <expr>` — Aiken tuple-destructuring
@@ -1159,11 +1291,16 @@ impl AikenTracer {
                         );
                     }
                 }
-                Statement::Expr { expr, line } => {
-                    TraceWriter::register_step(
+                Statement::Expr {
+                    expr,
+                    line,
+                    column,
+                } => {
+                    TraceWriter::register_step_with_column(
                         &mut *self.writer,
                         effective_path,
                         Line(*line as i64),
+                        Some(Line(*column as i64)),
                     );
 
                     // Detect a `when <scrutinee> is {` opener so the
@@ -1194,11 +1331,13 @@ impl AikenTracer {
                     pattern,
                     expr,
                     line,
+                    column,
                 } => {
-                    TraceWriter::register_step(
+                    TraceWriter::register_step_with_column(
                         &mut *self.writer,
                         effective_path,
                         Line(*line as i64),
+                        Some(Line(*column as i64)),
                     );
 
                     // If we have a scrutinee value, evaluate the arm
@@ -1249,7 +1388,7 @@ impl AikenTracer {
                     // and the sweep should dedupe.
                     break;
                 }
-                Statement::Trace { line, .. } => {
+                Statement::Trace { line, column, .. } => {
                     // `trace @"label": value` statements are surfaced
                     // as `EventLogKind::Write` io_events via the
                     // post-execution sweep in
@@ -1264,21 +1403,24 @@ impl AikenTracer {
                     // gains "execute every reachable `trace`"
                     // support, this arm should emit the io_event
                     // inline and the sweep should dedupe.
-                    TraceWriter::register_step(
+                    TraceWriter::register_step_with_column(
                         &mut *self.writer,
                         effective_path,
                         Line(*line as i64),
+                        Some(Line(*column as i64)),
                     );
                 }
                 Statement::Expect {
                     pattern,
                     expr,
                     line,
+                    column,
                 } => {
-                    TraceWriter::register_step(
+                    TraceWriter::register_step_with_column(
                         &mut *self.writer,
                         effective_path,
                         Line(*line as i64),
+                        Some(Line(*column as i64)),
                     );
 
                     // Runtime semantics: bind on success, abort on
@@ -2224,6 +2366,7 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
     while i < lines.len() {
         let trimmed = lines[i].trim();
         let line_num = (i + 1) as u32;
+        let signature_column = first_nonws_column(lines[i]);
 
         // Track validator-block enter/exit.  We do this BEFORE the
         // fn/test-prefix check so a `validator gift_card {` opener
@@ -2325,6 +2468,7 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
         while j < lines.len() && (brace_depth > 0 || !body_started) {
             let body_line = lines[j].trim();
             let body_line_num = (j + 1) as u32;
+            let body_column = first_nonws_column(lines[j]);
 
             for ch in lines[j].chars() {
                 match ch {
@@ -2338,7 +2482,7 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
             }
 
             if !body_line.is_empty() && body_line != "}" {
-                if let Some(stmt) = parse_statement(body_line, body_line_num) {
+                if let Some(stmt) = parse_statement(body_line, body_line_num, body_column) {
                     body.push(stmt);
                 }
             }
@@ -2357,6 +2501,7 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
                 params,
                 body,
                 line: line_num,
+                column: signature_column,
                 source_path: None,
             });
         }
@@ -2394,7 +2539,13 @@ fn parse_param_list(params_str: &str) -> Vec<(String, String)> {
 }
 
 /// Parse a single statement from a line of Aiken code.
-fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
+///
+/// `column` is the 1-based byte offset of the first non-whitespace
+/// character on the statement's source line, captured by the caller
+/// (`parse_functions`) so each emitted `Statement` carries a stable
+/// landing column for column-aware replay navigation
+/// (FU-Column-Aware-Nav-Cardano).
+fn parse_statement(line: &str, line_num: u32, column: u32) -> Option<Statement> {
     let trimmed = line.trim();
 
     if trimmed.is_empty() {
@@ -2410,6 +2561,7 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
                     name,
                     expr,
                     line: line_num,
+                    column,
                 });
             }
         }
@@ -2428,6 +2580,7 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
                     pattern,
                     expr,
                     line: line_num,
+                    column,
                 });
             }
         }
@@ -2440,6 +2593,7 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
         return Some(Statement::Fail {
             message: String::new(),
             line: line_num,
+            column,
         });
     }
     for prefix in ["fail ", "error "] {
@@ -2447,6 +2601,7 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
             return Some(Statement::Fail {
                 message: parse_fail_message(rest),
                 line: line_num,
+                column,
             });
         }
     }
@@ -2461,6 +2616,7 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
             label,
             value,
             line: line_num,
+            column,
         });
     }
 
@@ -2491,6 +2647,7 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
                 pattern: lhs.to_string(),
                 expr: rhs.to_string(),
                 line: line_num,
+                column,
             });
         }
     }
@@ -2498,7 +2655,26 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
     Some(Statement::Expr {
         expr: trimmed.to_string(),
         line: line_num,
+        column,
     })
+}
+
+/// Compute the 1-based byte column of the first non-whitespace byte on
+/// a source line, used by `parse_functions` to seed each `Statement`'s
+/// `column` field (FU-Column-Aware-Nav-Cardano).  Returns `1` for
+/// blank lines so the resulting column is always well-defined for the
+/// downstream `register_step_with_column` call.
+fn first_nonws_column(line: &str) -> u32 {
+    let bytes = line.as_bytes();
+    let mut i = 0u32;
+    for b in bytes {
+        if *b == b' ' || *b == b'\t' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i + 1
 }
 
 /// Desugar a top-level `|>` pipe.  If `expr` contains a top-level
@@ -3350,13 +3526,19 @@ test flow_test() {
 
     #[test]
     fn test_parse_statement_let() {
-        let stmt = parse_statement("let a = 10", 2);
+        let stmt = parse_statement("let a = 10", 2, 5);
         assert!(stmt.is_some());
         match stmt.unwrap() {
-            Statement::LetBinding { name, expr, line } => {
+            Statement::LetBinding {
+                name,
+                expr,
+                line,
+                column,
+            } => {
                 assert_eq!(name, "a");
                 assert_eq!(expr, "10");
                 assert_eq!(line, 2);
+                assert_eq!(column, 5);
             }
             _ => panic!("expected LetBinding"),
         }
@@ -3364,15 +3546,29 @@ test flow_test() {
 
     #[test]
     fn test_parse_statement_expr() {
-        let stmt = parse_statement("final_result", 7);
+        let stmt = parse_statement("final_result", 7, 3);
         assert!(stmt.is_some());
         match stmt.unwrap() {
-            Statement::Expr { expr, line } => {
+            Statement::Expr {
+                expr,
+                line,
+                column,
+            } => {
                 assert_eq!(expr, "final_result");
                 assert_eq!(line, 7);
+                assert_eq!(column, 3);
             }
             _ => panic!("expected Expr"),
         }
+    }
+
+    #[test]
+    fn test_first_nonws_column() {
+        assert_eq!(first_nonws_column("let a = 10"), 1);
+        assert_eq!(first_nonws_column("  let a = 10"), 3);
+        assert_eq!(first_nonws_column("    foo"), 5);
+        assert_eq!(first_nonws_column(""), 1);
+        assert_eq!(first_nonws_column("\tlet"), 2);
     }
 
     #[test]
