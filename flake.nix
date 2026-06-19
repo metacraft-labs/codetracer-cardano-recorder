@@ -34,6 +34,24 @@
           inputsFrom = [ mcl-blockchain.devShells.${system}.aiken ];
           packages = [
             pkgs.zstd # required by libcodetracer_trace_writer (Nim FFI)
+            # Declare nim + nimble + just + capnproto explicitly
+            # so the dev shell is self-contained.  Previously these
+            # came via inputsFrom = [aiken], but the cached aiken
+            # devShell on the mcl-blockchain cachix substituter
+            # sometimes resolves to a build whose PATH is missing
+            # nimble (the binary IS in the store, but the cached
+            # devShell's drvAttrs.nativeBuildInputs were partial).
+            # Declaring them directly here keeps the contract
+            # explicit and removes the substituter-keyed surprise.
+            pkgs.nim
+            pkgs.nimble
+            pkgs.just
+            pkgs.capnproto
+            pkgs.rustc
+            pkgs.cargo
+            pkgs.rustfmt
+            pkgs.clippy
+            pkgs.pkg-config
           ];
         };
       }
