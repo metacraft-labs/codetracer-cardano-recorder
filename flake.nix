@@ -3,12 +3,10 @@
 
   nixConfig = {
     extra-substituters = [
-      "https://mcl-blockchain-packages.cachix.org"
-      "https://nix-blockchain-development.cachix.org"
+      "https://cache.metacraft-labs.com/metacraft-public"
     ];
     extra-trusted-public-keys = [
-      "mcl-blockchain-packages.cachix.org-1:qoEiUyBgNXmgJTThjbjO//XA9/6tCmx/OohHHt9hWVY="
-      "nix-blockchain-development.cachix.org-1:Ekei3RuW3Se+P/UIo6Q/oAgor/fVhFuuuX5jR8K/cdg="
+      "metacraft-public:UtS6PK+p0uZaJK3i/jD2DQOjTpddhQUQmNQDQih5N4Q="
     ];
   };
 
@@ -39,7 +37,7 @@
             # Declare nim + nimble + just + capnproto explicitly
             # so the dev shell is self-contained.  Previously these
             # came via inputsFrom = [aiken], but the cached aiken
-            # devShell on the mcl-blockchain cachix substituter
+            # devShell on the mcl-blockchain Attic substituter
             # sometimes resolves to a build whose PATH is missing
             # nimble (the binary IS in the store, but the cached
             # devShell's drvAttrs.nativeBuildInputs were partial).
