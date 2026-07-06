@@ -23,12 +23,35 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Build the binary if it isn't already built (cargo build is a no-op
-# when nothing has changed).  We use --quiet so the output of this
-# script stays focused on verification results.
-( cd "${REPO_ROOT}" && cargo build --locked --quiet )
+# Build a runnable host binary even when the dev shell exports a Cargo
+# build target for Aiken/Plutus work.  A target override moves the
+# executable under target/<host>/debug, so derive the path from rustc's
+# active host triple instead of assuming target/debug.
+HOST_TARGET=""
+while IFS= read -r line; do
+  case "${line}" in
+    host:*)
+      HOST_TARGET="${line#host: }"
+      break
+      ;;
+  esac
+done < <(rustc -vV)
+if [[ -z "${HOST_TARGET}" ]]; then
+  echo "ERROR: failed to determine rustc host target" >&2
+  exit 1
+fi
 
-BIN="${REPO_ROOT}/target/debug/codetracer-cardano-recorder"
+( cd "${REPO_ROOT}" && cargo build --locked --quiet --target "${HOST_TARGET}" --bin codetracer-cardano-recorder )
+
+TARGET_ROOT="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+case "${TARGET_ROOT}" in
+  /* | [A-Za-z]:/*) ;;
+  *) TARGET_ROOT="${REPO_ROOT}/${TARGET_ROOT}" ;;
+esac
+BIN="${TARGET_ROOT}/${HOST_TARGET}/debug/codetracer-cardano-recorder"
+case "${HOST_TARGET}" in
+  *windows*) BIN="${BIN}.exe" ;;
+esac
 if [[ ! -x "${BIN}" ]]; then
   echo "ERROR: recorder binary not found at ${BIN}" >&2
   exit 1
