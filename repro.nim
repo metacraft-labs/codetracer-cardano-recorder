@@ -59,10 +59,15 @@ package codetracer_cardano_recorder:
     # pkg-config + OpenSSL — openssl-sys consults pkg-config to find
     # OpenSSL on Linux/macOS. The Windows build uses the rustls-tls
     # feature instead so neither is on the windows toolchain floor.
-    when not defined(windows):
+    when defined(linux):
+      # Nim staticlib builds invoked from cargo expect a GNU archiver on
+      # Linux. Use gcc so Nim selects ``ar`` instead of ``llvm-ar``.
+      "gcc"
+    when defined(macosx):
       # Cargo build scripts look for ``cc`` by default; pass ``CC=clang``
-      # below and make clang part of the Unix dev environment.
+      # below and make clang part of the macOS dev environment.
       "clang"
+    when not defined(windows):
       "pkg-config"
       "openssl"
 
@@ -89,7 +94,8 @@ package codetracer_cardano_recorder:
       "target/release/codetracer-cardano-recorder" & binarySuffix
     let cargoCompilerEnv: seq[(string, string)] =
       when defined(windows): @[]
-      else: @[("CC", "clang")]
+      elif defined(macosx): @[("CC", "clang")]
+      else: @[("CC", "gcc")]
 
     let recorderBuild = cargo.build(
       locked = true,
