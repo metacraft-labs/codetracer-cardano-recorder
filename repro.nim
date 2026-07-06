@@ -41,6 +41,7 @@ package codetracer_cardano_recorder:
     # Linux/macOS the nix flake supplies the same versions.
     "rustc >=1.85"
     "cargo >=1.85"
+    "just >=1"
 
     # Nim toolchain — codetracer_trace_writer_nim's build.rs compiles
     # a static library at cargo build time. tarball-provisioned on
