@@ -102,7 +102,7 @@ jobs:
       - name: Build codetracer
         run: |
           cd "$GITHUB_WORKSPACE/../codetracer"
-          OVERRIDE="--override-input codetracer-trace-format path:./libs/codetracer-trace-format"
+          OVERRIDE="--override-input codetracer-trace-format path:./libs/codetracer-trace-format --override-input codetracer-trace-format-nim path:../codetracer-trace-format-nim"
           # ``cache.metacraft-labs.com/metacraft-codetracer`` serves a stale
           # narinfo for the noir flake input keyed under a NAR-hash
           # that no longer matches the lockfile, so the build aborts
@@ -197,9 +197,9 @@ jobs:
         if: failure()
         run: |
           EXT_DIAG="$GITHUB_WORKSPACE/../codetracer-vscode-extension/test/wdio/diagnostics"
-          if [ -d "$EXT_DIAG" ]; then
+          if [ -d "$EXT_DIAG" ] && [ -n "$(find "$EXT_DIAG" -mindepth 1 -print -quit)" ]; then
             mkdir -p "$GITHUB_WORKSPACE/wdio-diagnostics"
-            cp -r "$EXT_DIAG"/* "$GITHUB_WORKSPACE/wdio-diagnostics/"
+            cp -r "$EXT_DIAG"/. "$GITHUB_WORKSPACE/wdio-diagnostics/"
           fi
 
       - name: Upload diagnostics on failure
