@@ -33,8 +33,9 @@ jobs:
           env-flavor: windows-diy
           gh-token: ${{ steps.app-token.outputs.token }}
           siblings: |
-            codetracer-trace-format
-            codetracer-trace-format-nim
+            codetracer
+            codetracer-trace-format=main
+            codetracer-trace-format-nim=main
 
       - name: Check
         run: dev-exec cargo check

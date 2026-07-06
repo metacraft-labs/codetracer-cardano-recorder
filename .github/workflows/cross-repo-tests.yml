@@ -82,8 +82,8 @@ jobs:
           siblings: |
             codetracer=${{ github.event.inputs.codetracer_ref || github.event.client_payload.codetracer_ref }}
             codetracer-vscode-extension=${{ github.event.inputs.vscode_extension_ref || github.event.client_payload.vscode_extension_ref }}
-            codetracer-trace-format
-            codetracer-trace-format-nim
+            codetracer-trace-format=main
+            codetracer-trace-format-nim=main
             nix-blockchain-development
 
       - name: Provide codetracer-trace-format into codetracer/libs (CI override)
