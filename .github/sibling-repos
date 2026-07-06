@@ -1,4 +1,4 @@
-# Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
-# revisions (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
-codetracer-trace-format
-codetracer-trace-format-nim
+# Cross-repo siblings cloned by setup-dev-env at explicit refs.
+# See codetracer-specs/Testing/Cross-Repo-CI-Integration.md.
+codetracer-trace-format=main
+codetracer-trace-format-nim=main
