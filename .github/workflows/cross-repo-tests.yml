@@ -67,7 +67,8 @@ jobs:
         # Installs nix and clones the cross-repo siblings adjacent to this
         # checkout at workspace-lock-pinned revisions. workflow_dispatch /
         # repository_dispatch ref inputs override the locked revision for
-        # codetracer + the extension (empty => lock). nix-blockchain-development
+        # codetracer + the extension (fallback => known-good CodeTracer dev fix).
+        # nix-blockchain-development
         # is cloned bare (no override) for the recorder_exec mcl-blockchain
         # flake override patched in below.
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
@@ -80,7 +81,7 @@ jobs:
           attic-cache: ${{ vars.ATTIC_CACHE }}
           attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
           siblings: |
-            codetracer=${{ github.event.inputs.codetracer_ref || github.event.client_payload.codetracer_ref }}
+            codetracer=${{ github.event.inputs.codetracer_ref || github.event.client_payload.codetracer_ref || '4321b253d9f11974da006f02182abfa8c42db46b' }}
             codetracer-vscode-extension=${{ github.event.inputs.vscode_extension_ref || github.event.client_payload.vscode_extension_ref }}
             codetracer-trace-format=main
             codetracer-trace-format-nim=main
