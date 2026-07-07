@@ -2091,8 +2091,14 @@ fn test_higher_order_test_via_ct_print_full() {
     );
 
     // ----- Per-call return values -------------------------------------
-    // inc(5) → 6, inc(10) → 11, list.map iterations → 101/102/103,
-    // compute → 323.
+    // inc(5) → 6, inc(10) → 11 (direct closure calls with body steps
+    // between them, so their call_exit order is source order).  Then the
+    // three `list.map` closure iterations return 101/102/103 by input,
+    // but the writer's close()-time drain flushes their call_exit records
+    // at the SAME exit step, so trace-format-nim's LIFO same-step
+    // ordering (sort callsByExit by exit_step ASC, call_key DESC) emits
+    // the last-opened iteration first → 103, 102, 101.  compute() is the
+    // outermost frame and exits last → 323.
     let returns: Vec<i64> = doc["events"]
         .as_array()
         .expect("events array")
@@ -2105,7 +2111,7 @@ fn test_higher_order_test_via_ct_print_full() {
                 .unwrap_or_else(|| panic!("return value should decode as Int.i; got {rv}"))
         })
         .collect();
-    assert_eq!(returns, vec![6, 11, 101, 102, 103, 323]);
+    assert_eq!(returns, vec![6, 11, 103, 102, 101, 323]);
 
     // ----- Closure value surfaces as a String ValueRecord -------------
     let inc_value = doc["events"]
@@ -3156,19 +3162,27 @@ fn test_multi_test_entry_test_via_ct_print_full() {
             (name, rv["i"].as_i64().expect("rv.i"))
         })
         .collect();
-    // Re-pinned against trace-format-nim eec665b
-    // (CTFS-M-CallKeyOrder: allocate call_key at call entry).  Pre-fix,
-    // call_keys were assigned at registerReturn so deepest-child got the
-    // smallest key; post-fix, parents get the smallest entry-keys and
-    // completed CallRecords are flushed in entry-key order — so each
-    // outer test fires its exit before its callee's exit.
+    // Re-pinned against trace-format-nim's LIFO same-step call_exit
+    // ordering (fix(ct_print): LIFO ordering for same-step call_exit
+    // events — sort callsByExit by (exit_step ASC, call_key DESC)).
+    // When the writer's close()-time drain places a parent and its
+    // callee's call_exit at the SAME exit step (a test body that is a
+    // pure delegation to the callee, no body step after the call), the
+    // inner frame's exit is emitted first.  So each callee fires its
+    // exit before its enclosing test:
+    //   * arithmetic_path delegates to add     → add before arithmetic_path
+    //   * pattern_match_path delegates to pick  → pick before pattern_match_path
+    //   * pipeline_path chains double |> incr   → double, incr, then
+    //     pipeline_path (double/incr land on distinct exit steps, so
+    //     their order is their source order, and pipeline_path exits
+    //     last as the outermost frame).
     assert_eq!(
         returns,
         vec![
-            ("arithmetic_path".to_string(), 1),
             ("add".to_string(), 7),
-            ("pattern_match_path".to_string(), 1),
+            ("arithmetic_path".to_string(), 1),
             ("pick".to_string(), 11),
+            ("pattern_match_path".to_string(), 1),
             ("double".to_string(), 10),
             ("incr".to_string(), 11),
             ("pipeline_path".to_string(), 1),
