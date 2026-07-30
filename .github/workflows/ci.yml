@@ -1,15 +1,13 @@
 name: CI
 
-# Pilot consumer for the shared `setup-dev-env` composite action.
-#
-# CI's job is to re-play the project's deterministic dev env on
-# the runner -- the same env a developer uses locally to run
-# `nix develop -c just test`.  All toolchain bootstrapping lives
-# in `flake.nix` (or `env.ps1` on Windows); CI only materialises
-# that env and invokes `dev-exec just <target>`.
-#
+# Re-plays the project's deterministic dev env on the runner via the shared
+# reusable recorder-CI workflow (nixos-modules). Recorder-specific prep lives in
+# the `prepare-ci` just recipe; the shared workflow runs it after setup-dev-env
+# and before lint/test, then uploads logs to GitHub (short retention) and
+# mirrors them to the in-house S3 artifact store. Runs on the CIP-3 eph-3-class
+# runner matrix (the reusable workflow's default).
 # See:
-#   https://github.com/metacraft-labs/metacraft-dev-guidelines/blob/latest/policies/ci-shared-dev-env.md
+#   https://github.com/metacraft-labs/metacraft-dev-guidelines/blob/latest/policies/ci-workflow-standards.md
 
 on:
   push:
@@ -18,72 +16,8 @@ on:
     branches: [main, dev, stable]
 
 jobs:
-  lint-and-test:
-    name: Lint and test (${{ matrix.runner }})
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Generate CI token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
-          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
-          owner: metacraft-labs
-
-      - name: Setup dev env
-        # Materialises the flake.nix devShell on the runner.  The
-        # dev shell already provides nim, nimble, capnproto,
-        # zstd, rust, just -- the same toolchain a developer gets
-        # locally with `nix develop`.  After this step,
-        # `dev-exec <cmd>` runs <cmd> inside that env.
-        #
-        # setup-dev-env clones the siblings listed in
-        # .github/sibling-repos (codetracer-trace-format,
-        # codetracer-trace-format-nim) at the workspace-lock-pinned
-        # revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
-        with:
-          env-flavor: nix
-          gh-token: ${{ steps.app-token.outputs.token }}
-
-      - name: Build Nim trace writer library (sibling artifact)
-        # codetracer_trace_writer_nim's build.rs links against
-        # libcodetracer_trace_writer.a at
-        # $CODETRACER_NIM_LIB_DIR.  Build it via the dev env so
-        # the toolchain (nim, nimble, gcc) comes from flake.nix
-        # rather than ad-hoc CI installs.
-        #
-        # TODO: once codetracer-trace-format-nim ships a
-        # `just build-trace-writer-lib` target, replace this
-        # block with `direnv exec ../codetracer-trace-format-nim
-        # just build-trace-writer-lib` per the
-        # cross-repo-builds.md policy.
-        run: |
-          dev-exec bash -c '
-            set -euo pipefail
-            cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
-            nimble install -y stew results
-            nim c --app:staticlib --mm:arc --noMain -d:release -p:src \
-              -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
-          '
-          echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "$GITHUB_ENV"
-
-      - name: Lint
-        run: dev-exec just lint
-
-      - name: Test
-        run: dev-exec just test
-
-      - name: Upload test logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-logs-${{ matrix.runner }}
-          path: target/
-          retention-days: 7
+  ci:
+    uses: metacraft-labs/nixos-modules/.github/workflows/reusable-recorder-ci.yml@main
+    with:
+      prepare-recipe: prepare-ci
+    secrets: inherit
