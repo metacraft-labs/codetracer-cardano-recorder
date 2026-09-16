@@ -58,7 +58,7 @@ the validator execution through the UPLC CEK machine.
 
 The recorder is CTFS-only. To convert a recorded `.ct` bundle to a
 human-readable form, use `ct print` from
-[`codetracer-trace-format-nim`](../codetracer-trace-format-nim):
+[`codetracer-trace-format-nim`](https://github.com/metacraft-labs/codetracer-trace-format-nim):
 
 ```bash
 ct-print --json <recording-dir>/<program>.ct
