@@ -28,5 +28,5 @@
 #
 # Cross-repo siblings cloned by setup-dev-env at the explicit SHAs
 # pinned below (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
-codetracer-trace-format=54ef5d649623be7c4cb9ef2357b90f79694ddbed  # codetracer-trace-format@stable tip
-codetracer-trace-format-nim=3fcd1666da3e21638dcd9716376b9ce126fcac8b  # codetracer-trace-format-nim@dev tip
+codetracer-trace-format=0b1dd96b415e1f0207485324cc3cfb5653423d40  # codetracer-trace-format@dev tip
+codetracer-trace-format-nim=801dfa2d3889986e8c7c5b350e38a60042db6baf  # codetracer-trace-format-nim@dev tip
