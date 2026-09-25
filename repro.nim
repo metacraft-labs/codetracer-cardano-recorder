@@ -70,6 +70,7 @@
 ## declarations".
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 import repro_dsl_stdlib/packages/sh
 
 package codetracer_cardano_recorder:
@@ -123,6 +124,9 @@ package codetracer_cardano_recorder:
     name: "codetracer-cardano-recorder"
 
   devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
     activity "default"
 
   build:
