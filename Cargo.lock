@@ -167,6 +167,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "capnp"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fe67a3f89b693d2163cf3d94129125463ac5913e1c4322f2db905aa631d3c67"
+dependencies = [
+ "embedded-io",
+]
+
+[[package]]
+name = "capnpc"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "642d771bf5096ad1963fdbb9839f22e7bb1e308a2d1456fb1ad6cc99bb691115"
+dependencies = [
+ "capnp",
+]
+
+[[package]]
 name = "cbor4ii"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -277,6 +295,7 @@ name = "codetracer-cardano-recorder"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "codetracer_trace_reader",
  "codetracer_trace_types",
  "codetracer_trace_writer_nim",
  "eyre",
@@ -289,7 +308,52 @@ dependencies = [
  "serde_json",
  "tempfile",
  "uplc",
- "ureq",
+ "ureq 3.3.0",
+]
+
+[[package]]
+name = "codetracer_ctfs"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "ureq 2.12.1",
+ "urlencoding",
+ "zstd",
+]
+
+[[package]]
+name = "codetracer_trace_format_capnp"
+version = "0.19.0"
+dependencies = [
+ "capnp",
+ "capnpc",
+ "codetracer_trace_types",
+]
+
+[[package]]
+name = "codetracer_trace_format_cbor_zstd"
+version = "0.19.0"
+
+[[package]]
+name = "codetracer_trace_reader"
+version = "0.19.0"
+dependencies = [
+ "cbor4ii",
+ "codetracer_ctfs",
+ "codetracer_trace_format_capnp",
+ "codetracer_trace_format_cbor_zstd",
+ "codetracer_trace_types",
+ "codetracer_trace_writer",
+ "fscommon",
+ "num-traits",
+ "ruzstd",
+ "serde",
+ "serde_json",
+ "zeekstd",
+ "zstd",
+ "zstd-safe",
 ]
 
 [[package]]
@@ -305,6 +369,23 @@ dependencies = [
  "serde_repr",
  "serde_with",
  "uuid",
+]
+
+[[package]]
+name = "codetracer_trace_writer"
+version = "0.19.0"
+dependencies = [
+ "cbor4ii",
+ "codetracer_ctfs",
+ "codetracer_trace_format_capnp",
+ "codetracer_trace_format_cbor_zstd",
+ "codetracer_trace_types",
+ "num-traits",
+ "ruzstd",
+ "serde",
+ "serde_json",
+ "zeekstd",
+ "zstd",
 ]
 
 [[package]]
@@ -564,6 +645,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-io"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -634,6 +721,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fscommon"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "315ce685aca5ddcc5a3e7e436ef47d4a5d0064462849b6f0f628c28140103531"
+dependencies = [
+ "log",
 ]
 
 [[package]]
@@ -1525,6 +1621,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
+name = "ruzstd"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "schemars"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1913,6 +2018,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "twox-hash"
+version = "2.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
+
+[[package]]
 name = "typed-arena"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1989,6 +2100,24 @@ dependencies = [
 
 [[package]]
 name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64",
+ "flate2",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "url",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "ureq"
 version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
@@ -2004,7 +2133,7 @@ dependencies = [
  "serde_json",
  "ureq-proto",
  "utf8-zero",
- "webpki-roots",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
@@ -2030,6 +2159,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utf8-zero"
@@ -2168,6 +2303,15 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap 2.13.0",
  "semver",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
@@ -2447,6 +2591,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeekstd"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5f1379c45a7b52ed4aa3442da2cf5cc39abf1d8d178a5c02797be29c072ede2"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2545,6 +2698,24 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+dependencies = [
+ "zstd-sys",
+]
 
 [[package]]
 name = "zstd-sys"
