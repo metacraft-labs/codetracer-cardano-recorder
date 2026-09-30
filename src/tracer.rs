@@ -14,7 +14,9 @@ use std::rc::Rc;
 
 use codetracer_trace_types::{EventLogKind, Line, TypeId, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
-use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
+use codetracer_trace_writer_nim::NimTraceWriter;
+
+use crate::line_counts::{line_counted_writer, LineCountedPaths};
 use eyre::{eyre, Context, Result};
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -542,7 +544,7 @@ enum Statement {
 
 /// The main tracer struct that captures Aiken execution traces.
 pub struct AikenTracer {
-    writer: Box<dyn TraceWriter + Send>,
+    writer: Box<NimTraceWriter>,
     type_ids: HashMap<String, codetracer_trace_types::TypeId>,
     /// Names of types declared with `opaque type Name { ... }`.  When a
     /// `Value::Record { type_name }` for one of these names lands in the
@@ -578,7 +580,6 @@ impl AikenTracer {
         // parameter (`TraceEventsFileFormat::{Json,Binary,Ctfs}`) and the
         // CLI exposed a `--format` flag.  The convention now mandates
         // CTFS exclusively.
-        let format = TraceEventsFileFormat::Ctfs;
         let _source_map = SourceMap::from_source(source_path, source_code);
         let mut functions = parse_functions(source_code);
         // Follow `use module/path.{names}` directives and merge in
@@ -586,20 +587,12 @@ impl AikenTracer {
         // function is tagged with its source path so cross-module
         // step events carry the right path on the wire.  See
         // `module_imports_test.ak`.
-        let imported = load_imported_modules(source_path, source_code);
+        let (imported, module_sources) = load_imported_modules(source_path, source_code);
         functions.extend(imported);
         let opaque_type_names = collect_opaque_type_names(source_code);
         let const_decls = parse_const_declarations(source_code);
 
         eprintln!("Parsed {} functions", functions.len());
-
-        let program_str = source_path.to_string_lossy();
-        let mut tracer = AikenTracer {
-            writer: create_trace_writer(&program_str, &[], format),
-            type_ids: HashMap::new(),
-            opaque_type_names,
-            consts: HashMap::new(),
-        };
 
         std::fs::create_dir_all(out_dir)
             .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
@@ -608,8 +601,22 @@ impl AikenTracer {
         let events_filename = "trace.ctfs";
         let events_path = out_dir.join(events_filename);
 
-        TraceWriter::begin_writing_trace_events(&mut *tracer.writer, &events_path)
-            .map_err(|e| eyre!("{e}"))?;
+        let program_str = source_path.to_string_lossy();
+        let mut tracer = AikenTracer {
+            writer: Box::new(line_counted_writer(&program_str, &events_path)?),
+            type_ids: HashMap::new(),
+            opaque_type_names,
+            consts: HashMap::new(),
+        };
+
+        // State every file's real line count in `paths.dat` — the program
+        // and each module it imports, which are the only paths its steps and
+        // functions name — before `start` names the first of them.
+        let mut paths = LineCountedPaths::default();
+        paths.register(&mut tracer.writer, source_path, source_code)?;
+        for (module_path, module_source) in &module_sources {
+            paths.register(&mut tracer.writer, module_path, module_source)?;
+        }
 
         TraceWriter::start(&mut *tracer.writer, source_path, Line(1));
 
@@ -2114,10 +2121,14 @@ fn resolve_module_path(primary_source: &Path, module_path: &str) -> Option<std::
 /// Load and parse every module reachable from the primary source via
 /// a `use` directive, returning the merged function list (each
 /// imported function tagged with its source path so cross-module
-/// step events carry the right path on the wire).  See
-/// `module_imports_test.ak`.
-fn load_imported_modules(primary_source: &Path, primary_source_code: &str) -> Vec<FunctionDef> {
+/// step events carry the right path on the wire) together with each
+/// loaded module's path and text.  See `module_imports_test.ak`.
+fn load_imported_modules(
+    primary_source: &Path,
+    primary_source_code: &str,
+) -> (Vec<FunctionDef>, Vec<(std::path::PathBuf, String)>) {
     let mut out = Vec::new();
+    let mut sources = Vec::new();
     for directive in parse_use_directives(primary_source_code) {
         let Some(module_path) = resolve_module_path(primary_source, &directive.module_path) else {
             continue;
@@ -2130,8 +2141,9 @@ fn load_imported_modules(primary_source: &Path, primary_source_code: &str) -> Ve
             f.source_path = Some(module_path.clone());
         }
         out.extend(funcs);
+        sources.push((module_path, module_source));
     }
-    out
+    (out, sources)
 }
 
 /// A parsed top-level `const` declaration.  Carries the source-level
