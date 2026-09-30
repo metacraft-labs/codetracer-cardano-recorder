@@ -6,6 +6,7 @@
 //! CodeTracer trace format for debugging and analysis.
 
 pub mod blockfrost;
+pub mod line_counts;
 pub mod recorder;
 pub mod source_map;
 pub mod tracer;
