@@ -244,3 +244,9 @@ verify-scoop:
 
 verify-chocolatey:
     just verify-package chocolatey
+
+# Install genuine canonical checks and preserve matching Repro publication hooks.
+# Pass the actual matching engine explicitly; unqualified protocols fail.
+[positional-arguments]
+install-hooks REPRO:
+    python3 tools/install-canonical-hooks.py --repro "$1"

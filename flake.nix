@@ -24,6 +24,15 @@
         devShells.default = pkgs.mkShell {
           inputsFrom = [ mcl-blockchain.devShells.${system}.aiken ];
           packages = [
+            # Portable mcl-standard-hooks rules are committed separately.
+            # This owning locked shell supplies their native executables.
+            pkgs.prek
+            pkgs.uv
+            pkgs.editorconfig-checker
+            pkgs.nixfmt-rfc-style
+            pkgs.opentofu
+            pkgs.nodePackages.prettier
+            pkgs.python3
             pkgs.zstd # required by libcodetracer_trace_writer (Nim FFI)
             # Declare nim + nimble + just + capnproto explicitly
             # so the dev shell is self-contained.  Previously these
@@ -67,6 +76,9 @@
           # credentials when present: the download cache is shared, and only
           # the proxy directory is left behind.
           shellHook = ''
+            # Execute the configured upstream hooks faithfully; Prek0.2.17
+            # native size rounding differs at the exact 1 MiB boundary.
+            export PREK_NO_FAST_PATH=1
             _ct_real_cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
             _ct_cargo_home="''${XDG_CACHE_HOME:-$HOME/.cache}/codetracer-cardano-recorder/cargo-home"
             if [ "$_ct_real_cargo_home" != "$_ct_cargo_home" ]; then

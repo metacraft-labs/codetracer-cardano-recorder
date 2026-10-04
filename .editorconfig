@@ -1,0 +1,23 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+# Explicit source indentation; format-aware Cargo fmt owns Rust literals.
+[*.{nix,nim,sh,ak,rb,json,toml,nuspec,ps1}]
+indent_size = 2
+
+[*.{sw,py}]
+indent_size = 4
+
+# Native generated lock formats retain their canonical one-space entries.
+[{Cargo.lock,repro.lock}]
+indent_size = 1
+
+# Arch .SRCINFO uses literal tab-prefixed metadata fields.
+[packaging/aur/.SRCINFO]
+indent_style = tab
