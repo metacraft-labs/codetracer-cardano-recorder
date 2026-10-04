@@ -72,6 +72,7 @@
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
 import repro_dsl_stdlib/packages/sh
+import "../codetracer-trace-format-nim/build_writer_artifacts"
 
 package codetracer_cardano_recorder:
   defaultToolProvisioning "path"
@@ -193,6 +194,10 @@ package codetracer_cardano_recorder:
     # §M4 — the whole-binary edge becomes a fan-out point without
     # changing this recipe.
 
+    const nimRoot = "../codetracer-trace-format-nim"
+    let decoderBuild = buildCtPrint(nimRoot)
+    let decoderBinary = ctPrintPath(nimRoot)
+
     let testsBuild = cargo.test(
       locked = true,
       noRun = true,
@@ -206,11 +211,11 @@ package codetracer_cardano_recorder:
     let testsRun = cargo.test(
       locked = true,
       actionId = "codetracer-cardano-recorder.cargo-test-run",
-      after = @[testsBuild.action],
+      after = @[testsBuild.action, decoderBuild],
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
         "src", "tests", "test-programs",
-        "target/debug/deps"
+        "target/debug/deps", decoderBinary
       ])
 
     # ---- CLI-convention verification edge -----------------------------
@@ -233,7 +238,7 @@ package codetracer_cardano_recorder:
     let cliVerify = shell(
       command = "bash tests/verify-cli-convention-no-silent-skip.sh",
       actionId = "codetracer-cardano-recorder.verify-cli-convention",
-      after = @[testsBuild.action],
+      after = @[testsRun.action],
       extraInputs = @[
         "tests/verify-cli-convention-no-silent-skip.sh",
         "Cargo.toml", "Cargo.lock", "src"

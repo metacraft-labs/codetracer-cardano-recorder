@@ -209,14 +209,11 @@ fn test_aiken_cli_record() {
 #[test]
 fn test_recorded_trace_via_ct_print_json() {
     let ct_print = ct_print_path();
-    if !ct_print.exists() {
-        eprintln!(
-            "SKIP: ct-print not found at {} — only available within the \
-             metacraft workspace where codetracer-trace-format-nim is a sibling.",
-            ct_print.display()
-        );
-        return;
-    }
+    assert!(
+        ct_print.exists(),
+        "missing prerequisite: ct-print not found at {}; build the owning decoder before running the full suite",
+        ct_print.display()
+    );
 
     let tmp_dir = tempfile::tempdir().expect("tempdir");
     let out_dir = tmp_dir.path().join("traces");
