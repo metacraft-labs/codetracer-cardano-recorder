@@ -1290,12 +1290,12 @@ fn test_error_paths_test_via_ct_print_full() {
     // failures (which carry `AikenUplcEvalError`).
     let error_events: Vec<&serde_json::Value> = events
         .iter()
-        .filter(|e| e["kind"] == "io" && e["io_kind"] == "ioError")
+        .filter(|e| e["kind"] == "io" && e["io_kind"] == "Error")
         .collect();
     assert_eq!(
         error_events.len(),
         1,
-        "expected exactly one ioError io_event for the `fail` in failing_compute; \
+        "expected exactly one Error io_event for the `fail` in failing_compute; \
          got {error_events:?}"
     );
     let text = error_events[0]["text"].as_str().unwrap_or("");
@@ -1392,11 +1392,9 @@ fn test_tracing_test_via_ct_print_full() {
         vec![("a".into(), 4), ("b".into(), 5), ("sum_val".into(), 9),],
     );
 
-    // Each `trace @"label": value` surfaces as an `ioStdout` io_event
-    // (the multi-stream IOEvent stream collapses
-    // `EventLogKind::Write` / `WriteFile` / `WriteOther` to the
-    // `ioStdout` bucket — see `toIOEventKind` in
-    // `codetracer-trace-format-nim`) whose `text` carries
+    // Each `trace @"label": value` surfaces as an io_event whose
+    // `io_kind` is the exact `EventLogKind` the recorder wrote, `Write`
+    // (`trace-events.md` §"EventLogKind (u8 enum)"), and whose `text` carries
     // `"<label>: <value-expr>"` verbatim.  The frontend can route on
     // the `AikenTrace` metadata tag (mirroring the `AikenFail`
     // convention) to distinguish trace output from generic
@@ -1407,7 +1405,7 @@ fn test_tracing_test_via_ct_print_full() {
     // called out for `emit_fail_events_for_program`.
     let trace_events: Vec<&serde_json::Value> = events
         .iter()
-        .filter(|e| e["kind"] == "io" && e["io_kind"] == "ioStdout")
+        .filter(|e| e["kind"] == "io" && e["io_kind"] == "Write")
         .collect();
     let texts: Vec<&str> = trace_events
         .iter()
@@ -1416,7 +1414,7 @@ fn test_tracing_test_via_ct_print_full() {
     assert_eq!(
         texts,
         vec!["after-a: a", "after-b: b", "final-sum: sum_val"],
-        "ioStdout events should carry one entry per `trace @\"label\": value` \
+        "Write events should carry one entry per `trace @\"label\": value` \
          with text \"<label>: <value-expr>\""
     );
 }
@@ -2497,19 +2495,19 @@ fn test_expect_refinement_test_via_ct_print_full() {
     let events = doc["events"].as_array().expect("events array");
     let expect_errors: Vec<&serde_json::Value> = events
         .iter()
-        .filter(|e| e["kind"] == "io" && e["io_kind"] == "ioError")
+        .filter(|e| e["kind"] == "io" && e["io_kind"] == "Error")
         .collect();
     assert_eq!(
         expect_errors.len(),
         3,
-        "expected 3 ioError io_events (one per expect statement); got {expect_errors:?}",
+        "expected 3 Error io_events (one per expect statement); got {expect_errors:?}",
     );
     // Every error message should mention `expect`.
     for ev in &expect_errors {
         let text = ev["text"].as_str().unwrap_or("");
         assert!(
             text.starts_with("expect "),
-            "ioError text should start with `expect `; got {text:?}"
+            "Error text should start with `expect `; got {text:?}"
         );
     }
 }
