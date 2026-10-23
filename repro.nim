@@ -11,12 +11,12 @@
 ## `shell(command = "bash scripts/...")` wrappers for the Rust build /
 ## test — delegation defeats the engine's incremental-build,
 ## action-cache, per-test invalidation, and the CI sharding the engine
-## grows into per ``reprobuild-specs/CI-Sharding.md``. The ONE
-## ``sh.shell`` edge below wraps the repo's CLI-convention verification
-## script, which is not a cargo target — it is a POSIX-shell assertion
-## harness that ``just test`` runs after ``cargo test`` (see ``Justfile``
-## ``test:``), so it is modelled as its own execute edge rather than
-## dropped.
+## grows into per ``reprobuild-specs/CI-Sharding.md``. The TWO
+## ``sh.shell`` edges below wrap the repo's shell verification scripts
+## — the CLI-convention check and the Cargo.lock-matches-trace-format
+## check. Neither is a cargo target; both are POSIX-shell assertion
+## harnesses that ``just test`` runs (see ``Justfile`` ``test:``), so
+## each is modelled as its own execute edge rather than dropped.
 ##
 ## On Windows the recipe drives real reprobuild tool provisioning via
 ## the tarball entries the ``uses:`` packages declare (cargo, rustc,
@@ -50,16 +50,17 @@
 ## tests invoke by relative path, not a reprobuild edge input.
 ##
 ## **Per-test platform gating.** ``just test`` is ``cargo test
-## --locked`` followed by the CLI-convention shell script — no test
-## FILE in this repo carries a per-host gate. ``tests/test_tracer.rs``
+## --locked`` bracketed by the two shell verification scripts
+## (Cargo.lock against trace-format first, the CLI convention last)
+## — no test FILE in this repo carries a per-host gate. ``tests/test_tracer.rs``
 ## and ``tests/test_ctfs_audit.rs`` contain no ``#[cfg(target_os =
 ## …)]`` / ``#[ignore]`` selection (they record the ``.ak`` / ``.uplc``
 ## fixtures under ``test-programs/`` through the recorder's in-process
 ## Aiken → UPLC → CTFS pipeline and assert on the produced CTFS bundle
 ## on every host), so the single whole-workspace ``cargo.test`` execute
 ## edge below matches the repo's own ``just test`` one-for-one — there
-## is no per-OS partition to model. The shell verify edge is
-## POSIX-portable (``bash``) and is likewise unconditional.
+## is no per-OS partition to model. The two shell verify edges are
+## POSIX-portable (``bash``) and are likewise unconditional.
 ##
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
 ## canonical Rust-recorder recipes: the nix dev shell puts ``cargo`` /
@@ -113,9 +114,10 @@ package codetracer_cardano_recorder:
       "pkg-config"
       "openssl"
 
-    # POSIX shell — drives the CLI-convention verification edge below,
-    # the same ``bash tests/verify-cli-convention-no-silent-skip.sh``
-    # step ``just test`` runs after ``cargo test``.
+    # POSIX shell — drives the two shell verification edges below, the
+    # same ``bash tests/verify-cli-convention-no-silent-skip.sh`` and
+    # ``bash tests/verify-cargo-lock-matches-trace-format.sh`` steps
+    # ``just test`` runs.
     "sh"
     # `choco pack` / `choco push` in .github/workflows/publish-chocolatey.yml.
     # Windows-guarded because Chocolatey is a Windows package manager with no
@@ -240,4 +242,33 @@ package codetracer_cardano_recorder:
       ],
       cacheable = false)
 
-    discard collect("test", @[testsRun.action, cliVerify])
+    # ---- Cargo.lock vs trace-format verification edge ------------------
+    #
+    # ``just test`` runs ``bash
+    # tests/verify-cargo-lock-matches-trace-format.sh`` FIRST, before
+    # ``cargo test --locked``, so that a stale lock is reported with this
+    # diagnosis rather than only cargo's "needs to be updated but
+    # --locked was passed". ``Cargo.toml`` reaches three
+    # ``codetracer-trace-format`` crates by sibling path, and cargo
+    # writes those crates' own dependency edges into ``Cargo.lock``, so
+    # the lock is valid for exactly one trace-format tree. The script re-resolves a scratch copy of the lock with
+    # ``cargo update --workspace --offline`` against a ``git archive``
+    # of the trace-format revision ``repro.lock`` pins and against the
+    # sibling checkout on disk, and requires both results to be
+    # byte-identical to the committed lock (it never writes the
+    # committed lock). Like the CLI-convention script it is not a cargo
+    # target, so it is its own ``sh.shell`` execute edge. It needs no
+    # built binary, so it has no ``after``. Non-cacheable: its verdict
+    # depends on the sibling checkout and on the cargo registry index
+    # cache, both outside this repo, so it is re-run every ``repro
+    # test`` pass (matching ``just test``).
+    let cargoLockVerify = shell(
+      command = "bash tests/verify-cargo-lock-matches-trace-format.sh",
+      actionId = "codetracer-cardano-recorder.verify-cargo-lock",
+      extraInputs = @[
+        "tests/verify-cargo-lock-matches-trace-format.sh",
+        "Cargo.toml", "Cargo.lock", "repro.lock"
+      ],
+      cacheable = false)
+
+    discard collect("test", @[testsRun.action, cliVerify, cargoLockVerify])
