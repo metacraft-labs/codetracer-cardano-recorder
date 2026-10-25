@@ -227,6 +227,7 @@ fn record(args: RecordArgs) -> Result<()> {
 /// CodeTracer trace.
 fn replay(args: ReplayArgs) -> Result<()> {
     use codetracer_cardano_recorder::blockfrost::BlockfrostClient;
+    use codetracer_cardano_recorder::cek::{step_program, BudgetComparison};
     use codetracer_cardano_recorder::transaction::reconstruct_applied_program;
     use uplc::machine::cost_model::ExBudget;
 
@@ -261,25 +262,45 @@ fn replay(args: ReplayArgs) -> Result<()> {
     let program = reconstruct_applied_program(&tx_data)?;
     eprintln!("Reconstructed applied program");
 
-    // 4. Evaluate through the CEK machine.
+    // 4. Step the program through the chain's own CEK machine.
+    //
+    // CXP-ADA-1: this path steps rather than calling `eval_version`, so the
+    // execution is observed inside the chain's evaluator one CEK transition
+    // at a time.  There is deliberately no fallback to a
+    // run-to-completion or source-simulated path on failure: §2.1 warns that
+    // a silent fallback lets a non-authoritative account be presented as if
+    // it were what the chain executed, so a stepping failure is an error.
     let language = tx_data.script_version.to_language();
-    let result = program.eval_version(ExBudget::default(), &language);
-    match result.result() {
-        Ok(term) => {
-            eprintln!("Evaluation succeeded");
-            println!("{term}");
-        }
-        Err(e) => {
-            eprintln!("Evaluation failed: {e:?}");
-            return Err(eyre::eyre!("UPLC evaluation error: {e:?}"));
-        }
-    }
+    let run = step_program(program, &language, ExBudget::default())?;
 
     eprintln!(
-        "Budget spent: {} CPU, {} MEM",
-        result.cost().cpu,
-        result.cost().mem
+        "Stepped {} CEK transitions through the chain's evaluator",
+        run.step_count()
     );
+    println!("{}", run.result);
+
+    let consumed = run.consumed();
+    eprintln!("Budget spent: {} CPU, {} MEM", consumed.cpu, consumed.mem);
+
+    // 5. Compare against the budget consensus recorded for this script.
+    match tx_data.consensus_budget {
+        Some(consensus) => {
+            let comparison = BudgetComparison::new(consumed, consensus);
+            eprintln!("Budget oracle: {comparison}");
+            if !comparison.agrees() {
+                return Err(eyre::eyre!(
+                    "replayed budget diverges from the budget consensus recorded: {comparison}"
+                ));
+            }
+        }
+        None => {
+            eprintln!(
+                "Budget oracle: NOT MEASURED -- the chain data source reported no \
+                 execution units for this redeemer, so there is nothing independent \
+                 to compare the replay against."
+            );
+        }
+    }
 
     Ok(())
 }
