@@ -5,6 +5,7 @@
 //! and script context needed to replay validator execution.
 
 use eyre::{eyre, Result};
+use uplc::machine::cost_model::ExBudget;
 
 use crate::transaction::{PlutusVersion, TransactionData};
 
@@ -164,6 +165,19 @@ impl BlockfrostClient {
             .unwrap_or_default()
             .to_string();
 
+        // CXP-ADA-1 oracle: the `/redeemers` response carries the execution
+        // units consensus recorded for this redeemer (`unit_mem` /
+        // `unit_steps`).  These are produced by the network, not by us, which
+        // is what makes them a control a recorder bug cannot corrupt.  They
+        // were previously fetched and discarded; keep them so a replay can be
+        // checked against what the chain actually charged.
+        //
+        // Blockfrost returns them as decimal *strings*, so parse rather than
+        // `as_i64`.  Absent or unparseable values yield `None` — the caller
+        // must then report the comparison as not measured instead of assuming
+        // agreement.
+        let consensus_budget = parse_execution_units(redeemer_entry);
+
         // Determine Plutus version from script type.
         let script_type_url = format!("{}/scripts/{}", self.base_url, script_hash);
         let mut script_type_resp = ureq::get(&script_type_url)
@@ -199,8 +213,34 @@ impl BlockfrostClient {
             redeemer: redeemer_hex,
             script_context: String::new(),
             script_version,
+            consensus_budget,
         })
     }
+}
+
+/// Extract the consensus-recorded execution units from a Blockfrost
+/// `/txs/{hash}/redeemers` entry.
+///
+/// Blockfrost encodes `unit_mem` and `unit_steps` as decimal strings; some
+/// deployments have been observed to return them as JSON numbers, so both are
+/// accepted.  Returns `None` unless *both* axes are present and parseable: a
+/// half-known budget is not an oracle, and silently defaulting the missing
+/// axis to zero would manufacture a divergence (or an agreement) that the
+/// chain never reported.
+fn parse_execution_units(entry: &serde_json::Value) -> Option<ExBudget> {
+    let field = |name: &str| -> Option<i64> {
+        let v = entry.get(name)?;
+        match v {
+            serde_json::Value::String(s) => s.parse::<i64>().ok(),
+            serde_json::Value::Number(n) => n.as_i64(),
+            _ => None,
+        }
+    };
+
+    Some(ExBudget {
+        mem: field("unit_mem")?,
+        cpu: field("unit_steps")?,
+    })
 }
 
 // ---------------------------------------------------------------------------

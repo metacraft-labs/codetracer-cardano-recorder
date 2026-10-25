@@ -1,12 +1,33 @@
-//! Tracer implementation for Aiken programs.
+//! Tracer implementation for Aiken programs — **source-simulated, not
+//! authoritative**.
 //!
-//! Parses an Aiken source file to extract function definitions, test blocks,
-//! variable declarations, and expressions, then evaluates each expression
-//! through the real UPLC CEK machine (from the `uplc` crate) and emits
-//! CodeTracer trace events (steps, calls, returns, variables).
+//! Parses an Aiken source file with a hand-written parser (`parse_functions`,
+//! `parse_statement`, `parse_when_opener`, ...) and evaluates the result with a
+//! hand-rolled interpreter (`eval_expr_to_value`, `synthesize_builtin_result`),
+//! emitting CodeTracer trace events (steps, calls, returns, variables).
 //!
-//! Every computed value in the trace comes from the real UPLC CEK machine
-//! evaluation, not from a hand-rolled expression evaluator.
+//! # This is not what the chain executed
+//!
+//! The chain executes compiled UPLC. This module never invokes the Aiken
+//! compiler, so what it reports is a simulation of the *source*, and per §2.1
+//! of the Cardano recorder charter it "must never be presented to a user as an
+//! authoritative account of what the chain executed".
+//!
+//! The real CEK machine is reached only by `eval_uplc_term`, which constant-
+//! folds integer arithmetic out of expressions this module has already parsed
+//! itself; that lowering "only knows about identifiers and integer literals"
+//! (see `eval_expr_via_uplc`). Values outside that narrow path are synthesised
+//! rather than computed, and some are deliberately not faithful at all:
+//! `blake2b_256`/`sha2_256`/`sha3_256` return zeroed byte arrays, and
+//! `verify_ed25519_signature` returns a constant true regardless of its
+//! arguments.
+//!
+//! An earlier version of this header claimed that "every computed value in the
+//! trace comes from the real UPLC CEK machine evaluation, not from a
+//! hand-rolled expression evaluator". That was false in the file that defines
+//! the hand-rolled evaluator. The authoritative path is `crate::cek`, driven by
+//! the `replay` subcommand; CXP-ADA-1 retires this module once the compiler is
+//! invoked (deliverable 3).
 
 use std::collections::HashMap;
 use std::path::Path;

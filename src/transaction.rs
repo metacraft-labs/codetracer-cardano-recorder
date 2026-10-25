@@ -15,6 +15,7 @@ use std::fmt;
 
 use eyre::{eyre, Result};
 use uplc::ast::{DeBruijn, NamedDeBruijn, Program};
+use uplc::machine::cost_model::ExBudget;
 
 use pallas_primitives::conway::Language;
 
@@ -76,6 +77,16 @@ pub struct TransactionData {
 
     /// Plutus language version of the script.
     pub script_version: PlutusVersion,
+
+    /// Execution units consensus recorded for this script, when the chain
+    /// data source reported them.
+    ///
+    /// This is the CXP-ADA-1 budget oracle: the network computed this figure,
+    /// so comparing a stepped replay against it is a check no recorder bug
+    /// can corrupt.  `None` means the figure was unavailable, and a caller
+    /// must then report the comparison as *not measured* — never as
+    /// agreement.
+    pub consensus_budget: Option<ExBudget>,
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +278,7 @@ mod tests {
             redeemer: "01".to_string(),
             script_context: "d87980".to_string(),
             script_version: PlutusVersion::V2,
+            consensus_budget: None,
         };
         assert_eq!(tx.script_version, PlutusVersion::V2);
         assert!(tx.datum.is_some());
@@ -310,6 +322,7 @@ mod tests {
             redeemer: redeemer_hex,
             script_context: ctx_hex,
             script_version: PlutusVersion::V2,
+            consensus_budget: None,
         };
 
         let program = reconstruct_applied_program(&tx_data).expect("reconstruction failed");
@@ -354,6 +367,7 @@ mod tests {
             redeemer: redeemer_hex,
             script_context: ctx_hex,
             script_version: PlutusVersion::V2,
+            consensus_budget: None,
         };
 
         let program = reconstruct_applied_program(&tx_data).expect("reconstruction failed");
@@ -376,6 +390,7 @@ mod tests {
             redeemer: redeemer_hex,
             script_context: ctx_hex,
             script_version: PlutusVersion::V2,
+            consensus_budget: None,
         };
 
         let program = reconstruct_applied_program(&tx_data).expect("reconstruction failed");
@@ -404,6 +419,7 @@ mod tests {
             redeemer: redeemer_hex,
             script_context: ctx_hex,
             script_version: PlutusVersion::V2,
+            consensus_budget: None,
         };
 
         let text = reconstruct_applied_program_text(&tx_data).expect("reconstruction failed");

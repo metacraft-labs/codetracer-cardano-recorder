@@ -17,7 +17,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 num-bigint = "0.4"
 num-traits = "0.2"
-uplc = "1.1.21"
+# CXP-ADA-1: the recorder must observe script execution *inside* the chain's
+# own evaluator, which requires the public CEK stepping API
+# (`Machine::get_initial_machine_state` / `Machine::step`, plus public
+# `MachineState` / `Context` / `Env`).  That API is not in the crates.io
+# release, so the dependency points at the workspace fork, where it landed as
+# `baeb591a` and is an ancestor of `origin/codetracer`.  The fork is the same
+# version (1.1.21) as the registry crate, so this is a drop-in redirect.
+uplc = { path = "../metacraft-aiken-fork/crates/uplc" }
 hex = "0.4"
 pallas-primitives = "0.33"
 pallas-codec = "0.33"
