@@ -55,6 +55,41 @@ jobs:
             "https://github.com/metacraft-labs/codetracer-trace-format-nim.git" \
             "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
 
+      - name: Clone metacraft-aiken-fork sibling (uplc path dependency)
+        # `Cargo.toml` takes `uplc` from
+        # ../metacraft-aiken-fork/crates/uplc rather than from
+        # crates.io, because the CEK stepping API this recorder
+        # drives is `pub` only in the fork -- in the published
+        # 1.1.21 crate `MachineState` and `Context` are private and
+        # `get_initial_machine_state`/`step` are absent entirely, so
+        # the registry release cannot satisfy the manifest.
+        #
+        # NOTE THE NAME MISMATCH, WHICH IS WHY THIS IS NOT A COPY OF
+        # THE STEPS ABOVE: the remote is `metacraft-labs/aiken` and
+        # the checkout directory must be `metacraft-aiken-fork`,
+        # because that is the path the dependency names. Cloning it
+        # under the repository's own name resolves nothing.
+        #
+        # The pin is keyed by DIRECTORY name in .github/sibling-pins
+        # and its ref is a SHA, so the `--branch` attempt below fails
+        # and the fallback checkout is the arm that runs. That is the
+        # same two-stage shape the trace-format step uses.
+        run: |
+          PINS=".github/sibling-pins"
+          AIKEN_REF="codetracer-stepping-api"
+          if [ -f "${PINS}" ]; then
+            PIN="$(grep '^metacraft-aiken-fork ' "${PINS}" | cut -d' ' -f2)" || true
+            [ -n "${PIN}" ] && AIKEN_REF="${PIN}"
+          fi
+          target="${GITHUB_WORKSPACE}/../metacraft-aiken-fork"
+          rm -rf "${target}"
+          if ! git clone --depth 1 --branch "${AIKEN_REF}" --single-branch \
+            "https://github.com/metacraft-labs/aiken.git" "${target}" 2>/dev/null; then
+            rm -rf "${target}"
+            git clone --no-checkout "https://github.com/metacraft-labs/aiken.git" "${target}"
+            git -C "${target}" checkout "${AIKEN_REF}"
+          fi
+
       - name: Setup dev env
         # Materialises the flake.nix devShell on the runner.  The
         # dev shell already provides nim, nimble, capnproto,

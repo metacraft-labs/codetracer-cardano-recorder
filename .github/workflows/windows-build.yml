@@ -72,6 +72,41 @@ jobs:
           fi
 
       - uses: dtolnay/rust-toolchain@stable
+      - name: Clone metacraft-aiken-fork (uplc path dependency)
+        # `Cargo.toml` takes `uplc` from
+        # ../metacraft-aiken-fork/crates/uplc, not from crates.io: the
+        # CEK stepping API this recorder drives is `pub` only in the
+        # fork, and in the published 1.1.21 crate `MachineState` and
+        # `Context` are private while `get_initial_machine_state` and
+        # `step` are absent, so `cargo check` cannot resolve the
+        # manifest without this checkout.
+        #
+        # THE REMOTE AND THE DIRECTORY HAVE DIFFERENT NAMES: the repo
+        # is `metacraft-labs/aiken`, the directory must be
+        # `metacraft-aiken-fork` because that is what the dependency
+        # path names. The pin in .github/sibling-pins is keyed by the
+        # directory name and holds a SHA, so the `--branch` attempt
+        # fails and the fallback checkout is the arm that runs.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          PINS=".github/sibling-pins"
+          AIKEN_REF="codetracer-stepping-api"
+          if [ -f "${PINS}" ]; then
+            PIN="$(grep '^metacraft-aiken-fork ' "${PINS}" | cut -d' ' -f2)" || true
+            [ -n "${PIN}" ] && AIKEN_REF="${PIN}"
+          fi
+          CLONE_URL="https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/aiken.git"
+          target="${GITHUB_WORKSPACE}/../metacraft-aiken-fork"
+          rm -rf "${target}"
+          if ! git clone --depth 1 --branch "${AIKEN_REF}" --single-branch \
+            "${CLONE_URL}" "${target}" 2>/dev/null; then
+            rm -rf "${target}"
+            git clone --no-checkout "${CLONE_URL}" "${target}"
+            git -C "${target}" checkout "${AIKEN_REF}"
+          fi
+
       - name: Install capnproto
         shell: pwsh
         run: choco install capnproto -y
