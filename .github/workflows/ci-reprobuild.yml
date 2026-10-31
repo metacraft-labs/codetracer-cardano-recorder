@@ -93,7 +93,10 @@ jobs:
         run: dev-exec repro build
 
       - name: repro test
-        # Materialises the `test` collection.
+        # Materialises the `test` collection. It also builds ct-print in the
+        # sibling `../codetracer-trace-format-nim`, which the cargo tests read
+        # their recordings back with: `repro.nim` declares that compile as an
+        # edge, through the sibling's own `buildCtPrint` constructor.
         run: dev-exec repro test
 
       - name: just build (cross-check)
