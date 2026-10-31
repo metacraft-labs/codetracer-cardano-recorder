@@ -1,0 +1,69 @@
+{
+  "network": "cardano-mainnet",
+  "endpoint": "POST https://api.koios.rest/api/v1/utxo_info",
+  "query": {
+    "_utxo_refs": [
+      "ac598daca88490c8c8f63f9bb4723fba7c4741998a57f60b4437972fe406b9f4#0"
+    ],
+    "_extended": true
+  },
+  "fetched": "2026-10-31",
+  "source": "Koios public API (no API key required)",
+  "identity": {
+    "kind": "datum-blake2b-256",
+    "note": "for every row carrying an inline_datum, blake2b-256(inline_datum.bytes) must equal that row datum_hash — the proven anchor"
+  },
+  "response": [
+    {
+      "tx_hash": "ac598daca88490c8c8f63f9bb4723fba7c4741998a57f60b4437972fe406b9f4",
+      "tx_index": 0,
+      "address": "addr1w8z0xlftcx54tn7uxdvhk0qgj9u7hmlaccjthnc9kvu4pmcyemglm",
+      "value": "1521430",
+      "stake_address": null,
+      "payment_cred": "c4f37d2bc1a955cfdc33597b3c089179ebeffdc624bbcf05b33950ef",
+      "epoch_no": 664,
+      "block_height": 14137075,
+      "block_time": 1793397186,
+      "datum_hash": "a4031996a548e58e94f438edaceb4f6464609b9db9d20dce910236e8dd509037",
+      "inline_datum": {
+        "bytes": "9f46313631363836463130373934384953594e4730303939391903625835697066733a2f2f516d5346794e4553513733634478505a3978416d64547a4c565245624e796371705a676f38436936394875775058184d43d87980ff",
+        "value": {
+          "list": [
+            {
+              "bytes": "313631363836"
+            },
+            {
+              "bytes": "313037393438"
+            },
+            {
+              "bytes": "53594e473030393939"
+            },
+            {
+              "int": 866
+            },
+            {
+              "bytes": "697066733a2f2f516d5346794e4553513733634478505a3978416d64547a4c565245624e796371705a676f38436936394875775058"
+            },
+            {
+              "int": 77
+            },
+            {
+              "bytes": "d87980"
+            }
+          ]
+        }
+      },
+      "reference_script": null,
+      "asset_list": [
+        {
+          "decimals": 0,
+          "quantity": "1",
+          "policy_id": "c4f37d2bc1a955cfdc33597b3c089179ebeffdc624bbcf05b33950ef",
+          "asset_name": "36373663366636323631366332643636363137323664",
+          "fingerprint": "asset1rcqh9eany2crdnzx0l4nq5w646fgyhdewtkjvl"
+        }
+      ],
+      "is_spent": true
+    }
+  ]
+}

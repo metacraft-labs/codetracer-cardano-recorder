@@ -26,6 +26,26 @@
 //!   the Cardano recorder currently logs to stderr unconditionally).
 //! * `BLOCKFROST_API_KEY` — Blockfrost API key used by the `replay` subcommand
 //!   (Cardano-specific; not part of the standard recorder env-var set).
+//! * `CODETRACER_CARDANO_RECORDER_LIVE_CHAIN` — set to `1` or `true` to let the
+//!   acquisition subcommands (`enumerate`, `provenance`, `eras`,
+//!   `prestate-strategy`, `fixtures`) reach the live chain. Unset, they read
+//!   the committed Koios captures under `tests/fixtures/koios/` instead, and
+//!   anything those captures do not cover is reported **NOT MEASURED** rather
+//!   than skipped. Koios needs no API key, so `--live` costs nothing but
+//!   network access; the default is offline so a run is reproducible.
+//!
+//! # The acquisition subcommands (CXP-ADA-2)
+//!
+//! `enumerate` counts blocks and transactions over a bounded height range and
+//! prints the counts it measured. `provenance` reports, per script execution
+//! and per requisite, whether the transaction carries the bytes or a state
+//! read has to answer for them — the reading that retired this chain's
+//! `self-contained` claim. `eras` enumerates the protocol-version boundaries
+//! with each era's cost models and reports the acquisition floor and the
+//! script-tracing floor separately, because they are different numbers.
+//! `prestate-strategy` prints the declared `hydrated-from-node` token together
+//! with the re-measurement that licenses it. `fixtures` recomputes every
+//! committed capture's hash identity.
 
 use std::path::PathBuf;
 
@@ -96,8 +116,79 @@ enum Commands {
     /// traces the validator execution through the UPLC CEK machine.
     Replay(ReplayArgs),
 
+    /// Enumerate blocks and transactions over a bounded height range.
+    ///
+    /// Prints the block and transaction counts measured in this run, together
+    /// with the per-block cross-check between each block's own `tx_count` and
+    /// the number of transaction rows actually enumerated.
+    Enumerate(EnumerateArgs),
+
+    /// Report where each script execution's requisites actually live.
+    ///
+    /// For every script execution in a transaction, says per requisite
+    /// (script, datum, redeemer, inputs, script context) whether the bytes are
+    /// carried in the transaction or whether a state read answers for them,
+    /// and names the resolution path for the second.
+    Provenance(ProvenanceArgs),
+
+    /// Enumerate ledger-era boundaries, their cost models, and both floors.
+    Eras(ErasArgs),
+
+    /// Print the declared prestate strategy and the reading that licenses it.
+    PrestateStrategy(ChainArgs),
+
+    /// Recompute the hash identity of every committed Koios capture.
+    Fixtures,
+
     /// Print version information.
     Version,
+}
+
+/// Flags every acquisition subcommand shares.
+#[derive(Debug, clap::Args)]
+struct ChainArgs {
+    /// Reach the live chain (Koios, no API key) instead of the committed
+    /// captures.
+    ///
+    /// Also enabled by `CODETRACER_CARDANO_RECORDER_LIVE_CHAIN=1`.
+    #[arg(long)]
+    live: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct EnumerateArgs {
+    /// First block height, inclusive. Defaults to the captured window's start.
+    #[arg(long)]
+    from_height: Option<u64>,
+
+    /// Last block height, inclusive. Defaults to the captured window's end.
+    #[arg(long)]
+    to_height: Option<u64>,
+
+    #[command(flatten)]
+    chain: ChainArgs,
+}
+
+#[derive(Debug, clap::Args)]
+struct ProvenanceArgs {
+    /// Cardano transaction hash (64 hex characters).
+    ///
+    /// Omit it to report every captured case.
+    #[arg(long)]
+    tx_hash: Option<String>,
+
+    #[command(flatten)]
+    chain: ChainArgs,
+}
+
+#[derive(Debug, clap::Args)]
+struct ErasArgs {
+    /// Epochs to read parameters for. Defaults to the captured boundary set.
+    #[arg(long, value_delimiter = ',')]
+    epochs: Option<Vec<u64>>,
+
+    #[command(flatten)]
+    chain: ChainArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -174,6 +265,11 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Record(args) => record(args),
         Commands::Replay(args) => replay(args),
+        Commands::Enumerate(args) => enumerate_cmd(args),
+        Commands::Provenance(args) => provenance_cmd(args),
+        Commands::Eras(args) => eras_cmd(args),
+        Commands::PrestateStrategy(args) => prestate_cmd(args),
+        Commands::Fixtures => fixtures_cmd(),
         Commands::Version => {
             println!("codetracer-cardano-recorder {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -303,4 +399,229 @@ fn replay(args: ReplayArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The acquisition subcommands (CXP-ADA-2)
+// ---------------------------------------------------------------------------
+
+/// Resolve the chain source these subcommands read from.
+///
+/// Offline is the default on purpose: the committed captures make a run
+/// reproducible, and a subcommand that silently reached the network would
+/// report a different measurement on every machine. When the captures do not
+/// cover what was asked for, the source says **NOT MEASURED** and names the
+/// flag — never an empty result.
+fn chain_source(live: bool) -> Box<dyn codetracer_cardano_recorder::chain::ChainSource> {
+    use codetracer_cardano_recorder::{fixture::FixtureSource, koios};
+    if live || koios::live_chain_enabled() {
+        eprintln!(
+            "chain source: koios-live ({}), no API key sent",
+            koios::DEFAULT_BASE_URL
+        );
+        Box::new(koios::KoiosClient::new())
+    } else {
+        let src = FixtureSource::at_crate_root();
+        eprintln!(
+            "chain source: koios-fixture ({}). Pass --live or set {}=1 to reach the chain.",
+            src.dir().display(),
+            koios::LIVE_CHAIN_ENV
+        );
+        Box::new(src)
+    }
+}
+
+fn enumerate_cmd(args: EnumerateArgs) -> Result<()> {
+    use codetracer_cardano_recorder::{enumerate, fixture::ALONZO_WINDOW};
+
+    let from = args.from_height.unwrap_or(ALONZO_WINDOW.0);
+    let to = args.to_height.unwrap_or(ALONZO_WINDOW.1);
+    let src = chain_source(args.chain.live);
+    let e = enumerate::enumerate(src.as_ref(), from, to)?;
+    print!("{}", enumerate::render(&e));
+    if !e.agrees() {
+        return Err(eyre::eyre!(
+            "the enumeration disagrees with the blocks' own transaction counts, so the count \
+             above is not a measurement of the range"
+        ));
+    }
+    Ok(())
+}
+
+fn provenance_cmd(args: ProvenanceArgs) -> Result<()> {
+    use codetracer_cardano_recorder::{fixture::cases, provenance};
+
+    let src = chain_source(args.chain.live);
+
+    // Which transactions to read. With no `--tx-hash`, every captured case,
+    // because the point of the reading is the contrast between them.
+    let hashes: Vec<String> = match args.tx_hash {
+        Some(h) => {
+            if h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(eyre::eyre!(
+                    "invalid transaction hash: expected 64 hex characters, got '{h}'"
+                ));
+            }
+            vec![h]
+        }
+        None => {
+            let fx = codetracer_cardano_recorder::fixture::FixtureSource::at_crate_root();
+            let mut out = Vec::new();
+            for case in cases::ALL {
+                let f = fx.load(&format!("tx_cbor_{case}"))?;
+                let h = f
+                    .identity
+                    .get("expect_tx_hash")
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| {
+                        eyre::eyre!("capture tx_cbor_{case} declares no expect_tx_hash")
+                    })?;
+                out.push(h.to_string());
+            }
+            out
+        }
+    };
+
+    for h in &hashes {
+        let cbor = src.tx_cbor(h)?;
+        let era = ledger_era_of(src.as_ref(), h);
+        let p = provenance::classify_in_era(&cbor, h, src.as_ref(), era.as_deref())?;
+        print!("{}", provenance::render(&p));
+
+        let refs = provenance::reference_inputs(&p, src.as_ref())?;
+        if refs.is_empty() {
+            println!(
+                "  reference inputs: none (CIP-31 reference inputs did not exist before Babbage)"
+            );
+        } else {
+            println!("  reference inputs ({}):", refs.len());
+            for r in &refs {
+                println!(
+                    "    {}  resolved={} is_spent={} script={} type={} inline_datum={}",
+                    r.reference,
+                    r.resolved,
+                    r.is_spent,
+                    r.carries_script.as_deref().unwrap_or("-"),
+                    r.script_type.as_deref().unwrap_or("-"),
+                    r.carries_inline_datum
+                );
+            }
+            println!("    resolution path: {}", refs[0].resolution_path);
+        }
+        println!();
+    }
+    Ok(())
+}
+
+fn eras_cmd(args: ErasArgs) -> Result<()> {
+    use codetracer_cardano_recorder::{eras, fixture::BOUNDARY_EPOCHS};
+
+    let src = chain_source(args.chain.live);
+    let versions = src.protocol_versions()?;
+    let boundaries = eras::boundaries(&versions);
+    eprintln!(
+        "read {} epoch(s) of protocol versions; {} boundary/boundaries",
+        versions.len(),
+        boundaries.len()
+    );
+
+    let epochs = args.epochs.unwrap_or_else(|| BOUNDARY_EPOCHS.to_vec());
+    let rows = eras::era_table(src.as_ref(), &epochs)?;
+    let floors = eras::floors(&rows);
+    print!("{}", eras::render(&rows, &boundaries, &floors));
+
+    // And the thing that makes era handling load-bearing rather than
+    // decorative: build each era's own cost model from its own parameters,
+    // and report the refusals as refusals.
+    println!("\ncost models built from each era's own parameters:");
+    for row in &rows {
+        let p = src.epoch_params(row.epoch_no)?;
+        for (lang, _) in eras::EVALUATOR_ARITY {
+            match eras::cost_model_for(&p, lang) {
+                Ok(_) => println!(
+                    "  epoch {:>4} {lang}: BUILT from the chain's own parameters",
+                    row.epoch_no
+                ),
+                Err(e) => println!("  epoch {:>4} {lang}: REFUSED — {e}", row.epoch_no),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prestate_cmd(args: ChainArgs) -> Result<()> {
+    use codetracer_cardano_recorder::{fixture, prestate, provenance};
+
+    let src = chain_source(args.live);
+    let fx = fixture::FixtureSource::at_crate_root();
+
+    let mut cases = Vec::new();
+    for case in fixture::cases::ALL {
+        let f = fx.load(&format!("tx_cbor_{case}"))?;
+        let h = f
+            .identity
+            .get("expect_tx_hash")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| eyre::eyre!("capture tx_cbor_{case} declares no expect_tx_hash"))?
+            .to_string();
+        let cbor = src.tx_cbor(&h)?;
+        let era = ledger_era_of(src.as_ref(), &h);
+        cases.push((
+            case.to_string(),
+            provenance::classify_in_era(&cbor, &h, src.as_ref(), era.as_deref())?,
+        ));
+    }
+
+    let reading = prestate::read(&cases);
+    print!("{}", prestate::render(&reading));
+    if !reading.licenses_declaration() {
+        return Err(eyre::eyre!(
+            "the reading does not license the declared `{}` token, so this producer must not \
+             write it into provenance.prestateStrategy",
+            prestate::PRESTATE_STRATEGY
+        ));
+    }
+    Ok(())
+}
+
+fn fixtures_cmd() -> Result<()> {
+    use codetracer_cardano_recorder::fixture::{
+        render_identities, verify_identities, FixtureSource, IdentityVerdict,
+    };
+
+    let src = FixtureSource::at_crate_root();
+    eprintln!("fixture directory: {}", src.dir().display());
+    let readings = verify_identities(&src)?;
+    print!("{}", render_identities(&readings));
+
+    let broken: Vec<&str> = readings
+        .iter()
+        .filter(|r| r.verdict == IdentityVerdict::Broken)
+        .map(|r| r.fixture.as_str())
+        .collect();
+    if !broken.is_empty() {
+        return Err(eyre::eyre!(
+            "{} committed capture(s) failed their own hash identity: {:?}. These files no longer \
+             hold the bytes the chain hashed, so nothing read from them is a reading of the chain",
+            broken.len(),
+            broken
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the LEDGER era of a transaction, or report that it was not.
+///
+/// The era comes from the epoch of the block the transaction settled in,
+/// looked up in the captured window — never from the CBOR decoder's probe,
+/// which returns the newest format that parses and therefore calls a 2021
+/// Alonzo transaction "Conway". A transaction outside the window resolves to
+/// `None`, and every report prints that as unknown.
+fn ledger_era_of(
+    src: &dyn codetracer_cardano_recorder::chain::ChainSource,
+    tx_hash: &str,
+) -> Option<String> {
+    use codetracer_cardano_recorder::{chain, fixture::ALONZO_WINDOW};
+    let epoch = chain::epoch_of_tx(src, tx_hash, ALONZO_WINDOW.0, ALONZO_WINDOW.1).ok()??;
+    src.epoch_params(epoch).ok()?.era
 }

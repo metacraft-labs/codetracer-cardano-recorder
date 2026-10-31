@@ -1,0 +1,25 @@
+{
+  "network": "cardano-mainnet",
+  "endpoint": "POST https://api.koios.rest/api/v1/script_info",
+  "query": {
+    "_script_hashes": [
+      "c4f37d2bc1a955cfdc33597b3c089179ebeffdc624bbcf05b33950ef"
+    ]
+  },
+  "fetched": "2026-10-31",
+  "source": "Koios public API (no API key required)",
+  "identity": {
+    "kind": "script-blake2b-224-tagged",
+    "note": "blake2b-224 over (language tag byte || script bytes) must equal the reported script_hash, which is how a script identity is checked without trusting the fetcher"
+  },
+  "response": [
+    {
+      "script_hash": "c4f37d2bc1a955cfdc33597b3c089179ebeffdc624bbcf05b33950ef",
+      "creation_tx_hash": "c0d91af7f12c728d06fc030f0fa4240e2cc8eb921ee3bbd787857640366aaf58",
+      "type": "plutusV3",
+      "value": null,
+      "bytes": "588d010000322533357346646460044660040040024600446600400400244a666aae7c0045280a999ab9a3375e6ae84004010528898011aba20013237586ae84c8d5d11aba2357446ae88d5d11aba2357446ae88004c8d55cf1baa00100135742646aae78dd50008008a4c2c98011e581ce9b56233ca537ab6b3096e886f4a54fbd2fb92b4b3bf52d8e1e71c2a0001",
+      "size": 143
+    }
+  ]
+}

@@ -28,6 +28,14 @@ uplc = { path = "../metacraft-aiken-fork/crates/uplc" }
 hex = "0.4"
 pallas-primitives = "0.33"
 pallas-codec = "0.33"
+# CXP-ADA-2 acquisition: era-generic transaction decoding (`MultiEraTx`), the
+# blake2b hashers the chain identifies scripts and datums with, and the address
+# decoder that reads a script hash off a spent output. All three were already in
+# `Cargo.lock` transitively at 0.33, so this adds dependency EDGES and not
+# versions.
+pallas-traverse = "0.33"
+pallas-crypto = "0.33"
+pallas-addresses = "0.33"
 ureq = { version = "3", features = ["json"] }
 
 [dev-dependencies]
