@@ -149,6 +149,22 @@ impl ScriptRow {
     }
 }
 
+/// One native asset on an output, from a `/utxo_info` row's `asset_list`.
+///
+/// Carried because a resolved input's **value** is part of Plutus's
+/// `ScriptContext`: a `TxOut` is `(address, value, datum, script_ref)`, so an
+/// output reported with its lovelace alone would produce a script context the
+/// chain never applied, and the budget computed from it would be a different
+/// script's budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetRow {
+    /// The minting policy's script hash, hex.
+    pub policy_id: String,
+    /// The asset name, hex, possibly empty (which is a legal asset name).
+    pub asset_name: String,
+    pub quantity: u64,
+}
+
 /// A row of Koios `/utxo_info` with `_extended: true`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UtxoRow {
@@ -160,6 +176,12 @@ pub struct UtxoRow {
     /// makes `hydrated-from-node` work at all for a historic transaction.
     pub is_spent: bool,
     pub address: String,
+    /// Lovelace on the output.
+    pub value_lovelace: u64,
+    /// Native assets on the output, in the order the node served them. The
+    /// evaluator sorts a value canonically before hashing it into a script
+    /// context, so this order is not load-bearing — but the *contents* are.
+    pub assets: Vec<AssetRow>,
     pub datum_hash: Option<String>,
     /// The inline datum's bytes (CIP-32), when the output carries one.
     pub inline_datum: Option<Vec<u8>>,
@@ -235,6 +257,17 @@ pub trait ChainSource {
     /// Datums by hash.
     fn datums(&self, datum_hashes: &[String]) -> Result<Vec<DatumRow>>;
 
+    /// The epoch the transaction's block belongs to.
+    ///
+    /// This is the one fact that decides which cost model a replay is charged
+    /// under, and it cannot be read off the transaction's own bytes: the
+    /// post-Alonzo formats are forward-compatible, so a 2021 Alonzo
+    /// transaction decodes cleanly as Conway (see [`crate::provenance`]). It
+    /// is therefore a chain read rather than a decoder probe — the difference
+    /// between charging a transaction under its own era's prices and charging
+    /// it under today's.
+    fn tx_epoch(&self, tx_hash: &str) -> Result<u64>;
+
     /// One epoch's protocol parameters.
     fn epoch_params(&self, epoch: u64) -> Result<EpochParams>;
 
@@ -273,6 +306,29 @@ fn req_str(v: &Value, field: &str, what: &str) -> Result<String> {
         .and_then(|x| x.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| eyre!("{what}: missing or non-string field `{field}`"))
+}
+
+/// Read a lovelace or asset quantity.
+///
+/// Koios serves these as decimal **strings**, because a Cardano quantity does
+/// not fit a JSON number's guaranteed integer range; some deployments serve a
+/// number. Both are read, and anything else is refused rather than defaulted
+/// to zero — a value silently read as zero would build a script context the
+/// chain never applied and the budget computed from it would still look like
+/// a budget.
+fn req_amount(v: &Value, field: &str, what: &str) -> Result<u64> {
+    match v.get(field) {
+        Some(Value::String(s)) => s
+            .parse::<u64>()
+            .map_err(|e| eyre!("{what}: field `{field}` is not a u64 quantity (`{s}`): {e}")),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| eyre!("{what}: field `{field}` is not a non-negative integer")),
+        other => Err(eyre!(
+            "{what}: missing or non-numeric field `{field}` (got {})",
+            other.map(kind_of).unwrap_or("absent")
+        )),
+    }
 }
 
 fn opt_str(v: &Value, field: &str) -> Option<String> {
@@ -383,6 +439,27 @@ pub fn parse_utxos(v: &Value) -> Result<Vec<UtxoRow>> {
                 Some(Value::Object(_)) => Some(parse_script_row(&row["reference_script"])?),
                 _ => None,
             };
+            let mut assets: Vec<AssetRow> = Vec::new();
+            if let Some(Value::Array(list)) = row.get("asset_list") {
+                for a in list {
+                    assets.push(AssetRow {
+                        policy_id: req_str(a, "policy_id", "/utxo_info asset_list entry")?,
+                        // An empty asset name is legal and is served as `""`,
+                        // so the field must be present-but-empty rather than
+                        // defaulted: a missing field would mean the node said
+                        // something this decoder does not understand.
+                        asset_name: a
+                            .get("asset_name")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                            .ok_or_else(|| {
+                                eyre!("/utxo_info asset_list entry: missing `asset_name`")
+                            })?,
+                        quantity: req_amount(a, "quantity", "/utxo_info asset_list entry")?,
+                    });
+                }
+            }
+
             Ok(UtxoRow {
                 reference,
                 is_spent: row
@@ -390,6 +467,8 @@ pub fn parse_utxos(v: &Value) -> Result<Vec<UtxoRow>> {
                     .and_then(|x| x.as_bool())
                     .ok_or_else(|| eyre!("/utxo_info row: missing or non-bool `is_spent`"))?,
                 address: req_str(row, "address", "/utxo_info row")?,
+                value_lovelace: req_amount(row, "value", "/utxo_info row")?,
+                assets,
                 datum_hash: opt_str(row, "datum_hash"),
                 inline_datum,
                 reference_script,
@@ -511,6 +590,22 @@ pub fn parse_epoch_params(v: &Value, epoch: u64) -> Result<EpochParams> {
         protocol_minor: row.get("protocol_minor").and_then(|x| x.as_u64()),
         cost_models,
     })
+}
+
+/// Decode a `/tx_info` projection, returning the epoch for `tx_hash`.
+pub fn parse_tx_epoch(v: &Value, tx_hash: &str) -> Result<u64> {
+    for row in as_array(v, "/tx_info projection")? {
+        if row.get("tx_hash").and_then(|x| x.as_str()) == Some(tx_hash) {
+            return req_u64(row, "epoch_no", "/tx_info projection row");
+        }
+    }
+    Err(eyre!(
+        "no /tx_info row carries the epoch of transaction {tx_hash}; the rows carried {:?}",
+        as_array(v, "/tx_info projection")?
+            .iter()
+            .filter_map(|r| r.get("tx_hash").and_then(|x| x.as_str()))
+            .collect::<Vec<_>>()
+    ))
 }
 
 /// Decode the `epoch_no,protocol_major,protocol_minor` projection.

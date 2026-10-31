@@ -1,15 +1,46 @@
-//! On-chain transaction replay infrastructure.
+//! UPLC script decoding, and the hex-argument shape that predates the budget
+//! oracle.
 //!
-//! Provides types and functions for fetching Cardano transactions,
-//! extracting their Plutus scripts, and reconstructing fully-applied
-//! UPLC programs ready for CEK machine evaluation.
+//! # What this module observes
 //!
-//! Cardano validators are applied as successive UPLC `Apply` operations:
+//! Bytes it is handed. [`decode_script`] turns on-chain CBOR into a
+//! `Program<NamedDeBruijn>`, and [`reconstruct_applied_program`] applies
+//! hex-encoded PlutusData arguments in the order Cardano applies them:
 //!
 //! ```text
 //! ((script datum) redeemer) script_context   -- spending validators (V1/V2)
 //! (script redeemer) script_context            -- minting policies, V3 validators
 //! ```
+//!
+//! # What this module does NOT do, and what superseded it
+//!
+//! **It does not fetch anything**, despite what its name and its earlier
+//! header suggested, and it is **not** the path a settled transaction is
+//! replayed through. [`TransactionData`] carries its arguments as hex strings
+//! supplied by a caller, and the caller that supplied them —
+//! `BlockfrostClient::fetch_transaction` — is gone: it could not read a
+//! redeemer's data or assemble a script context, so it filled
+//! `script_context` with `String::new()` and the redeemer field with a hash.
+//!
+//! The replay path for a real transaction is [`crate::oracle`], which takes
+//! the chain's own typed `PlutusData`, reconstructs the `ScriptContext`
+//! through `uplc`'s `TxInfo` types, and picks the application order from the
+//! reconstructed context's own variant rather than from whether a datum
+//! happens to have been passed.
+//!
+//! **Nothing outside this module calls anything in it**, as of CXP-ADA-1
+//! deliverable 4, and that is stated rather than implied: `grep -rn
+//! 'reconstruct_applied_program\|decode_script' src tests` matches only this
+//! file. Its remaining callers are its own unit tests, which exercise both
+//! application orders against programs they build themselves — not vacuous,
+//! but not a reading about the chain either.
+//!
+//! [`crate::oracle`] deliberately does **not** route through
+//! [`decode_script`], and the difference is not stylistic: this module decodes
+//! via `Program::<DeBruijn>::from_cbor`, while `uplc`'s own `eval_redeemer`
+//! decodes via `Program::<FakeNamedDeBruijn>::from_cbor`. The oracle mirrors
+//! the evaluator, because a budget compared against the chain's figure must be
+//! produced the way the chain produces it.
 
 use std::fmt;
 

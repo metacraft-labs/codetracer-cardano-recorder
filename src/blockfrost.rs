@@ -1,13 +1,38 @@
-//! Blockfrost API client for fetching Cardano transaction data.
+//! Blockfrost API client for reading Cardano transaction data.
 //!
-//! Uses the [Blockfrost](https://blockfrost.io/) REST API to retrieve
-//! transaction details, extract Plutus script bytes, datum, redeemer,
-//! and script context needed to replay validator execution.
+//! # What this module observes
+//!
+//! The [Blockfrost](https://blockfrost.io/) REST API, with an API key: a
+//! transaction's UTxOs, the script bytes behind a script hash, the script's
+//! Plutus version, and the execution units the chain recorded per redeemer.
+//!
+//! # What this module does NOT do, and this is the load-bearing part
+//!
+//! **It cannot assemble anything that can be executed, and it no longer
+//! pretends to.** Two things are missing and neither is a tooling gap:
+//!
+//! - `/txs/{hash}/redeemers` serves `redeemer_data_hash` — the hash of the
+//!   redeemer, not the redeemer. Applying a script to a hash is applying it to
+//!   a different argument.
+//! - No endpoint here yields a `ScriptContext`. One is assembled from the
+//!   transaction body plus every resolved input, which is [`crate::oracle`]'s
+//!   job over a [`crate::chain::ChainSource`].
+//!
+//! So this module reports what it read and stops. The previous
+//! `fetch_transaction` returned a `TransactionData` with `script_context:
+//! String::new()` and the data hash in the redeemer field, which produced a
+//! program that ran and whose budget could not match the chain's for reasons
+//! unrelated to stepping. That path is removed.
+//!
+//! **No API key exists in any lane of this workspace** — not in CI and not in
+//! a developer checkout — so nothing standing is measured through here.
+//! [`crate::koios`] is the keyless route and is what the acquisition path and
+//! the budget oracle use.
 
 use eyre::{eyre, Result};
 use uplc::machine::cost_model::ExBudget;
 
-use crate::transaction::{PlutusVersion, TransactionData};
+use crate::transaction::PlutusVersion;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -60,21 +85,30 @@ impl BlockfrostClient {
         Ok(Self::new(api_key))
     }
 
-    /// Fetch transaction data for the given transaction hash.
+    /// Read what this client *can* read about a transaction's scripts, and say
+    /// so.
     ///
-    /// This retrieves the Plutus script, datum, redeemer, and script context
-    /// from the Blockfrost API and assembles them into a `TransactionData`
-    /// struct suitable for replay.
+    /// Returns a human-readable report rather than a `TransactionData`,
+    /// because a `TransactionData` is a thing that can be *executed* and this
+    /// client cannot assemble one:
     ///
-    /// # Current limitations
+    /// - `/txs/{hash}/redeemers` serves `redeemer_data_hash` and **not** the
+    ///   redeemer data. A script applied to a hash is a different script
+    ///   application.
+    /// - No endpoint here yields a `ScriptContext`. Assembling one needs the
+    ///   transaction body plus every resolved input, which is what
+    ///   [`crate::oracle`] does from [`crate::chain::ChainSource`].
     ///
-    /// This is a placeholder implementation. A full implementation would:
-    /// 1. GET `/txs/{hash}/utxos` to find script inputs and their datum hashes
-    /// 2. GET `/txs/{hash}/redeemers` to get the redeemer data
-    /// 3. GET `/scripts/{script_hash}/cbor` to get the script bytes
-    /// 4. GET `/scripts/datum/{datum_hash}/cbor` to get the datum
-    /// 5. Reconstruct the ScriptContext from the transaction data
-    pub fn fetch_transaction(&self, tx_hash: &str) -> Result<TransactionData> {
+    /// It used to return a `TransactionData` with `script_context:
+    /// String::new()` and the data hash in the redeemer field — a placeholder
+    /// that produced a runnable program whose budget could not match the
+    /// chain's for reasons unrelated to stepping. That is removed rather than
+    /// improved: the honest shape for this client is a report of what it read.
+    ///
+    /// The execution units it reads ARE the chain's own figures, so they are
+    /// reported; they are just not comparable to anything this client can
+    /// execute.
+    pub fn fetch_script_summary(&self, tx_hash: &str) -> Result<String> {
         if self.api_key.is_empty() {
             return Err(eyre!(
                 "Blockfrost API key is empty. Set {BLOCKFROST_API_KEY_ENV} or pass \
@@ -156,28 +190,6 @@ impl BlockfrostClient {
             .as_array()
             .ok_or_else(|| eyre!("no redeemers found in transaction"))?;
 
-        let redeemer_entry = redeemers
-            .first()
-            .ok_or_else(|| eyre!("empty redeemers list"))?;
-
-        let redeemer_hex = redeemer_entry["redeemer_data_hash"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-
-        // CXP-ADA-1 oracle: the `/redeemers` response carries the execution
-        // units consensus recorded for this redeemer (`unit_mem` /
-        // `unit_steps`).  These are produced by the network, not by us, which
-        // is what makes them a control a recorder bug cannot corrupt.  They
-        // were previously fetched and discarded; keep them so a replay can be
-        // checked against what the chain actually charged.
-        //
-        // Blockfrost returns them as decimal *strings*, so parse rather than
-        // `as_i64`.  Absent or unparseable values yield `None` — the caller
-        // must then report the comparison as not measured instead of assuming
-        // agreement.
-        let consensus_budget = parse_execution_units(redeemer_entry);
-
         // Determine Plutus version from script type.
         let script_type_url = format!("{}/scripts/{}", self.base_url, script_hash);
         let mut script_type_resp = ureq::get(&script_type_url)
@@ -198,23 +210,34 @@ impl BlockfrostClient {
             None => return Err(eyre!("could not determine script type")),
         };
 
-        // Look for datum in inputs.
-        let datum = inputs
-            .iter()
-            .find_map(|input| input["inline_datum"].as_str())
-            .map(|s| s.to_string());
-
-        // Note: A complete implementation would also reconstruct the
-        // ScriptContext from the full transaction data. For now, we return
-        // the redeemer data hash as a placeholder.
-        Ok(TransactionData {
-            script_bytes,
-            datum,
-            redeemer: redeemer_hex,
-            script_context: String::new(),
-            script_version,
-            consensus_budget,
-        })
+        let mut out = format!(
+            "transaction {tx_hash} (via Blockfrost)\n  script {script_hash} ({script_version}), \
+             {} byte(s)\n  {} redeemer(s)\n",
+            script_bytes.len(),
+            redeemers.len()
+        );
+        for (i, entry) in redeemers.iter().enumerate() {
+            match parse_execution_units(entry) {
+                Some(units) => out.push_str(&format!(
+                    "    redeemer[{i}] chain-recorded mem={} steps={}\n",
+                    units.mem, units.cpu
+                )),
+                None => out.push_str(&format!(
+                    "    redeemer[{i}] chain-recorded units NOT REPORTED by this endpoint\n"
+                )),
+            }
+            out.push_str(&format!(
+                "    redeemer[{i}] data: NOT AVAILABLE -- this endpoint serves \
+                 redeemer_data_hash={}, which is the hash and not the data\n",
+                entry["redeemer_data_hash"].as_str().unwrap_or("?")
+            ));
+        }
+        out.push_str(
+            "  script context: NOT AVAILABLE -- no endpoint here yields one, and assembling one \
+             needs the body plus every resolved input. So nothing here can be stepped and no \
+             budget comparison is run from this path.\n",
+        );
+        Ok(out)
     }
 }
 
@@ -268,8 +291,9 @@ mod tests {
     #[test]
     fn test_fetch_with_empty_key() {
         let client = BlockfrostClient::new(String::new());
-        let result = client
-            .fetch_transaction("0000000000000000000000000000000000000000000000000000000000000000");
+        let result = client.fetch_script_summary(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -281,7 +305,7 @@ mod tests {
     #[test]
     fn test_fetch_with_invalid_hash() {
         let client = BlockfrostClient::new("some_key".to_string());
-        let result = client.fetch_transaction("not_a_valid_hash");
+        let result = client.fetch_script_summary("not_a_valid_hash");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(

@@ -246,6 +246,9 @@ mod tests {
         fn datums(&self, _: &[String]) -> Result<Vec<DatumRow>> {
             Ok(vec![])
         }
+        fn tx_epoch(&self, _: &str) -> Result<u64> {
+            Err(eyre!("not supplied"))
+        }
         fn epoch_params(&self, _: u64) -> Result<EpochParams> {
             Err(eyre!("not supplied"))
         }

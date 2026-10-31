@@ -31,8 +31,8 @@ use serde_json::{json, Value};
 
 use crate::chain::{
     parse_block_txs, parse_blocks, parse_datums, parse_epoch_params, parse_protocol_versions,
-    parse_scripts, parse_tx_cbor, parse_utxos, BlockRow, BlockTxRow, ChainOrigin, ChainSource,
-    DatumRow, EpochParams, ProtocolVersionRow, ScriptRow, UtxoRef, UtxoRow,
+    parse_scripts, parse_tx_cbor, parse_tx_epoch, parse_utxos, BlockRow, BlockTxRow, ChainOrigin,
+    ChainSource, DatumRow, EpochParams, ProtocolVersionRow, ScriptRow, UtxoRef, UtxoRow,
 };
 
 /// Public Koios mainnet base URL. No credential is required or sent.
@@ -172,6 +172,19 @@ impl ChainSource for KoiosClient {
         }
         let v = self.post("datum_info", json!({ "_datum_hashes": datum_hashes }))?;
         parse_datums(&v)
+    }
+
+    fn tx_epoch(&self, tx_hash: &str) -> Result<u64> {
+        // A projection rather than the whole `/tx_info` row: the epoch is the
+        // only field this read is for, and a full row would invite something
+        // else to be taken from it. In particular Koios's own
+        // `plutus_contracts` summary lives on that endpoint and is measurably
+        // wrong about what a transaction carries (see the module docs).
+        let v = self.post(
+            "tx_info?select=tx_hash,epoch_no,block_height,absolute_slot",
+            json!({ "_tx_hashes": [tx_hash] }),
+        )?;
+        parse_tx_epoch(&v, tx_hash)
     }
 
     fn epoch_params(&self, epoch: u64) -> Result<EpochParams> {

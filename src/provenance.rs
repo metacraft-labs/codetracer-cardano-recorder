@@ -36,13 +36,12 @@
 //!
 //! # What this module does NOT do
 //!
-//! - **It does not build a script context.** Reconstructing Plutus's
-//!   `ScriptContext` from a settled transaction is CXP-ADA-1's open work
-//!   (`src/blockfrost.rs` still sets `script_context: String::new()`), and
-//!   without it no execution can be run to completion. Every script context is
-//!   therefore classified [`Carriage::RequiresHydration`] with its path named
-//!   and marked unbuilt, rather than being quietly omitted from the requisite
-//!   list.
+//! - **It does not build a script context**, though one is now buildable.
+//!   Reconstructing Plutus's `ScriptContext` from a settled transaction landed
+//!   as CXP-ADA-1 deliverable 4 and lives in [`crate::oracle`]; this module
+//!   classifies the script context as [`Carriage::RequiresHydration`] — the
+//!   transaction does not carry one — and names that path as built. It does
+//!   not call it, because this module's job is carriage and not execution.
 //! - **It does not evaluate anything.** No CEK machine is started here and no
 //!   budget is compared. What it does read off the bytes is the execution
 //!   units the chain recorded for each redeemer, because those live in the
@@ -251,11 +250,12 @@ pub const PATH_INLINE_DATUM: &str =
 pub const PATH_DATUM_BY_HASH: &str =
     "datum_hash -> /datum_info -> bytes, verified blake2b-256(bytes) == datum_hash";
 
-/// The named path a script context would need, and does not have.
+/// The named path that assembles Plutus's `ScriptContext`.
 pub const PATH_SCRIPT_CONTEXT: &str =
     "resolved inputs + reference inputs + body (fee, validity range, signatories, \
-     mint, certs, withdrawals, redeemers) -> Plutus ScriptContext PlutusData \
-     — NOT BUILT: CXP-ADA-1 deliverable 4's open clause";
+     mint, certs, withdrawals, redeemers) -> Plutus ScriptContext PlutusData, \
+     via uplc TxInfoV1/V2/V3::from_transaction + into_script_context — BUILT in \
+     crate::oracle (CXP-ADA-1 deliverable 4)";
 
 // ---------------------------------------------------------------------------
 // Classification
@@ -546,7 +546,12 @@ pub fn classify_in_era(
                        assembled from the body plus every resolved input"
                 .to_string(),
             resolution_path: Some(PATH_SCRIPT_CONTEXT.to_string()),
-            resolution_built: false,
+            // Built as of CXP-ADA-1 deliverable 4. The carriage stays
+            // `RequiresHydration` and that is not a contradiction: the
+            // transaction still does not CARRY a script context, which is what
+            // this column reports. What changed is that the path which answers
+            // for it now exists ([`crate::oracle`]) instead of being named.
+            resolution_built: true,
         });
 
         executions.push(ScriptExecution {
@@ -808,6 +813,9 @@ mod tests {
             }
             fn datums(&self, _: &[String]) -> Result<Vec<crate::chain::DatumRow>> {
                 Ok(vec![])
+            }
+            fn tx_epoch(&self, _: &str) -> Result<u64> {
+                Err(eyre!("not captured"))
             }
             fn epoch_params(&self, _: u64) -> Result<crate::chain::EpochParams> {
                 Err(eyre!("not captured"))

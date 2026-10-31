@@ -53,8 +53,8 @@ use serde_json::Value;
 
 use crate::chain::{
     parse_block_txs, parse_blocks, parse_datums, parse_epoch_params, parse_protocol_versions,
-    parse_scripts, parse_tx_cbor, parse_utxos, BlockRow, BlockTxRow, ChainOrigin, ChainSource,
-    DatumRow, EpochParams, ProtocolVersionRow, ScriptRow, UtxoRef, UtxoRow,
+    parse_scripts, parse_tx_cbor, parse_tx_epoch, parse_utxos, BlockRow, BlockTxRow, ChainOrigin,
+    ChainSource, DatumRow, EpochParams, ProtocolVersionRow, ScriptRow, UtxoRef, UtxoRow,
 };
 
 /// The three transaction cases the fixtures carry, each chosen for what it
@@ -74,17 +74,60 @@ pub mod cases {
     /// post-Babbage reading from being "the script is always absent".
     pub const V3_EMBEDDED_SCRIPT_SPEND: &str = "v3_embedded_script_spend";
 
-    /// Every case, in the order a report should print them.
+    /// An Alonzo-era PlutusV1 **minting policy**, whose application order is
+    /// `(script redeemer) context` — two arguments and not three. It is in
+    /// the corpus because the spending order and the minting order are
+    /// different code paths and a corpus of only spends cannot tell them
+    /// apart.
+    pub const V1_MINT_POLICY: &str = "v1_mint_policy";
+    /// A Conway PlutusV2 transaction all of whose redeemers replay strictly
+    /// **under** the units it declares.
+    ///
+    /// It is in the corpus because it is what stops the standing assertion
+    /// from being equality. A submitter chooses the units it declares and the
+    /// ledger validates only that execution fits inside them, so an
+    /// over-declared transaction is an ordinary transaction, not a defect —
+    /// and a corpus without one would let the recorder assert equality and
+    /// then fail on the next ordinary transaction it saw.
+    pub const V2_OVER_DECLARED_SPEND: &str = "v2_over_declared_spend";
+
+    /// The three **provenance** cases, in the order a report should print
+    /// them.
+    ///
+    /// These are the cases CXP-ADA-2 chose to measure carriage with, and each
+    /// has a `script_info_*` capture to go with it. The budget corpus is a
+    /// superset — see [`ALL_WITH_BUDGET`] — because a case added for the
+    /// oracle needs a transaction and its inputs but no script lookup: the
+    /// scripts the oracle executes come out of the witness set or off a
+    /// CIP-33 reference output, never out of a `/script_info` row.
     pub const ALL: [&str; 3] = [
         FIRST_PLUTUS_EXECUTION,
         V3_REFERENCE_SCRIPT_SPEND,
         V3_EMBEDDED_SCRIPT_SPEND,
+    ];
+
+    /// Every case whose transaction CBOR and resolved inputs are captured:
+    /// the budget oracle's standing corpus.
+    pub const ALL_WITH_BUDGET: [&str; 5] = [
+        FIRST_PLUTUS_EXECUTION,
+        V3_REFERENCE_SCRIPT_SPEND,
+        V3_EMBEDDED_SCRIPT_SPEND,
+        V1_MINT_POLICY,
+        V2_OVER_DECLARED_SPEND,
     ];
 }
 
 /// The bounded historic range the enumeration fixtures cover: the first ten
 /// blocks of the Alonzo era.
 pub const ALONZO_WINDOW: (u64, u64) = (6_236_060, 6_236_069);
+
+/// The capture that says which epoch each corpus transaction settled in.
+///
+/// Kept as a named constant because it is the one capture whose absence would
+/// make a budget comparison silently era-blind: without it a replay would need
+/// an epoch from somewhere, and "somewhere" is how a hard-coded cost model got
+/// into this recorder the first time.
+pub const TX_EPOCHS_FIXTURE: &str = "tx_epochs_oracle_corpus";
 
 /// The epochs the era-boundary fixture carries parameters for.
 pub const BOUNDARY_EPOCHS: [u64; 13] = [
@@ -274,7 +317,7 @@ impl ChainSource for FixtureSource {
     }
 
     fn tx_cbor(&self, tx_hash: &str) -> Result<Vec<u8>> {
-        for case in cases::ALL {
+        for case in cases::ALL_WITH_BUDGET {
             let f = self.load(&format!("tx_cbor_{case}"))?;
             if let Ok(bytes) = parse_tx_cbor(&f.response, tx_hash) {
                 return Ok(bytes);
@@ -283,7 +326,7 @@ impl ChainSource for FixtureSource {
         Err(eyre!(
             "no committed capture carries the CBOR of transaction {tx_hash}. The cases captured \
              are {:?}; another transaction is NOT MEASURED offline and needs --live",
-            cases::ALL
+            cases::ALL_WITH_BUDGET
         ))
     }
 
@@ -304,7 +347,9 @@ impl ChainSource for FixtureSource {
 
     fn utxos(&self, refs: &[UtxoRef]) -> Result<Vec<UtxoRow>> {
         let mut found: Vec<UtxoRow> = Vec::new();
-        for case in cases::ALL {
+        // Every case with captured inputs, not just the provenance three: a
+        // budget-only case's inputs are read through this same method.
+        for case in cases::ALL_WITH_BUDGET {
             let f = self.load(&format!("utxo_info_{case}"))?;
             for row in parse_utxos(&f.response)? {
                 if refs.contains(&row.reference)
@@ -323,6 +368,17 @@ impl ChainSource for FixtureSource {
             .into_iter()
             .filter(|d| datum_hashes.contains(&d.datum_hash))
             .collect())
+    }
+
+    fn tx_epoch(&self, tx_hash: &str) -> Result<u64> {
+        let f = self.load(TX_EPOCHS_FIXTURE)?;
+        parse_tx_epoch(&f.response, tx_hash).with_context(|| {
+            format!(
+                "no committed capture carries the epoch of transaction {tx_hash}. The epoch is \
+                 what selects the cost model a replay is charged under, so a transaction whose \
+                 epoch is uncaptured is NOT MEASURED offline and needs --live"
+            )
+        })
     }
 
     fn epoch_params(&self, epoch: u64) -> Result<EpochParams> {
@@ -387,6 +443,26 @@ pub struct IdentityReading {
     pub failures: Vec<String>,
     pub endpoint: String,
     pub fetched: String,
+}
+
+/// `(tx_hash, epoch_no)` out of a `/tx_info` epoch projection.
+fn as_tx_epoch_rows(v: &Value) -> Result<Vec<(String, u64)>> {
+    let rows = v
+        .as_array()
+        .ok_or_else(|| eyre!("`response` must be an array of /tx_info projection rows"))?;
+    rows.iter()
+        .map(|r| {
+            let h = r
+                .get("tx_hash")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| eyre!("a projection row has no string `tx_hash`"))?;
+            let e = r
+                .get("epoch_no")
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| eyre!("projection row {h} has no integer `epoch_no`"))?;
+            Ok((h.to_string(), e))
+        })
+        .collect()
 }
 
 fn blake2b_256(bytes: &[u8]) -> String {
@@ -640,6 +716,121 @@ pub fn verify_identities(src: &FixtureSource) -> Result<Vec<IdentityReading>> {
                     }
                 }
             }
+            "unanchored-every-input-covered" => {
+                // A capture of outputs that carry neither an inline datum nor
+                // a reference script has nothing the chain hashed that a
+                // client can recompute. Saying so is the point: the
+                // alternative was to give it `datum-blake2b-256` and have the
+                // per-datum arm iterate an empty list and report ANCHORED,
+                // which is the blind instrument this convention exists to
+                // rule out (the same blind spot was found and closed on the
+                // reference-resolution kind on 2026-10-31).
+                //
+                // What IS checkable is internal and is checked: the rows are
+                // what they claim to be — no inline datum and no reference
+                // script, since a row carrying either would belong under a
+                // kind that can anchor it.
+                let rows = parse_utxos(&f.response)?;
+                if rows.is_empty() {
+                    failures.push(
+                        "this capture carries no rows, so it covers no input at all".to_string(),
+                    );
+                }
+                for row in &rows {
+                    checks += 1;
+                    if row.inline_datum.is_some() || row.reference_script.is_some() {
+                        failures.push(format!(
+                            "{}: carries an inline datum or a reference script, which IS \
+                             anchorable — this capture must then declare an identity kind that \
+                             recomputes it rather than being filed as unanchored",
+                            row.reference
+                        ));
+                    }
+                }
+            }
+            "tx-epoch-cross-fixture" => {
+                // An epoch is not hashed by the chain, so this capture has no
+                // identity of its own. It has three that run ACROSS captures,
+                // and each can fail:
+                //
+                // 1. every transaction named here must be one whose bytes we
+                //    hold, and those bytes must hash to the name — otherwise
+                //    the projection could name a transaction the corpus does
+                //    not have and the epoch would be attached to nothing;
+                // 2. a transaction inside the captured window must agree with
+                //    what `/block_txs` says its epoch is — two independent
+                //    statements by the node about the same transaction;
+                // 3. every epoch named must have a parameter capture, because
+                //    an epoch with no captured cost model cannot charge a
+                //    replay and the oracle would be unrunnable offline for
+                //    that transaction.
+                let rows =
+                    as_tx_epoch_rows(&f.response).map_err(|e| eyre!("fixture {stem}: {e}"))?;
+                if rows.is_empty() {
+                    failures.push(
+                        "this capture carries no rows, so it attaches an epoch to nothing. An \
+                         identity about epochs cannot be satisfied by having none"
+                            .to_string(),
+                    );
+                }
+                let window_txs = parse_block_txs(&src.load("block_txs_alonzo_window")?.response)?;
+                for (tx_hash, epoch_no) in &rows {
+                    // (1) the bytes, and their hash.
+                    checks += 1;
+                    let mut found_cbor = None;
+                    for case in cases::ALL_WITH_BUDGET {
+                        if let Ok(bytes) =
+                            parse_tx_cbor(&src.load(&format!("tx_cbor_{case}"))?.response, tx_hash)
+                        {
+                            found_cbor = Some(bytes);
+                            break;
+                        }
+                    }
+                    match found_cbor {
+                        None => failures.push(format!(
+                            "transaction {tx_hash} is given epoch {epoch_no} and no tx_cbor \
+                             capture carries its bytes, so the epoch is attached to a \
+                             transaction this corpus does not hold"
+                        )),
+                        Some(bytes) => {
+                            checks += 1;
+                            let tx = pallas_traverse::MultiEraTx::decode(&bytes).map_err(|e| {
+                                eyre!("fixture {stem}: transaction {tx_hash} does not decode: {e}")
+                            })?;
+                            if tx.hash().to_string() != *tx_hash {
+                                failures.push(format!(
+                                    "transaction {tx_hash}: the captured bytes hash to {}",
+                                    tx.hash()
+                                ));
+                            }
+                        }
+                    }
+                    // (2) the second, independent statement, where there is
+                    // one. A transaction outside the captured window has no
+                    // second statement, and that is reported by the absence of
+                    // a check rather than by a pass.
+                    if let Some(row) = window_txs.iter().find(|r| &r.tx_hash == tx_hash) {
+                        checks += 1;
+                        if row.epoch_no != *epoch_no {
+                            failures.push(format!(
+                                "transaction {tx_hash}: this projection says epoch {epoch_no} and \
+                                 /block_txs says epoch {}",
+                                row.epoch_no
+                            ));
+                        }
+                    }
+                    // (3) the epoch's parameters are capturable.
+                    checks += 1;
+                    if !BOUNDARY_EPOCHS.contains(epoch_no) {
+                        failures.push(format!(
+                            "transaction {tx_hash} settled in epoch {epoch_no}, which has no \
+                             committed /epoch_params capture ({BOUNDARY_EPOCHS:?}). Without that \
+                             epoch's cost model a replay of this transaction cannot be charged \
+                             under its own era's prices offline"
+                        ));
+                    }
+                }
+            }
             "evaluator-arity" => {
                 // `parse_epoch_params` is itself the check: it refuses a cost
                 // model that is not a dense index map. Run it for every epoch
@@ -690,7 +881,10 @@ pub fn verify_identities(src: &FixtureSource) -> Result<Vec<IdentityReading>> {
 
         let verdict = if !failures.is_empty() {
             IdentityVerdict::Broken
-        } else if f.identity_kind == "none" || f.identity_kind == "evaluator-arity" {
+        } else if f.identity_kind == "none"
+            || f.identity_kind == "evaluator-arity"
+            || f.identity_kind == "unanchored-every-input-covered"
+        {
             IdentityVerdict::Unanchored
         } else if checks == 0 {
             IdentityVerdict::Broken

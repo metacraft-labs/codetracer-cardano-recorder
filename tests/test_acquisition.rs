@@ -105,6 +105,9 @@ impl ChainSource for BlockedSource {
     fn datums(&self, _: &[String]) -> Result<Vec<DatumRow>> {
         Err(eyre!("chain state queries are blocked"))
     }
+    fn tx_epoch(&self, _: &str) -> Result<u64> {
+        Err(eyre!("chain state queries are blocked"))
+    }
     fn epoch_params(&self, _: u64) -> Result<EpochParams> {
         Err(eyre!("chain state queries are blocked"))
     }
@@ -142,6 +145,9 @@ impl ChainSource for EmptySource {
     }
     fn datums(&self, _: &[String]) -> Result<Vec<DatumRow>> {
         Ok(vec![])
+    }
+    fn tx_epoch(&self, _: &str) -> Result<u64> {
+        Err(eyre!("no epoch"))
     }
     fn epoch_params(&self, _: u64) -> Result<EpochParams> {
         Err(eyre!("no parameters"))
