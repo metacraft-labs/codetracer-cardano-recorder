@@ -59,6 +59,21 @@
 //! transaction settled in, and compare each redeemer's budget against the
 //! execution units the transaction's own witness set declares.
 //!
+//! # The compiler invocation (CXP-ADA-1 deliverable 3)
+//!
+//! `compile-corpus` invokes the **real Aiken compiler** on every `.ak` module
+//! under `test-programs/aiken/`, encodes each generated program the way the
+//! chain stores a script, steps it through the chain's own CEK machine under a
+//! named mainnet epoch's prices, and byte-compares what ran against what the
+//! compiler produced. It prints the modules the compiler **refused** with the
+//! compiler's own diagnostic, because a ratio over a narrowed corpus is not a
+//! reading of the corpus.
+//!
+//! It does **not** change `record`, which still goes through the
+//! source-simulating path. Routing `record` through the compiler means
+//! deleting that path rather than keeping it as a fallback, and that is
+//! deliverable 2.
+//!
 //! `budget-oracle` prints the **distribution** rather than a verdict, because
 //! the relation was measured and is not equality: the ledger validates only
 //! that execution *fits inside* the declaration, so a submitter's round
@@ -164,6 +179,17 @@ enum Commands {
     /// and names every transaction that could not be measured.
     BudgetOracle(BudgetOracleArgs),
 
+    /// Compile the Aiken corpus with the real compiler and step its output.
+    ///
+    /// Invokes `aiken-lang`'s own lexer, parser, type checker and code
+    /// generator on every `.ak` module under `test-programs/aiken/`, encodes
+    /// each generated program the way the chain stores a script, steps it
+    /// through the chain's CEK machine under a named mainnet epoch's prices,
+    /// and byte-compares what ran against what the compiler produced. Prints
+    /// the population, the refusals with the compiler's own reasons, and the
+    /// identity count.
+    CompileCorpus(CompileCorpusArgs),
+
     /// Recompute the hash identity of every committed Koios capture.
     Fixtures,
 
@@ -235,6 +261,25 @@ struct BudgetOracleArgs {
     /// Last block height, inclusive.
     #[arg(long)]
     to_height: Option<u64>,
+
+    #[command(flatten)]
+    chain: ChainArgs,
+}
+
+#[derive(Debug, clap::Args)]
+struct CompileCorpusArgs {
+    /// Directory holding the Aiken corpus.
+    #[arg(long)]
+    corpus_dir: Option<PathBuf>,
+
+    /// Epoch whose cost model the corpus is charged under.
+    ///
+    /// A local `.ak` module settled in no epoch, so there is nothing to read
+    /// off it; what must not happen is a default cost model, which charges
+    /// prices no era ever set. The default is the latest epoch the committed
+    /// captures cover and it is printed with the reading.
+    #[arg(long)]
+    epoch: Option<u64>,
 
     #[command(flatten)]
     chain: ChainArgs,
@@ -338,6 +383,7 @@ fn main() -> Result<()> {
         Commands::Eras(args) => eras_cmd(args),
         Commands::PrestateStrategy(args) => prestate_cmd(args),
         Commands::BudgetOracle(args) => budget_oracle_cmd(args),
+        Commands::CompileCorpus(args) => compile_corpus_cmd(args),
         Commands::Fixtures => fixtures_cmd(),
         Commands::Version => {
             println!("codetracer-cardano-recorder {}", env!("CARGO_PKG_VERSION"));
@@ -765,6 +811,46 @@ fn corpus_tx_hashes() -> Result<Vec<String>> {
         out.push(h.to_string());
     }
     Ok(out)
+}
+
+/// Execute the `compile-corpus` subcommand (CXP-ADA-1 deliverable 3).
+///
+/// The reading this prints is the deliverable's own: how many modules the real
+/// Aiken compiler accepts, how many artifacts it produced, how many of those
+/// the CEK machine executed byte-identically to the compiler's output, and how
+/// many stepped to `Done`. A module the compiler refuses is printed with the
+/// compiler's own diagnostic rather than dropped, because a ratio over a
+/// narrowed corpus is not a reading of the corpus.
+fn compile_corpus_cmd(args: CompileCorpusArgs) -> Result<()> {
+    use codetracer_cardano_recorder::compile;
+
+    let corpus_dir = args
+        .corpus_dir
+        .unwrap_or_else(|| PathBuf::from(compile::CORPUS_DIR));
+    let epoch = args.epoch.unwrap_or(compile::CORPUS_COST_MODEL_EPOCH);
+    let src = chain_source(args.chain.live);
+
+    let reading = compile::read_corpus(&corpus_dir, src.as_ref(), epoch)?;
+    print!("{}", compile::render(&reading));
+
+    // The deliverable's clause, enforced rather than printed: an artifact that
+    // is not the compiler's own bytes means something else ran, which is the
+    // defect §2.2 grades.
+    let divergent = reading.divergent();
+    if !divergent.is_empty() {
+        return Err(eyre::eyre!(
+            "{} artifact(s) executed bytes that are NOT the compiler's output. The artifact \
+             executed must be the artifact the compiler produced, or the trace describes a \
+             program the compiler never emitted: {:?}",
+            divergent.len(),
+            divergent
+                .iter()
+                .map(|a| format!("{}.{}", a.artifact.module, a.artifact.test_name))
+                .collect::<Vec<_>>()
+        ));
+    }
+
+    Ok(())
 }
 
 fn fixtures_cmd() -> Result<()> {

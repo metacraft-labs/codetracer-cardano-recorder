@@ -4,10 +4,23 @@
 //!
 //! **Script tracing** ([`tracer`], [`recorder`]) parses Aiken source and walks
 //! its own AST. Chain-Support-Matrix.md §2.1 grades that *source-simulated*
-//! and caps it at fidelity C; §2.2 records *"compiler never invoked"*.
-//! Replacing it is CXP-ADA-1's deliverables 2 and 3 and is blocked on the
-//! Aiken compiler front-end. [`cek`] is the authoritative replacement path:
-//! it steps the chain's own UPLC CEK machine.
+//! and caps it at fidelity C; §2.2 records *"compiler never invoked"*. That
+//! grade is still accurate **of this path**: `record` goes through
+//! [`recorder`] into [`tracer`] and invokes no compiler. [`cek`] is the
+//! authoritative replacement path: it steps the chain's own UPLC CEK machine.
+//!
+//! **The compiler** ([`compile`]) is CXP-ADA-1 deliverable 3. It invokes the
+//! real Aiken front-end — `aiken-lang`'s own lexer, parser, type checker and
+//! `CodeGenerator::generate_raw` — on an Aiken module, encodes the generated
+//! program the way the chain stores a script (the same
+//! `SerializableProgram::compiled_code_and_hash` a blueprint's `compiledCode`
+//! and `hash` come from), steps it through [`cek`], and byte-compares what ran
+//! against what the compiler produced. **It does not yet back `record`**:
+//! wiring it in means removing the source-simulating path, because a fallback
+//! would restore the exact property §2.1 warns about, and that is
+//! deliverable 2. Measured over the 19-module corpus in `test-programs/aiken/`:
+//! 14 modules compile, 5 are refused by the compiler itself, and all 15
+//! artifacts generated executed the compiler's own bytes.
 //!
 //! **The budget oracle** ([`oracle`]) is CXP-ADA-1 deliverable 4 and is the
 //! strongest check in this crate. It reconstructs Plutus's `ScriptContext` for
@@ -37,6 +50,7 @@
 pub mod blockfrost;
 pub mod cek;
 pub mod chain;
+pub mod compile;
 pub mod enumerate;
 pub mod eras;
 pub mod fixture;

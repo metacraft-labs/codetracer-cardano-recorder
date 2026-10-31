@@ -23,8 +23,6 @@ dependencies = [
 [[package]]
 name = "aiken-lang"
 version = "1.1.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "578941589556cb61cc9c4f17ef8159d15c72b59b9602f3f506d85088d65d597c"
 dependencies = [
  "blst",
  "built",
@@ -45,7 +43,7 @@ dependencies = [
  "serde",
  "strum",
  "thiserror",
- "uplc 1.1.21 (registry+https://github.com/rust-lang/crates.io-index)",
+ "uplc",
  "vec1",
 ]
 
@@ -398,7 +396,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "uplc 1.1.21",
+ "uplc",
  "ureq 3.3.0",
 ]
 
@@ -2354,39 +2352,6 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "uplc"
 version = "1.1.21"
-dependencies = [
- "bitvec",
- "blst",
- "cryptoxide",
- "hamming",
- "hex",
- "indexmap 1.9.3",
- "itertools 0.10.5",
- "k256",
- "miette 5.10.0",
- "num-bigint",
- "num-integer",
- "num-traits",
- "once_cell",
- "pallas-addresses",
- "pallas-codec",
- "pallas-crypto",
- "pallas-primitives",
- "pallas-traverse",
- "peg",
- "pretty 0.11.3",
- "secp256k1",
- "serde",
- "serde_json",
- "strum",
- "thiserror",
-]
-
-[[package]]
-name = "uplc"
-version = "1.1.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af10ae941c734f297a8ab1a08d79aa16e4216552bdc6b526dff8d91115c1eed9"
 dependencies = [
  "bitvec",
  "blst",
