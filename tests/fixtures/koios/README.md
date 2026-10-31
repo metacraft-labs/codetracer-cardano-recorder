@@ -1,4 +1,4 @@
-# Committed Koios captures — CXP-ADA-2 acquisition
+# Committed Koios captures — CXP-ADA-2 acquisition and the CXP-ADA-1 budget oracle
 
 Cardano mainnet's own responses, captured once and committed as text, so the
 acquisition suite measures something with **no network and no credential**.
@@ -32,11 +32,16 @@ therefore declares an identity that `codetracer-cardano-recorder fixtures`
 | `pre-babbage-datum-hash-only` | the row names its datum by hash and carries no inline datum (CIP-32 did not exist), and the paired `/datum_info` capture's bytes hash to that datum hash |
 | `cross-fixture` | the `/blocks` and `/block_txs` captures agree: every block hash in both, and each block's own `tx_count` equal to the rows enumerated for it |
 | `evaluator-arity` | each `cost_models` entry reduces to a **dense** positional `0..n-1` vector, and its length is compared against the arity the UPLC evaluator reads |
+| `tx-epoch-cross-fixture` | an epoch is not hashed by the chain, so this one runs ACROSS captures: every `tx_hash` named has a `tx_cbor` capture whose bytes hash to that name, a transaction inside the captured window agrees with what `/block_txs` says its epoch is, and every epoch named has an `/epoch_params` capture so its cost model is reachable offline |
+| `unanchored-every-input-covered` | **stated as unanchored.** A `/utxo_info` row carrying neither an inline datum nor a reference script has nothing the chain hashed that a client can recompute. What IS checked is that the rows are what they claim — a row carrying either would belong under a kind that can anchor it — and the reason the file is unanchored rather than filed under `datum-blake2b-256` with an empty loop, which would report ANCHORED over nothing |
 | `none` | **stated as unanchored.** A projection of epoch/protocol-version pairs is not hashed by the chain in any recomputable form; what is checked is internal (epochs ascending, `protocol_major` non-decreasing) |
 
-The last two verdicts are reported `UNANCHORED (stated, not proven)` rather
-than being quietly counted as passes. A protocol-parameter set carries no
-hash; saying so is the honest option and inventing an anchor is not.
+Three of these kinds — `evaluator-arity`, `unanchored-every-input-covered`
+and `none` — are reported `UNANCHORED (stated, not proven)` rather than being
+quietly counted as passes. A protocol-parameter set carries no hash; saying so
+is the honest option and inventing an anchor is not. (Named rather than counted
+by position: the sentence used to say "the last two", and inserting a kind into
+the table above silently moved what that referred to.)
 
 ## The captures
 
@@ -56,12 +61,30 @@ hash; saying so is the honest option and inventing an anchor is not.
 | `tx_cbor_v3_embedded_script_spend` | `POST /tx_cbor` | a live PlutusV3 spend whose script **is** carried in the transaction |
 | `utxo_info_v3_embedded_script_spend` | `POST /utxo_info` | its spent input, with the inline datum that is *not* carried |
 | `script_info_v3_embedded_script_spend` | `POST /script_info` | its script |
+| `tx_cbor_v1_mint_policy` | `POST /tx_cbor` | an Alonzo PlutusV1 **minting policy**, whose application order is `(script redeemer) context` — two arguments, not three |
+| `utxo_info_v1_mint_policy` | `POST /utxo_info` | its one input, so the script context can be assembled |
+| `tx_cbor_v2_over_declared_spend` | `POST /tx_cbor` | a Conway PlutusV2 transaction all three of whose redeemers replay strictly **under** the units it declares — the corpus's only PlutusV2 case, and the one that stops the budget check from asserting equality |
+| `utxo_info_v2_over_declared_spend` | `POST /utxo_info` | its two inputs and three reference inputs |
+| `tx_epochs_oracle_corpus` | `POST /tx_info?select=…` | which epoch each corpus transaction settled in — the fact that selects the cost model a replay is charged under, taken from the chain rather than from a constant |
 
-Three transaction cases, chosen for what they measure rather than for being
-typical: one where everything travels with the transaction (Alonzo), one where
-neither the script nor the datum does (CIP-32 + CIP-33), and one in between.
-Reading only the middle one would support "post-Babbage the script is always
-absent", which the third refutes.
+Three transaction cases for CXP-ADA-2's carriage reading, chosen for what they
+measure rather than for being typical: one where everything travels with the
+transaction (Alonzo), one where neither the script nor the datum does (CIP-32 +
+CIP-33), and one in between. Reading only the middle one would support
+"post-Babbage the script is always absent", which the third refutes.
+
+**Two more for CXP-ADA-1's budget oracle**, which needs a different kind of
+coverage: all three Plutus languages, all three application orders, and both
+sides of the relation between the replayed budget and the declared one. Those
+two have no `script_info_*` capture and need none — the scripts the oracle
+executes come out of the witness set or off a CIP-33 reference output, never
+out of a `/script_info` row. The five together are `fixture::cases::
+ALL_WITH_BUDGET`; the three carriage cases alone are `fixture::cases::ALL`.
+
+The `utxo_info_*` captures cover **every** output each transaction consumes and
+refers to, not only its script inputs, because Plutus applies a `ScriptContext`
+assembled from all of them. A partial capture would build a context the chain
+never hashed, and the budget replayed from it would still look like a budget.
 
 ## Regenerating
 
@@ -74,9 +97,12 @@ declared identity no longer holds.
 
 `CODETRACER_CARDANO_RECORDER_LIVE_CHAIN=1 cargo test --test test_acquisition`
 compares every capture against the live chain
-(`test_the_live_chain_agrees_with_the_committed_captures`). Without that
-variable the test prints **NOT MEASURED** and names what is unmeasured:
-drift, not authenticity.
+(`test_the_live_chain_agrees_with_the_committed_captures`), and the same
+variable on `--test test_budget_oracle` re-reads every corpus transaction and
+re-runs the budget comparison against it
+(`test_the_live_chain_agrees_with_the_committed_budget_readings`). Without that
+variable both tests print **NOT MEASURED** and name what is unmeasured: drift,
+not authenticity.
 
 ## No `.ct` files, ever
 

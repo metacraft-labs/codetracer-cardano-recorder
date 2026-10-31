@@ -24,11 +24,15 @@
 //!   (where applicable) and propagates its exit code.
 //! * `CODETRACER_CARDANO_RECORDER_LOG_LEVEL` — recorder log verbosity (advisory;
 //!   the Cardano recorder currently logs to stderr unconditionally).
-//! * `BLOCKFROST_API_KEY` — Blockfrost API key used by the `replay` subcommand
-//!   (Cardano-specific; not part of the standard recorder env-var set).
+//! * `BLOCKFROST_API_KEY` — Blockfrost API key, used only by `replay
+//!   --via-blockfrost` (Cardano-specific; not part of the standard recorder
+//!   env-var set). No lane in this workspace holds one, and that path cannot
+//!   run a budget comparison in any case — see [`codetracer_cardano_recorder::
+//!   blockfrost`]. The default `replay` path needs no credential.
 //! * `CODETRACER_CARDANO_RECORDER_LIVE_CHAIN` — set to `1` or `true` to let the
 //!   acquisition subcommands (`enumerate`, `provenance`, `eras`,
-//!   `prestate-strategy`, `fixtures`) reach the live chain. Unset, they read
+//!   `prestate-strategy`, `fixtures`), `replay` and `budget-oracle` reach the
+//!   live chain. Unset, they read
 //!   the committed Koios captures under `tests/fixtures/koios/` instead, and
 //!   anything those captures do not cover is reported **NOT MEASURED** rather
 //!   than skipped. Koios needs no API key, so `--live` costs nothing but
@@ -46,6 +50,20 @@
 //! `prestate-strategy` prints the declared `hydrated-from-node` token together
 //! with the re-measurement that licenses it. `fixtures` recomputes every
 //! committed capture's hash identity.
+//!
+//! # The budget oracle (CXP-ADA-1 deliverable 4)
+//!
+//! `replay` takes one transaction and `budget-oracle` takes a corpus or a
+//! height range. Both reconstruct Plutus's `ScriptContext`, step every script
+//! through the chain's own CEK machine under the cost model of the epoch the
+//! transaction settled in, and compare each redeemer's budget against the
+//! execution units the transaction's own witness set declares.
+//!
+//! `budget-oracle` prints the **distribution** rather than a verdict, because
+//! the relation was measured and is not equality: the ledger validates only
+//! that execution *fits inside* the declaration, so a submitter's round
+//! over-estimate is an ordinary transaction and reads `UNDER`. `OVER` is
+//! always a defect and fails the command.
 
 use std::path::PathBuf;
 
@@ -137,6 +155,15 @@ enum Commands {
     /// Print the declared prestate strategy and the reading that licenses it.
     PrestateStrategy(ChainArgs),
 
+    /// Replay a corpus of transactions and report the budget relation.
+    ///
+    /// For each transaction, every script is stepped through the chain's CEK
+    /// machine under its own epoch's cost model and each redeemer's replayed
+    /// budget is compared against the execution units the transaction's
+    /// witness set declares. Prints the distribution — EQUAL / UNDER / OVER —
+    /// and names every transaction that could not be measured.
+    BudgetOracle(BudgetOracleArgs),
+
     /// Recompute the hash identity of every committed Koios capture.
     Fixtures,
 
@@ -192,13 +219,51 @@ struct ErasArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct BudgetOracleArgs {
+    /// Transactions to replay. Repeatable.
+    ///
+    /// Omit to replay every captured case, which is the standing corpus.
+    #[arg(long)]
+    tx_hash: Vec<String>,
+
+    /// Replay every script transaction in a height range instead.
+    ///
+    /// Needs `--live` unless the range is one the captures cover.
+    #[arg(long)]
+    from_height: Option<u64>,
+
+    /// Last block height, inclusive.
+    #[arg(long)]
+    to_height: Option<u64>,
+
+    #[command(flatten)]
+    chain: ChainArgs,
+}
+
+#[derive(Debug, clap::Args)]
 struct ReplayArgs {
     /// Cardano transaction hash (64 hex characters).
     #[arg(long)]
     tx_hash: String,
 
-    /// Blockfrost API key. If not provided, the BLOCKFROST_API_KEY
-    /// environment variable is used.
+    /// The epoch the transaction settled in, overriding the chain read.
+    ///
+    /// The epoch selects the cost model the replay is charged under. It is
+    /// normally read from the chain, because it cannot be read off the
+    /// transaction's bytes; this flag exists for a transaction no capture
+    /// covers.
+    #[arg(long)]
+    epoch: Option<u64>,
+
+    /// Use the older Blockfrost client instead of the Koios/capture path.
+    ///
+    /// That client cannot supply a redeemer's data or a script context, so it
+    /// reports the budget comparison as NOT MEASURED rather than running one.
+    #[arg(long)]
+    via_blockfrost: bool,
+
+    /// Blockfrost API key, for `--via-blockfrost`. If not provided, the
+    /// BLOCKFROST_API_KEY environment variable is used.
     #[arg(long)]
     blockfrost_key: Option<String>,
 
@@ -207,6 +272,9 @@ struct ReplayArgs {
     /// Falls back to `CODETRACER_CARDANO_RECORDER_OUT_DIR` when omitted.
     #[arg(short = 'o', long)]
     out_dir: Option<PathBuf>,
+
+    #[command(flatten)]
+    chain: ChainArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -269,6 +337,7 @@ fn main() -> Result<()> {
         Commands::Provenance(args) => provenance_cmd(args),
         Commands::Eras(args) => eras_cmd(args),
         Commands::PrestateStrategy(args) => prestate_cmd(args),
+        Commands::BudgetOracle(args) => budget_oracle_cmd(args),
         Commands::Fixtures => fixtures_cmd(),
         Commands::Version => {
             println!("codetracer-cardano-recorder {}", env!("CARGO_PKG_VERSION"));
@@ -318,14 +387,19 @@ fn record(args: RecordArgs) -> Result<()> {
 
 /// Execute the `replay` subcommand.
 ///
-/// Fetches the transaction via Blockfrost, reconstructs the fully-applied
-/// UPLC program, evaluates it through the CEK machine, and writes a
-/// CodeTracer trace.
+/// Reads a settled transaction's bytes and the outputs it consumes,
+/// reconstructs Plutus's `ScriptContext`, **steps** every script through the
+/// chain's own CEK machine under the cost model of the epoch the transaction
+/// settled in, and compares each redeemer's replayed budget against the
+/// execution units the transaction's own witness set declares.
+///
+/// The default source is the committed captures, so the comparison is
+/// reproducible and needs no credential. `--via-blockfrost` selects the older
+/// client instead and is honest about what it cannot do: see
+/// [`codetracer_cardano_recorder::blockfrost`].
 fn replay(args: ReplayArgs) -> Result<()> {
-    use codetracer_cardano_recorder::blockfrost::BlockfrostClient;
-    use codetracer_cardano_recorder::cek::{step_program, BudgetComparison};
-    use codetracer_cardano_recorder::transaction::reconstruct_applied_program;
-    use uplc::machine::cost_model::ExBudget;
+    use codetracer_cardano_recorder::cek::AccountingFault;
+    use codetracer_cardano_recorder::oracle;
 
     eprintln!("Replaying transaction: {}", args.tx_hash);
 
@@ -334,70 +408,94 @@ fn replay(args: ReplayArgs) -> Result<()> {
         return Ok(());
     }
 
+    if args.tx_hash.len() != 64 || !args.tx_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(eyre::eyre!(
+            "invalid transaction hash: expected 64 hex characters, got '{}'",
+            args.tx_hash
+        ));
+    }
+
     // The replay subcommand does not yet write CTFS output, but we
     // resolve the output dir up-front so callers can rely on the
     // env-var fallback once writer support lands.
     let _out_dir = resolve_out_dir(args.out_dir);
 
-    // 1. Build the Blockfrost client.
-    let client = if let Some(key) = args.blockfrost_key {
-        BlockfrostClient::new(key)
-    } else {
-        BlockfrostClient::from_env()?
-    };
-
-    // 2. Fetch the transaction data.
-    let tx_data = client.fetch_transaction(&args.tx_hash)?;
-    eprintln!(
-        "Fetched {} script ({} bytes)",
-        tx_data.script_version,
-        tx_data.script_bytes.len()
-    );
-
-    // 3. Reconstruct the fully-applied program.
-    let program = reconstruct_applied_program(&tx_data)?;
-    eprintln!("Reconstructed applied program");
-
-    // 4. Step the program through the chain's own CEK machine.
-    //
-    // CXP-ADA-1: this path steps rather than calling `eval_version`, so the
-    // execution is observed inside the chain's evaluator one CEK transition
-    // at a time.  There is deliberately no fallback to a
-    // run-to-completion or source-simulated path on failure: §2.1 warns that
-    // a silent fallback lets a non-authoritative account be presented as if
-    // it were what the chain executed, so a stepping failure is an error.
-    let language = tx_data.script_version.to_language();
-    let run = step_program(program, &language, ExBudget::default())?;
-
-    eprintln!(
-        "Stepped {} CEK transitions through the chain's evaluator",
-        run.step_count()
-    );
-    println!("{}", run.result);
-
-    let consumed = run.consumed();
-    eprintln!("Budget spent: {} CPU, {} MEM", consumed.cpu, consumed.mem);
-
-    // 5. Compare against the budget consensus recorded for this script.
-    match tx_data.consensus_budget {
-        Some(consensus) => {
-            let comparison = BudgetComparison::new(consumed, consensus);
-            eprintln!("Budget oracle: {comparison}");
-            if !comparison.agrees() {
-                return Err(eyre::eyre!(
-                    "replayed budget diverges from the budget consensus recorded: {comparison}"
-                ));
-            }
-        }
-        None => {
-            eprintln!(
-                "Budget oracle: NOT MEASURED -- the chain data source reported no \
-                 execution units for this redeemer, so there is nothing independent \
-                 to compare the replay against."
-            );
-        }
+    if args.via_blockfrost {
+        return replay_via_blockfrost(&args.tx_hash, args.blockfrost_key.clone());
     }
 
+    let src = chain_source(args.chain.live);
+
+    // The epoch is read from the chain, not assumed: it is what selects the
+    // cost model, and a replay charged under the wrong era's prices is not a
+    // replay of that transaction. `--epoch` exists for a transaction whose
+    // epoch no capture covers, and it is an override rather than a default.
+    let epoch = match args.epoch {
+        Some(e) => {
+            eprintln!("epoch {e} supplied on the command line, overriding the chain read");
+            e
+        }
+        None => src.tx_epoch(&args.tx_hash)?,
+    };
+
+    let reading =
+        oracle::replay_from_source(src.as_ref(), &args.tx_hash, epoch, AccountingFault::none())?;
+    print!("{}", oracle::render(&reading));
+
+    // The oracle's verdict. The relation the recorder asserts is the ledger's
+    // own — execution fits inside the declaration — because that is what was
+    // measured; see `oracle::BudgetRelation`. An OVER reading is always a
+    // defect and fails here.
+    if reading.over_count() > 0 {
+        return Err(eyre::eyre!(
+            "{} of {} redeemer(s) replayed MORE than the transaction declares. A settled \
+             transaction's execution fit inside its declaration by the ledger's own rule, so \
+             either this replay is wrong or the transaction could not have settled",
+            reading.over_count(),
+            reading.redeemers.len()
+        ));
+    }
+    for r in &reading.redeemers {
+        if r.errored {
+            return Err(eyre::eyre!(
+                "the {}[{}] script evaluated to ERROR. A settled transaction's phase-two scripts \
+                 succeeded, so this is a divergence even though the budget fits",
+                r.purpose,
+                r.index
+            ));
+        }
+    }
+    eprintln!(
+        "Budget oracle: AGREES -- {} of {} redeemer(s) exact, {} within the declaration, 0 over",
+        reading.exact_count(),
+        reading.redeemers.len(),
+        reading.redeemers.len() - reading.exact_count()
+    );
+
+    Ok(())
+}
+
+/// The older Blockfrost path, kept and not pretended about.
+///
+/// `BlockfrostClient` can read a script's bytes and the units the chain
+/// recorded, and it cannot read a redeemer's *data* (its endpoint serves the
+/// data hash) or assemble a `ScriptContext`. So this prints what it can read
+/// and reports the budget comparison as NOT MEASURED rather than running a
+/// comparison whose inputs are a hash and an empty context.
+fn replay_via_blockfrost(tx_hash: &str, key: Option<String>) -> Result<()> {
+    use codetracer_cardano_recorder::blockfrost::BlockfrostClient;
+
+    let client = match key {
+        Some(k) => BlockfrostClient::new(k),
+        None => BlockfrostClient::from_env()?,
+    };
+    let summary = client.fetch_script_summary(tx_hash)?;
+    print!("{summary}");
+    eprintln!(
+        "Budget oracle: NOT MEASURED via Blockfrost -- this client cannot supply a redeemer's \
+         data or a script context, so there is nothing to step. Drop --via-blockfrost to run the \
+         comparison against the committed captures, or pass --live for the keyless Koios path."
+    );
     Ok(())
 }
 
@@ -582,6 +680,91 @@ fn prestate_cmd(args: ChainArgs) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The standing budget oracle, over a corpus rather than one transaction.
+///
+/// Prints the distribution it measured. The relation the recorder asserts is
+/// the ledger's own — execution fits inside the declaration — because that is
+/// what the measurement found; `oracle::BudgetRelation` records why. An OVER
+/// reading is always a defect and fails the command.
+fn budget_oracle_cmd(args: BudgetOracleArgs) -> Result<()> {
+    use codetracer_cardano_recorder::cek::AccountingFault;
+    use codetracer_cardano_recorder::{fixture::cases, oracle};
+
+    let src = chain_source(args.chain.live);
+
+    let census = match (args.from_height, args.to_height) {
+        (Some(lo), Some(hi)) => {
+            oracle::census_over_range(src.as_ref(), lo, hi, AccountingFault::none())?
+        }
+        (None, None) => {
+            let hashes = if args.tx_hash.is_empty() {
+                corpus_tx_hashes()?
+            } else {
+                for h in &args.tx_hash {
+                    if h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err(eyre::eyre!(
+                            "invalid transaction hash: expected 64 hex characters, got '{h}'"
+                        ));
+                    }
+                }
+                args.tx_hash.clone()
+            };
+            eprintln!(
+                "corpus: {} transaction(s) ({} captured case(s) available)",
+                hashes.len(),
+                cases::ALL_WITH_BUDGET.len()
+            );
+            oracle::census_over_hashes(src.as_ref(), &hashes, AccountingFault::none())
+        }
+        _ => {
+            return Err(eyre::eyre!(
+                "a height range needs both --from-height and --to-height; one of the two names \
+                 no range and would enumerate a different population than the flag reads like"
+            ))
+        }
+    };
+
+    print!("{}", oracle::render_census(&census));
+
+    if census.redeemer_count() == 0 {
+        return Err(eyre::eyre!(
+            "no redeemer was replayed, so the distribution above is over an empty set. A census \
+             of nothing is not a measurement"
+        ));
+    }
+    if census.over_count() > 0 || census.errored_count() > 0 {
+        return Err(eyre::eyre!(
+            "{} redeemer(s) replayed MORE than the transaction declares and {} evaluated to \
+             ERROR. A settled transaction's phase-two scripts succeeded within their \
+             declaration, so either the replay is wrong or the transaction could not have settled",
+            census.over_count(),
+            census.errored_count()
+        ));
+    }
+    Ok(())
+}
+
+/// The committed corpus's transaction hashes, taken from the captures rather
+/// than hard-coded, so adding a case extends the corpus by committing a
+/// capture.
+fn corpus_tx_hashes() -> Result<Vec<String>> {
+    use codetracer_cardano_recorder::fixture::{cases, FixtureSource};
+    let fx = FixtureSource::at_crate_root();
+    let mut out = Vec::new();
+    for case in cases::ALL_WITH_BUDGET {
+        let f = fx.load(&format!("tx_cbor_{case}"))?;
+        let h = f
+            .identity
+            .get("expect_tx_hash")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| {
+                eyre::eyre!("capture tx_cbor_{case} declares no `identity.expect_tx_hash`")
+            })?;
+        out.push(h.to_string());
+    }
+    Ok(out)
 }
 
 fn fixtures_cmd() -> Result<()> {

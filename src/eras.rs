@@ -44,7 +44,9 @@
 //!
 //! It does not evaluate, and it does not reach into `crate::cek`. Building a
 //! cost model is as far as it goes; applying one to a settled transaction
-//! needs a script context, which is CXP-ADA-1's open work. It also refuses,
+//! needs a script context, and that is [`crate::oracle`]'s job — which calls
+//! [`cost_model_for`] rather than the reverse, so the dependency runs one way
+//! and this module stays unable to evaluate anything. It also refuses,
 //! rather than pads, a cost model whose parameter vector is shorter than the
 //! evaluator reads — a padded model would charge invented prices and report a
 //! budget as though it were the chain's.
@@ -135,6 +137,18 @@ pub enum ArityVerdict {
     /// Longer than the evaluator reads: the prefix is used and the surplus is
     /// reported, because a parameter this evaluator ignores is a price the
     /// chain charged and the replay will not.
+    ///
+    /// **Measured 2026-10-31: on this chain's current epoch the surplus does
+    /// not in fact move the budget.** Epoch 664 serves 350 PlutusV3
+    /// parameters against the 297 this evaluator reads — `Surplus(53)` — and
+    /// four mainnet PlutusV3 redeemers, across the two PlutusV3 transactions
+    /// the corpus carries, replayed from that epoch's
+    /// 297-parameter prefix reproduced the execution units the chain recorded
+    /// **exactly** (`tests/test_budget_oracle.rs`). The surplus parameters are
+    /// prices for builtins those scripts do not use, so they were never
+    /// charged. That is a reading about those transactions and not a
+    /// guarantee: a script that used one of the 53 would be mispriced, and the
+    /// surplus is still reported for exactly that reason.
     Surplus(usize),
     /// Shorter than the evaluator reads: this era's prices cannot be supplied,
     /// so a replay under them is refused rather than approximated.

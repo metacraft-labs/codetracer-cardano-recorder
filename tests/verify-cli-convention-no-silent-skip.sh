@@ -27,9 +27,18 @@
 #   * `eras` prints BOTH floors, because the acquisition floor and the
 #     script-tracing floor are different numbers and printing one of them is
 #     the collapse this milestone measured apart
-#   * `CODETRACER_CARDANO_RECORDER_LIVE_CHAIN` is referenced in source, and the
-#     acquisition suite says `NOT MEASURED` instead of skipping and uses no
-#     `#[ignore]`
+#   * `CODETRACER_CARDANO_RECORDER_LIVE_CHAIN` is referenced in source, and EVERY
+#     test file carrying a live arm says `NOT MEASURED` instead of skipping
+#   * no `tests/*.rs` and no `src/*.rs` carries an ignore attribute at all
+#
+# And, since CXP-ADA-1 deliverable 4, the budget oracle:
+#
+#   * `budget-oracle` keeps the CTFS-only convention and exposes `--live`
+#   * it runs offline over the committed corpus, prints the DISTRIBUTION it
+#     measured (EQUAL/UNDER/OVER) rather than a bare verdict, says
+#     `NOT MEASURED: none`, and names the epoch and era each transaction was
+#     charged under — a replay that did not say which cost model it used is the
+#     era-blind defect this landing closed
 #
 # Wire-up: see `Justfile` (`just lint` and `just test` both run this
 # script).
@@ -136,16 +145,16 @@ assert_present "codetracer-cardano-recorder" "--version output" "${VERSION_OUT}"
 # live-chain gate, so a reading can never silently go to the network and can
 # never silently skip when it does not.
 
-for SUB in enumerate provenance eras prestate-strategy fixtures; do
+for SUB in enumerate provenance eras prestate-strategy fixtures budget-oracle; do
   SUB_HELP="$("${BIN}" "${SUB}" --help)"
   assert_absent "--format" "${SUB} --help" "${SUB_HELP}"
   assert_absent "CODETRACER_FORMAT" "${SUB} --help" "${SUB_HELP}"
 done
 
-# The four chain-reading subcommands expose the opt-in gate on the CLI as well
-# as in the environment.  `fixtures` deliberately does not: it reads only
-# committed captures and has nothing to opt in to.
-for SUB in enumerate provenance eras prestate-strategy; do
+# The chain-reading subcommands expose the opt-in gate on the CLI as well as in
+# the environment.  `fixtures` deliberately does not: it reads only committed
+# captures and has nothing to opt in to.
+for SUB in enumerate provenance eras prestate-strategy budget-oracle; do
   SUB_HELP="$("${BIN}" "${SUB}" --help)"
   assert_present "--live" "${SUB} --help" "${SUB_HELP}"
 done
@@ -181,6 +190,23 @@ ERAS_OUT="$("${BIN}" eras 2>&1)"
 assert_present "acquisition floor" "eras output" "${ERAS_OUT}"
 assert_present "script-tracing floor" "eras output" "${ERAS_OUT}"
 
+# The CXP-ADA-1 deliverable-4 oracle must run offline over the committed corpus
+# and must print the distribution it measured, not a verdict.  A command that
+# printed "AGREES" without the counts would hide an empty population, and
+# `NOT MEASURED: none` is the line that says no transaction was quietly
+# dropped from the census.
+BUDGET_OUT="$("${BIN}" budget-oracle 2>&1)"
+assert_present "koios-fixture" "budget-oracle output" "${BUDGET_OUT}"
+assert_present "EQUAL" "budget-oracle output" "${BUDGET_OUT}"
+assert_present "UNDER" "budget-oracle output" "${BUDGET_OUT}"
+assert_present "OVER" "budget-oracle output" "${BUDGET_OUT}"
+assert_present "NOT MEASURED: none" "budget-oracle output" "${BUDGET_OUT}"
+# And it must name the era it charged each transaction under.  A replay that
+# did not say which epoch's cost model it used is the era-blind defect this
+# landing closed, wearing a passing badge.
+assert_present "epoch 290 (era Alonzo)" "budget-oracle output" "${BUDGET_OUT}"
+assert_present "epoch 664 (era Conway)" "budget-oracle output" "${BUDGET_OUT}"
+
 # ---------------------------------------------------------------------------
 # Source-level references for the acquisition gate
 # ---------------------------------------------------------------------------
@@ -192,28 +218,105 @@ if ! grep -rqF "CODETRACER_CARDANO_RECORDER_LIVE_CHAIN" "${REPO_ROOT}/src"; then
 fi
 echo "ok: CODETRACER_CARDANO_RECORDER_LIVE_CHAIN referenced in src/"
 
-# A test that needs the network must say NOT MEASURED rather than skipping, so
-# the token has to exist in the suite.
-if ! grep -rqF "NOT MEASURED" "${REPO_ROOT}/tests/test_acquisition.rs"; then
-  echo "FAIL: tests/test_acquisition.rs must report NOT MEASURED when the live-chain gate is" \
-       "unset; a silent skip is the thing this script exists to prevent" >&2
-  exit 1
-fi
-echo "ok: the acquisition suite reports NOT MEASURED rather than skipping"
-
-# And it must not do it with #[ignore], which hides the reading from the
-# summary line entirely.
+# EVERY test file that consults the live-chain gate must report NOT MEASURED
+# when it is unset, rather than skipping.
 #
-# Matched as an ATTRIBUTE (a line whose first non-space token is `#[ignore`),
-# not as a substring: the first spelling of this check fired on the prose in
-# that file explaining why `#[ignore]` is not used, which is a false red of
-# exactly the kind that gets a gate disabled.
-if grep -rqE '^[[:space:]]*#\[ignore' "${REPO_ROOT}/tests/test_acquisition.rs"; then
-  echo "FAIL: tests/test_acquisition.rs uses #[ignore]; an ignored test is a silent skip with" \
-       "extra steps" >&2
+# Scoped per file and derived from the files themselves, not from a hard-coded
+# path. The previous spelling named `tests/test_acquisition.rs` alone, which
+# left three of four test files — and every test file added afterwards —
+# outside the ban while the gate stayed green
+# That gap was filed as
+# `issues/2026-10-31-the-cardano-no-silent-skip-gate-bans-ignore-in-one-test-file-of-four.md`
+# and is resolved here, so its file is deleted and the reading is in CXP-ADA-1's
+# "Measured state — 2026-10-31". A ban that reads as repository-wide and covers one file is
+# the shape Chain-Support-Matrix.md §2.4 warns about: the green is narrower
+# than the sentence next to it.
+GATED_FILES=0
+for F in "${REPO_ROOT}"/tests/*.rs; do
+  if grep -qF "CODETRACER_CARDANO_RECORDER_LIVE_CHAIN" "${F}" \
+     || grep -qF "live_chain_enabled" "${F}"; then
+    GATED_FILES=$((GATED_FILES + 1))
+    # Per GUARD, not per file. An existence check over the whole file passes
+    # while one of several reports is deleted, and it passes on prose in the
+    # module header that merely mentions the token — both of which the filed
+    # issue names. So each `live_chain_enabled()` guard must have a NOT
+    # MEASURED report inside the twelve lines that follow it, counted over
+    # non-comment lines only.
+    MISSING="$(awk '
+      /live_chain_enabled\(\)/ { guard = NR; found = 0 }
+      guard && NR > guard && NR <= guard + 12 {
+        line = $0
+        sub(/^[[:space:]]+/, "", line)
+        if (line !~ /^(\/\/|\*)/ && index($0, "NOT MEASURED")) { found = 1 }
+      }
+      guard && NR == guard + 12 { if (!found) print guard; guard = 0 }
+      END { if (guard && !found) print guard }
+    ' "${F}")"
+    if [[ -n "${MISSING}" ]]; then
+      echo "FAIL: $(basename "${F}") consults the live-chain gate at line(s) ${MISSING}" \
+           "without reporting NOT MEASURED in the guarded branch; a test that needs the" \
+           "network and says nothing when it is absent is a silent skip" >&2
+      exit 1
+    fi
+    GUARDS="$(grep -c 'live_chain_enabled()' "${F}")"
+    echo "ok: $(basename "${F}") reports NOT MEASURED at each of its ${GUARDS} live-chain guard(s)"
+  fi
+done
+if [[ "${GATED_FILES}" -lt 2 ]]; then
+  echo "FAIL: only ${GATED_FILES} test file(s) consult the live-chain gate. Both the" \
+       "acquisition suite and the budget oracle have a live arm, so a smaller number means a" \
+       "live arm was removed or renamed and this check stopped covering it" >&2
   exit 1
 fi
-echo "ok: the acquisition suite uses no #[ignore] attribute"
+echo "ok: ${GATED_FILES} test file(s) carry a live arm, and each reports NOT MEASURED"
+
+# And no test may skip with #[ignore], which hides the reading from the summary
+# line entirely.
+#
+# Every `tests/*.rs` and every `src/*.rs`, not one path, and scanned per
+# ATTRIBUTE rather than per line: an attribute is opened by a line whose first
+# non-comment token is `#[` and runs until its brackets balance, so `ignore`
+# counts wherever it sits inside it. A line-anchored grep was the first
+# spelling and it had a measured hole — driven red 2026-10-31 — because
+#
+#     #[cfg_attr(
+#         all(),
+#         ignore
+#     )]
+#
+# puts `ignore` on a continuation line that starts with neither `#[` nor a
+# comment, and `cargo test` really does report that test `ignored`. `//`
+# comment text is stripped before the scan rather than the match being
+# narrowed to the first token, which is what keeps the original false red away
+# — the prose in `test_acquisition.rs` explaining why `#[ignore]` is not used
+# — without excusing any attribute spelling.
+for F in "${REPO_ROOT}"/tests/*.rs "${REPO_ROOT}"/src/*.rs; do
+  HITS="$(awk '
+    {
+      line = $0
+      sub(/\/\/.*/, "", line)
+    }
+    !inattr && line ~ /^[[:space:]]*#\[/ { inattr = 1; start = NR; buf = ""; depth = 0 }
+    inattr {
+      buf = buf " " line
+      depth += gsub(/\[/, "[", line) - gsub(/\]/, "]", line)
+      if (depth <= 0) {
+        if (buf ~ /(^|[^A-Za-z0-9_])ignore([^A-Za-z0-9_]|$)/) {
+          sub(/^[[:space:]]+/, "", buf)
+          print start ": " buf
+        }
+        inattr = 0
+      }
+    }
+  ' "${F}")"
+  if [[ -n "${HITS}" ]]; then
+    echo "FAIL: ${F} uses an ignore attribute; an ignored test is a silent skip with extra" \
+         "steps:" >&2
+    echo "${HITS}" >&2
+    exit 1
+  fi
+done
+echo "ok: no ignore attribute in any tests/*.rs or src/*.rs"
 
 # ---------------------------------------------------------------------------
 # Source-level reference for the env-var fallback

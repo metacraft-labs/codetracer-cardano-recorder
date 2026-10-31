@@ -3,7 +3,8 @@
   "endpoint": "POST https://api.koios.rest/api/v1/utxo_info",
   "query": {
     "_utxo_refs": [
-      "ac598daca88490c8c8f63f9bb4723fba7c4741998a57f60b4437972fe406b9f4#0"
+      "ac598daca88490c8c8f63f9bb4723fba7c4741998a57f60b4437972fe406b9f4#0",
+      "ac598daca88490c8c8f63f9bb4723fba7c4741998a57f60b4437972fe406b9f4#1"
     ],
     "_extended": true
   },
@@ -11,7 +12,7 @@
   "source": "Koios public API (no API key required)",
   "identity": {
     "kind": "datum-blake2b-256",
-    "note": "for every row carrying an inline_datum, blake2b-256(inline_datum.bytes) must equal that row datum_hash — the proven anchor"
+    "note": "for every row carrying an inline_datum, blake2b-256(inline_datum.bytes) must equal that row datum_hash — the proven anchor. The capture covers EVERY output the transaction consumes and not only the script input: Plutus applies a ScriptContext assembled from every resolved input, so a partial capture would build a context the chain never hashed and the budget replayed from it would still look like a budget. Row #1 is a key-address input carrying no datum and no script, and it is here for exactly that reason."
   },
   "response": [
     {
@@ -63,6 +64,22 @@
           "fingerprint": "asset1rcqh9eany2crdnzx0l4nq5w646fgyhdewtkjvl"
         }
       ],
+      "is_spent": true
+    },
+    {
+      "tx_hash": "ac598daca88490c8c8f63f9bb4723fba7c4741998a57f60b4437972fe406b9f4",
+      "tx_index": 1,
+      "address": "addr1q85m2c3neffh4d4np9hgsm622naa97ujkjem75kcu8n3c25rc9kn6q6sl4uj0ymn3xu3gxffn7gna6z32952k0axuhwsn9aj4t",
+      "value": "1210290284",
+      "stake_address": "stake1uxpuzmfaqdg067f8jdecnwg5ry5elyf7apg4z69t87nwthgqlq4p7",
+      "payment_cred": "e9b56233ca537ab6b3096e886f4a54fbd2fb92b4b3bf52d8e1e71c2a",
+      "epoch_no": 664,
+      "block_height": 14137075,
+      "block_time": 1793397186,
+      "datum_hash": null,
+      "inline_datum": null,
+      "reference_script": null,
+      "asset_list": [],
       "is_spent": true
     }
   ]

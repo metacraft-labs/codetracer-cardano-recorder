@@ -25,12 +25,26 @@
 //! from this file on purpose.
 //!
 //! It is also, honestly, *not* the exact oracle the charter names.  The
-//! charter asks for a replayed script's budget against the budget consensus
-//! recorded for a real transaction.  That comparison needs a mainnet
-//! transaction, and this recorder cannot yet reach one — see the milestone
-//! file for why.  The conformance corpus is the strongest independent budget
-//! oracle reachable offline: same quantity (execution units under the Plutus
-//! cost model), same cost model version, independently produced.
+//! charter asks for a replayed script's budget against the units the chain
+//! recorded for a real transaction.  **That oracle now exists and lives in
+//! `tests/test_budget_oracle.rs`**, over committed mainnet captures; this file
+//! is no longer the only budget check and no longer claims to stand in for the
+//! chain comparison.  The two measure different things and both are kept: the
+//! conformance corpus is 592 programs against IOG's own figures, which is
+//! breadth; the chain comparison is a handful of real transactions against
+//! figures the network produced, which is the authority the charter asks for.
+//!
+//! # Why the cost model is passed explicitly here
+//!
+//! `step_program` takes a cost model since the era-blindness defect was fixed
+//! (filed as `issues/2026-10-31-the-cardano-budget-oracle-steps-with-a-hard-
+//! coded-cost-model-so-it-is-era-blind.md`, now resolved and deleted; the
+//! reading is in CXP-ADA-1's "Measured state — 2026-10-31").  This file passes `CostModel::default()` on
+//! purpose and that is not era blindness: the conformance corpus's expected
+//! budgets were produced by the reference implementation under the **default**
+//! PlutusV3 parameters, so the default model is the one that matches the
+//! oracle.  The chain comparison passes the transaction's own epoch's model
+//! instead, because there the oracle is the chain.
 //!
 //! Only V3 is used.  The aiken fork's own conformance harness asserts budget
 //! equality for `PlutusV3` and deliberately skips it for V1/V2, because the
@@ -44,7 +58,7 @@ use std::path::{Path, PathBuf};
 use codetracer_cardano_recorder::cek::{step_program, BudgetComparison, StateKind};
 use pallas_primitives::conway::Language;
 use uplc::ast::{Name, NamedDeBruijn, Program};
-use uplc::machine::cost_model::ExBudget;
+use uplc::machine::cost_model::{CostModel, ExBudget};
 use uplc::parser;
 
 /// Root of the Plutus conformance corpus inside the aiken fork.
@@ -144,7 +158,12 @@ fn stepping_reproduces_reference_execution_units_for_v3_corpus() {
             continue;
         };
 
-        match step_program(program, &Language::PlutusV3, ExBudget::default()) {
+        match step_program(
+            program,
+            &Language::PlutusV3,
+            CostModel::default(),
+            ExBudget::default(),
+        ) {
             Ok(run) => {
                 compared += 1;
                 let comparison = BudgetComparison::new(run.consumed(), expected);
@@ -161,6 +180,15 @@ fn stepping_reproduces_reference_execution_units_for_v3_corpus() {
         }
     }
 
+    // The population this file's header claims, read out of the run rather
+    // than only asserted against a floor: the assertion below is `>= 500`, so
+    // a corpus that shrank to 501 would still pass and the printed figure is
+    // the only place a reader can see that it did not.
+    println!(
+        "MEASURED: {compared} of {} V3 conformance program(s) compared against the reference \
+         implementation's own .uplc.budget.expected figures, 0 divergent",
+        files.len()
+    );
     // A control that cannot fail is worthless, and a control that silently
     // compared nothing is the same thing wearing a passing badge.  Pin the
     // corpus size so that losing the corpus, or filtering it down to nothing,
@@ -199,8 +227,13 @@ fn stepping_exposes_state_environment_continuation_and_budget() {
     let named: Program<Name> = parser::program(code).expect("fixture failed to parse");
     let program: Program<NamedDeBruijn> = named.try_into().expect("fixture failed to convert");
 
-    let run = step_program(program, &Language::PlutusV3, ExBudget::default())
-        .expect("stepping the fixture failed");
+    let run = step_program(
+        program,
+        &Language::PlutusV3,
+        CostModel::default(),
+        ExBudget::default(),
+    )
+    .expect("stepping the fixture failed");
 
     // Machine state: the run must pass through both transition kinds and end
     // in exactly one terminal state.
@@ -318,8 +351,13 @@ fn repo_uplc_fixture_steps_to_true() {
     let named: Program<Name> = parser::program(&code).expect("fixture failed to parse");
     let program: Program<NamedDeBruijn> = named.try_into().expect("fixture failed to convert");
 
-    let run = step_program(program, &Language::PlutusV3, ExBudget::default())
-        .expect("stepping the repo fixture failed");
+    let run = step_program(
+        program,
+        &Language::PlutusV3,
+        CostModel::default(),
+        ExBudget::default(),
+    )
+    .expect("stepping the repo fixture failed");
 
     assert_eq!(format!("{}", run.result), "(con bool True)");
     assert!(

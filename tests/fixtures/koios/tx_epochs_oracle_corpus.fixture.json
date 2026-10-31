@@ -1,0 +1,56 @@
+{
+  "network": "cardano-mainnet",
+  "endpoint": "POST https://api.koios.rest/api/v1/tx_info?select=tx_hash,epoch_no,block_height,absolute_slot",
+  "query": {
+    "_tx_hashes": [
+      "a95d16e891e51f98a3b1d3fe862ed355ebc8abffb7a7269d86f775553d9e653f",
+      "e9d20746cec2d506a5ae201adbfec13ef20279b689f0612cc3802274ce4da2ce",
+      "0ab94a1542a36f2be087627f5e1c7cdfeb26bc1b8672004a760a1fed93f3c336",
+      "b116d0a734c0369d79062004618dffbf5b6770e76a28114640913aa71eacbbac",
+      "82dc8232feaf701b97e3fe082d5909fd3c437f4adc6c37c7634bd8782a49b0ca"
+    ],
+    "select": "tx_hash,epoch_no,block_height,absolute_slot"
+  },
+  "fetched": "2026-10-31",
+  "source": "Koios public API (no API key required)",
+  "identity": {
+    "kind": "tx-epoch-cross-fixture",
+    "note": "an epoch is not hashed by the chain, so this projection carries no hash of its own. Its checkable properties are ACROSS captures: every tx_hash here must have a tx_cbor capture, and for a transaction whose block is inside the captured Alonzo window the epoch_no here must equal the epoch_no the block_txs capture reports for the same transaction. The epoch is what selects the cost model a replay is charged under, so taking it from the chain rather than from a constant in the recorder is what stops an era-blind budget comparison from reappearing as a hard-coded number",
+    "cross_checks": [
+      "every tx_hash appears in some tx_cbor_*.fixture.json",
+      "for a tx inside the captured window, epoch_no == block_txs_alonzo_window's epoch_no for that tx_hash"
+    ]
+  },
+  "response": [
+    {
+      "tx_hash": "a95d16e891e51f98a3b1d3fe862ed355ebc8abffb7a7269d86f775553d9e653f",
+      "epoch_no": 290,
+      "block_height": 6236063,
+      "absolute_slot": 39917226
+    },
+    {
+      "tx_hash": "e9d20746cec2d506a5ae201adbfec13ef20279b689f0612cc3802274ce4da2ce",
+      "epoch_no": 290,
+      "block_height": 6236063,
+      "absolute_slot": 39917226
+    },
+    {
+      "tx_hash": "0ab94a1542a36f2be087627f5e1c7cdfeb26bc1b8672004a760a1fed93f3c336",
+      "epoch_no": 664,
+      "block_height": 14137078,
+      "absolute_slot": 201830930
+    },
+    {
+      "tx_hash": "b116d0a734c0369d79062004618dffbf5b6770e76a28114640913aa71eacbbac",
+      "epoch_no": 664,
+      "block_height": 14137078,
+      "absolute_slot": 201830930
+    },
+    {
+      "tx_hash": "82dc8232feaf701b97e3fe082d5909fd3c437f4adc6c37c7634bd8782a49b0ca",
+      "epoch_no": 664,
+      "block_height": 14139061,
+      "absolute_slot": 201870742
+    }
+  ]
+}
