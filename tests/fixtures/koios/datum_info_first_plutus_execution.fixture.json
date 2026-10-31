@@ -1,0 +1,25 @@
+{
+  "network": "cardano-mainnet",
+  "endpoint": "POST https://api.koios.rest/api/v1/datum_info",
+  "query": {
+    "_datum_hashes": [
+      "818ee3db3bbbd04f9f2ce21778cac3ac605802a4fcb00c8b3a58ee2dafc17d46"
+    ]
+  },
+  "fetched": "2026-10-31",
+  "source": "Koios public API (no API key required)",
+  "identity": {
+    "kind": "datum-blake2b-256",
+    "note": "blake2b-256(bytes) must equal the requested datum_hash"
+  },
+  "response": [
+    {
+      "datum_hash": "818ee3db3bbbd04f9f2ce21778cac3ac605802a4fcb00c8b3a58ee2dafc17d46",
+      "creation_tx_hash": "a95d16e891e51f98a3b1d3fe862ed355ebc8abffb7a7269d86f775553d9e653f",
+      "value": {
+        "bytes": "57656c636f6d6520746f20416c6f6e7a6f2045726121202d20466976652042696e6172696573207465616d"
+      },
+      "bytes": "582b57656c636f6d6520746f20416c6f6e7a6f2045726121202d20466976652042696e6172696573207465616d"
+    }
+  ]
+}

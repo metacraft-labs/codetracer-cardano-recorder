@@ -1,0 +1,34 @@
+{
+  "network": "cardano-mainnet",
+  "endpoint": "POST https://api.koios.rest/api/v1/utxo_info",
+  "query": {
+    "_utxo_refs": [
+      "7510385def92ad50602b75e519f733ed2acd248610aa5f920218ce8010acd4b4#0"
+    ],
+    "_extended": true
+  },
+  "fetched": "2026-10-31",
+  "source": "Koios public API (no API key required)",
+  "identity": {
+    "kind": "pre-babbage-datum-hash-only",
+    "note": "the spent output of the earliest mainnet Plutus execution is pre-Babbage: it names its datum by HASH and carries no inline datum, because CIP-32 did not exist. The datum identity is therefore proven ACROSS captures — blake2b-256(datum_info bytes) == this row datum_hash — which is a reading that can fail, rather than a hash check with nothing to hash"
+  },
+  "response": [
+    {
+      "tx_hash": "7510385def92ad50602b75e519f733ed2acd248610aa5f920218ce8010acd4b4",
+      "tx_index": 0,
+      "address": "addr1w984jz3aszhqxy466zmy64qv8l6ssrnhy58fm06sz93sq9s9edd6l",
+      "value": "7000000",
+      "stake_address": null,
+      "payment_cred": "4f590a3d80ae0312bad0b64d540c3ff5080e77250e9dbf5011630016",
+      "epoch_no": 290,
+      "block_height": 6236061,
+      "block_time": 1631483407,
+      "datum_hash": "818ee3db3bbbd04f9f2ce21778cac3ac605802a4fcb00c8b3a58ee2dafc17d46",
+      "inline_datum": null,
+      "reference_script": null,
+      "asset_list": [],
+      "is_spent": true
+    }
+  ]
+}
