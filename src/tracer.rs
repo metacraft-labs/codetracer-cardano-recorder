@@ -26,8 +26,10 @@
 //! trace comes from the real UPLC CEK machine evaluation, not from a
 //! hand-rolled expression evaluator". That was false in the file that defines
 //! the hand-rolled evaluator. The authoritative path is `crate::cek`, driven by
-//! the `replay` subcommand; CXP-ADA-1 retires this module once the compiler is
-//! invoked (deliverable 3).
+//! the `replay` subcommand. CXP-ADA-1 **deliverable 2** retires this module;
+//! the compiler invocation it was waiting for landed as `crate::compile`
+//! (deliverable 3, 2026-10-31) but does not back `record`, so this module is
+//! still the `record` path and is still what §2.2 grades.
 
 use std::collections::HashMap;
 use std::path::Path;

@@ -25,7 +25,33 @@ num-traits = "0.2"
 # `baeb591a` and is an ancestor of `origin/codetracer`.  The fork is the same
 # version (1.1.21) as the registry crate, so this is a drop-in redirect.
 uplc = { path = "../metacraft-aiken-fork/crates/uplc" }
+# CXP-ADA-1 deliverable 3: the compiler must actually be invoked, so the
+# artifact this recorder executes is the artifact the compiler produced rather
+# than one of our own parsing. The whole front-end this needs — the lexer and
+# parser (`parser::module`), the type checker (`UntypedModule::infer`), the
+# prelude (`builtins::{prelude, plutus, prelude_functions, prelude_data_types}`)
+# and the code generator (`CodeGenerator::generate_raw`) — is public in
+# `aiken-lang`, so this is the whole dependency and `aiken-project` is NOT
+# needed.
+#
+# THAT WAS MEASURED, not assumed, because the cost differs by a factor of
+# seven: `Cargo.lock` carries 269 packages without either, 301 with
+# `aiken-lang` (+32) and 479 with `aiken-project` as well (+210 — it pulls
+# `reqwest`, `tokio`, `zip`, `askama`, `notify`, `rayon` and miette's fancy
+# reporter for a project/validator/blueprint pipeline this repo has no subject
+# for: there is no `aiken.toml` anywhere in it and the corpus is 19 bare
+# modules).
+#
+# Same fork and same version (1.1.21) as the `uplc` path dep above, so the two
+# resolve to one checkout; CI already clones it (`03e3ec3`).
+aiken-lang = { path = "../metacraft-aiken-fork/crates/aiken-lang" }
 hex = "0.4"
+# Named directly because `aiken-lang`'s own API is in terms of it:
+# `TypedModule::register_definitions` and `CodeGenerator::new` take
+# `IndexMap`s, so a consumer has to be able to spell the type. Pinned to the
+# 1.x line `aiken-lang` uses, so this adds a dependency EDGE and not a version
+# — `Cargo.lock` already carried indexmap 1.9.3 once `aiken-lang` was added.
+indexmap = "1.9"
 pallas-primitives = "0.33"
 pallas-codec = "0.33"
 # CXP-ADA-2 acquisition: era-generic transaction decoding (`MultiEraTx`), the

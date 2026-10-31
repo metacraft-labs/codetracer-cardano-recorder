@@ -40,6 +40,22 @@
 #     charged under — a replay that did not say which cost model it used is the
 #     era-blind defect this landing closed
 #
+# And, since CXP-ADA-1 deliverable 3, the compiler invocation:
+#
+#   * `compile-corpus` keeps the CTFS-only convention and exposes `--live`
+#     (it reads one epoch's parameters, so it has a chain source)
+#   * it NAMES the compiler it invoked (`aiken-lang`), because a reading that
+#     did not say which front-end produced the artifact is exactly the
+#     "compiler never invoked" grade wearing a passing badge
+#   * it names the epoch AND era the artifacts were charged under, for the same
+#     reason `budget-oracle` must
+#   * it prints a `MEASURED:` population line carrying BOTH the modules the
+#     compiler accepted and the ones it REFUSED. A ratio printed without its
+#     refusals is a ratio over a narrowed corpus, which is the shape
+#     Chain-Support-Matrix.md §2.4 warns about
+#   * it says, per artifact, whether what ran was IDENTICAL to the compiler's
+#     output — the deliverable's whole clause
+#
 # Wire-up: see `Justfile` (`just lint` and `just test` both run this
 # script).
 #
@@ -145,7 +161,7 @@ assert_present "codetracer-cardano-recorder" "--version output" "${VERSION_OUT}"
 # live-chain gate, so a reading can never silently go to the network and can
 # never silently skip when it does not.
 
-for SUB in enumerate provenance eras prestate-strategy fixtures budget-oracle; do
+for SUB in enumerate provenance eras prestate-strategy fixtures budget-oracle compile-corpus; do
   SUB_HELP="$("${BIN}" "${SUB}" --help)"
   assert_absent "--format" "${SUB} --help" "${SUB_HELP}"
   assert_absent "CODETRACER_FORMAT" "${SUB} --help" "${SUB_HELP}"
@@ -154,7 +170,7 @@ done
 # The chain-reading subcommands expose the opt-in gate on the CLI as well as in
 # the environment.  `fixtures` deliberately does not: it reads only committed
 # captures and has nothing to opt in to.
-for SUB in enumerate provenance eras prestate-strategy budget-oracle; do
+for SUB in enumerate provenance eras prestate-strategy budget-oracle compile-corpus; do
   SUB_HELP="$("${BIN}" "${SUB}" --help)"
   assert_present "--live" "${SUB} --help" "${SUB_HELP}"
 done
@@ -206,6 +222,26 @@ assert_present "NOT MEASURED: none" "budget-oracle output" "${BUDGET_OUT}"
 # landing closed, wearing a passing badge.
 assert_present "epoch 290 (era Alonzo)" "budget-oracle output" "${BUDGET_OUT}"
 assert_present "epoch 664 (era Conway)" "budget-oracle output" "${BUDGET_OUT}"
+
+# ---------------------------------------------------------------------------
+# The CXP-ADA-1 deliverable-3 compiler invocation
+# ---------------------------------------------------------------------------
+#
+# `compile-corpus` must name the compiler it invoked, name the era it charged
+# the artifacts under, and print its population WITH the refusals. The three
+# together are what make the reading a reading: a run that printed a ratio
+# without naming the compiler could be the old source-simulating path, and one
+# that printed a ratio without its refusals would be reporting over a narrowed
+# corpus.
+COMPILE_OUT="$("${BIN}" compile-corpus 2>&1)"
+assert_present "koios-fixture" "compile-corpus output" "${COMPILE_OUT}"
+assert_present "the real Aiken compiler (aiken-lang" "compile-corpus output" "${COMPILE_OUT}"
+assert_present "epoch 664 (era Conway)" "compile-corpus output" "${COMPILE_OUT}"
+assert_present "MEASURED:" "compile-corpus output" "${COMPILE_OUT}"
+assert_present "refused by the compiler" "compile-corpus output" "${COMPILE_OUT}"
+assert_present "COMPILER REFUSED" "compile-corpus output" "${COMPILE_OUT}"
+assert_present "artifact IDENTICAL to the compiler's output" "compile-corpus output" "${COMPILE_OUT}"
+assert_present "executed the compiler's own bytes" "compile-corpus output" "${COMPILE_OUT}"
 
 # ---------------------------------------------------------------------------
 # Source-level references for the acquisition gate
