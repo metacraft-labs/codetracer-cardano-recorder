@@ -1,5 +1,5 @@
 // Exercises Aiken's closure literal `fn(x) { ... }` and the
-// `list.map` higher-order builtin.
+// `list.map` higher-order function from `aiken-lang/stdlib`.
 //
 // The recorder gained `Value::Closure { params, body_expr }` and
 // matching dispatch paths alongside this fixture:
@@ -21,7 +21,13 @@
 //   * `inc(10)` returns 11.
 //   * `list.map([1,2,3], fn(x) { x + 100 })` produces `[101,102,103]`
 //     (3 closure invocations).
+//   * The `when` takes the result apart and adds its elements.  This
+//     is what makes the map run: the compiler drops a binding nothing
+//     reads, so the module would otherwise pass with the closure
+//     never called.
 //   * `compute()` returns 6 + 11 + 101 + 102 + 103 = 323.
+
+use aiken/collection/list
 
 fn compute() -> Int {
   let inc = fn(x) { x + 1 }
@@ -29,8 +35,10 @@ fn compute() -> Int {
   let b = inc(10)
   let xs = [1, 2, 3]
   let mapped = list.map(xs, fn(x) { x + 100 })
-  let total = a + b + 101 + 102 + 103
-  total
+  when mapped is {
+    [first, second, third] -> a + b + first + second + third
+    _ -> 0
+  }
 }
 
 test higher_order() {

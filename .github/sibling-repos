@@ -5,3 +5,7 @@
 # run `repro lock refresh` and commit repro.lock. Do not add `=<ref>` here.
 codetracer-trace-format
 codetracer-trace-format-nim
+# The Aiken standard library, at aiken-lang rather than metacraft-labs. Its pin
+# comes from repro.lock like the others. tests/test_corpus_is_valid_aiken.rs
+# compiles test-programs/aiken/ against it.
+aiken-lang/stdlib

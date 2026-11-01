@@ -1004,6 +1004,39 @@ fn record_and_dump_full(test_name: &str, program: &str) -> Option<(serde_json::V
     Some((doc, source_path))
 }
 
+/// Like `observed_int_vars`, for a program with one parameter that
+/// is not an Int: `name` must appear exactly once and decode as the
+/// `Variant` `discriminator`, and is left out of the returned pairs.
+/// Every other variable is still held to the Int rule.
+fn observed_int_vars_except_variant(
+    doc: &serde_json::Value,
+    name: &str,
+    discriminator: &str,
+) -> Vec<(String, i64)> {
+    let mut doc = doc.clone();
+    let mut seen = 0;
+    for ev in doc["events"].as_array_mut().expect("events array") {
+        let Some(vars) = ev["vars"].as_array_mut() else {
+            continue;
+        };
+        vars.retain(|v| {
+            if v["varname"].as_str() != Some(name) {
+                return true;
+            }
+            seen += 1;
+            assert_eq!(v["value"]["kind"].as_str(), Some("Variant"), "{v}");
+            assert_eq!(
+                v["value"]["discriminator"].as_str(),
+                Some(discriminator),
+                "{v}"
+            );
+            false
+        });
+    }
+    assert_eq!(seen, 1, "`{name}` must be recorded exactly once");
+    observed_int_vars(&doc)
+}
+
 /// Decode every (varname, i64) pair from step events.  Rejects any
 /// `ValueRecord` variant other than `Int` with a hard error that
 /// asks the test author to extend the test rather than weaken it.
@@ -1669,13 +1702,13 @@ fn test_error_paths_test_via_ct_print_full() {
 
     let counts = &doc["counts"];
     // safe_path branch:
-    //   * 1 dispatch step (line 29: `compute() == 112`)
+    //   * 1 dispatch step (line 33: `compute() == 112`)
     //   * compute(): 2 let-binding steps + 1 trailing-expr step
     //   * safe_compute(): 1 param-intro is suppressed (no params), 3
     //     let-bindings + 1 trailing-expr = 4 steps
     //   = 1 + 3 + 4 = 8 steps so far.
     // failing_path branch:
-    //   * 1 dispatch step (line 33: `failing_compute() == 0`)
+    //   * 1 dispatch step (line 37: `failing_compute() == 0`)
     //   * failing_compute(): 1 param-intro suppressed, 2 let-bindings
     //     before the `fail` arm `break`s out = 2 steps,
     //     plus 1 trailing in-flight step that lands at the `fail`
@@ -1894,9 +1927,12 @@ fn test_tracing_test_emits_record_events() {
 /// outer block — Aiken's primary on-chain shape.  The recorder's
 /// parser gained validator-block awareness alongside this fixture
 /// (`spend` / `mint` / `else` / etc. inside a `validator <name> { ... }`
-/// block now register as function-table entries).  The strict pin
-/// asserts on the call sequence (compute → spend → redeemer_bonus
-/// then compute → mint → redeemer_bonus) and the per-step values.
+/// block now register as function-table entries).  `compute()` calls
+/// the handlers through the validator's name (`gift_card.spend(...)`),
+/// each returns Bool, and `score` turns each Bool into points.  The
+/// strict pin asserts on the call sequence (compute → spend →
+/// redeemer_bonus, compute → mint → redeemer_bonus, then compute →
+/// score twice) and the per-step values.
 #[test]
 fn test_validator_test_via_ct_print_full() {
     let Some((doc, source_path)) =
@@ -1915,9 +1951,10 @@ fn test_validator_test_via_ct_print_full() {
         .collect();
     // The function table includes the test fn (validator_smoke), the
     // free-function `compute()`, the validator's entry-point handlers
-    // `spend` / `mint`, and the shared helper `redeemer_bonus`, under
-    // the `<toplevel>` root the writer's `start` registers — see the
-    // "`<toplevel>` root frame" note above.
+    // `spend` / `mint`, the shared helper `redeemer_bonus` and the
+    // Bool-to-points helper `score`, under the `<toplevel>` root the
+    // writer's `start` registers — see the "`<toplevel>` root frame"
+    // note above.
     assert_eq!(
         functions,
         vec![
@@ -1926,15 +1963,19 @@ fn test_validator_test_via_ct_print_full() {
             "compute",
             "spend",
             "redeemer_bonus",
-            "mint"
+            "mint",
+            "score"
         ],
     );
 
     // ----- counts -----------------------------------------------------
     let counts = &doc["counts"];
-    assert_eq!(counts["steps"].as_u64(), Some(18), "steps; counts={counts}");
-    // 5 program calls + the `<toplevel>` root frame.
-    assert_eq!(counts["calls"].as_u64(), Some(6), "calls; counts={counts}");
+    // 1 in the test body, 6 in compute(), 3 in each handler, 1 in each
+    // redeemer_bonus, 3 in each score (the `when` line and both arms),
+    // plus one call-entry step for each of the 7 program calls.
+    assert_eq!(counts["steps"].as_u64(), Some(28), "steps; counts={counts}");
+    // 7 program calls + the `<toplevel>` root frame.
+    assert_eq!(counts["calls"].as_u64(), Some(8), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -1942,14 +1983,14 @@ fn test_validator_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 18 steps + 6 call_entry + 6 call_exit = 30 events.
-    assert_eq!(events.len(), 30, "events.len()");
+    // 28 steps + 8 call_entry + 8 call_exit = 44 events.
+    assert_eq!(events.len(), 44, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
-    // compute() → spend(2) → redeemer_bonus(2), then back to compute(),
-    // → mint(3) → redeemer_bonus(3), all nested in the `<toplevel>`
-    // root frame.
+    // compute() → spend(...) → redeemer_bonus(2), then back to compute(),
+    // → mint(...) → redeemer_bonus(3), then compute() → score twice, all
+    // nested in the `<toplevel>` root frame.
     assert_eq!(
         observed_call_sequence(&doc),
         vec![
@@ -1959,34 +2000,50 @@ fn test_validator_test_via_ct_print_full() {
             "redeemer_bonus".to_string(),
             "mint".to_string(),
             "redeemer_bonus".to_string(),
+            "score".to_string(),
+            "score".to_string(),
         ],
     );
 
     // ----- Decoded variable values ------------------------------------
-    // spend(2): amount=2 (param-intro in spend) → redeemer_bonus(2)
-    //   binds amount=2 in callee → bonus=20 → adjusted=21 (spend's
-    //   return).  Back in compute: spent=21.
-    // mint(3): action=3 → redeemer_bonus(3) (amount=3) → base=30 →
-    //   total=35 (mint's return).  Back in compute: minted=35.
+    // spend(None, 2, 0, 0): amount=2, _utxo=0, _self=0 (param-intro in
+    //   spend; `_datum` is `None`, which is not an Int) →
+    //   redeemer_bonus(2) binds amount=2 in callee → bonus=20 →
+    //   adjusted=21.  `adjusted == 21` holds, so spend returns True,
+    //   modelled as 1.  Back in compute: spend_ok=1.
+    // mint(3, 0, 0): action=3, _policy_id=0, _self=0 → redeemer_bonus(3)
+    //   (amount=3) → base=30 → total=35.  `total == 35` holds, so
+    //   mint_ok=1.
+    // score(spend_ok, 21) → spent=21; score(mint_ok, 35) → minted=35.
     // combined = 21 + 35 = 56.
     assert_eq!(
-        observed_var_sequence(&doc),
+        observed_int_vars_except_variant(&doc, "_datum", "None"),
         vec![
             ("amount".into(), 2),
+            ("_utxo".into(), 0),
+            ("_self".into(), 0),
             ("amount".into(), 2),
             ("bonus".into(), 20),
             ("adjusted".into(), 21),
-            ("spent".into(), 21),
+            ("spend_ok".into(), 1),
             ("action".into(), 3),
+            ("_policy_id".into(), 0),
+            ("_self".into(), 0),
             ("amount".into(), 3),
             ("base".into(), 30),
             ("total".into(), 35),
+            ("mint_ok".into(), 1),
+            ("accepted".into(), 1),
+            ("points".into(), 21),
+            ("spent".into(), 21),
+            ("accepted".into(), 1),
+            ("points".into(), 35),
             ("minted".into(), 35),
             ("combined".into(), 56),
         ],
     );
 
-    // ----- Return values: 20, 21, 30, 35, 56 ---------------------------
+    // ----- Return values: 20, 1, 30, 1, 21, 35, 56 ---------------------
     let returns: Vec<i64> = program_call_exits(&doc)
         .iter()
         .map(|e| {
@@ -1995,7 +2052,7 @@ fn test_validator_test_via_ct_print_full() {
             rv["i"].as_i64().expect("return value Int.i")
         })
         .collect();
-    assert_eq!(returns, vec![20, 21, 30, 35, 56]);
+    assert_eq!(returns, vec![20, 1, 30, 1, 21, 35, 56]);
 }
 
 // --- pattern_match_test.ak -------------------------------------------------
@@ -2625,6 +2682,8 @@ fn test_recursion_test_via_ct_print_full() {
 ///   * `list.map([1,2,3], fn(x) { x + 100 })` is recognised in
 ///     `eval_list_map` and dispatches the closure over each list
 ///     element, surfacing one Call/Return per iteration.
+///   * A `when` over `[first, second, third]` adds the map's result
+///     into compute()'s return value, so the map has to have run.
 ///
 /// The strict pin captures the call sequence (the `<toplevel>` root
 /// frame + compute + 2 closure inc(...) calls + 3 list.map closure
@@ -2688,7 +2747,8 @@ fn test_higher_order_test_via_ct_print_full() {
     // at the SAME exit step, so trace-format-nim's LIFO same-step
     // ordering (sort callsByExit by exit_step ASC, call_key DESC) emits
     // the last-opened iteration first → 103, 102, 101.  compute() is the
-    // outermost frame and exits last → 323.
+    // outermost frame and exits last → 323, which it can only reach by
+    // binding the three mapped elements in its `when` arm.
     let returns: Vec<i64> = program_call_exits(&doc)
         .iter()
         .map(|e| {

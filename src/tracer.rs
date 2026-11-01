@@ -1477,7 +1477,7 @@ impl AikenTracer {
     /// 4. Bare variable reference — read from `env` (preserves
     ///    structured shape, no UPLC round-trip).
     /// 5. Field access `<lhs>.<field>` — `Value::Record` or
-    ///    `Value::Tuple` (numeric index) projection.
+    ///    `Value::Tuple` (ordinal, `.1st`) projection.
     /// 6. Function call `f(args...)` — evaluate args via
     ///    `eval_expr_to_value`, recurse into `evaluate_function`,
     ///    return the callee's `Value` result.
@@ -1603,8 +1603,8 @@ impl AikenTracer {
 
         // 5. Field access: `<lhs>.<field>` — top-level dot, where
         // `<lhs>` resolves to a `Value::Record` or `Value::Tuple`
-        // and `<field>` is either a field name (Record) or numeric
-        // index (Tuple).
+        // and `<field>` is either a field name (Record) or an
+        // ordinal (Tuple, `.1st`, `.2nd`, ...).
         if let Some((lhs, field)) = split_top_level_dot(expr) {
             if let Some(base) = self.eval_expr_to_value(lhs, env, source_path, func_map)? {
                 match (&base, field) {
@@ -1613,11 +1613,10 @@ impl AikenTracer {
                             return Ok(Some(v.clone()));
                         }
                     }
-                    (Value::Tuple(elements), idx_str) => {
-                        if let Ok(idx) = idx_str.parse::<usize>() {
-                            if let Some(v) = elements.get(idx) {
-                                return Ok(Some(v.clone()));
-                            }
+                    (Value::Tuple(elements), ordinal) => {
+                        if let Some(v) = parse_tuple_ordinal(ordinal).and_then(|i| elements.get(i))
+                        {
+                            return Ok(Some(v.clone()));
                         }
                     }
                     _ => {}
@@ -1973,9 +1972,7 @@ fn resolve_field_accesses(expr: &str, env: &HashMap<String, Value>) -> String {
                                 .iter()
                                 .find(|(n, _)| n == field)
                                 .and_then(|(_, v)| v.as_i64()),
-                            Value::Tuple(elements) => field
-                                .parse::<usize>()
-                                .ok()
+                            Value::Tuple(elements) => parse_tuple_ordinal(field)
                                 .and_then(|idx| elements.get(idx))
                                 .and_then(|v| v.as_i64()),
                             _ => None,
@@ -2277,7 +2274,7 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
             (true, rest)
         } else if in_validator {
             // Inside a validator block, look for entry-point fn-shaped
-            // lines like `spend(args) -> Int {`.
+            // lines like `spend(args) -> Bool {`.
             if let Some(entry) = try_validator_entry(trimmed) {
                 (false, entry)
             } else {
@@ -2648,12 +2645,17 @@ fn find_top_level_is(s: &str) -> Option<usize> {
 ///   lookup — Aiken pattern semantics).
 /// * Constructor `None` — matches a `Value::Variant { discriminator:
 ///   "None", .. }`.
+/// * `True` / `False` — match the `Value::Int` the recorder models a
+///   Bool as.
 /// * Constructor with payload `Some(x)`, `Ok(v)`, `Error(e)` —
 ///   matches a `Value::Variant` with the same discriminator and
 ///   binds the single payload identifier to the inner contents.
 /// * Nested constructor patterns `Wrap(InnerActive(n))` —
 ///   recursively destructures each constructor level, binding any
 ///   identifier patterns to the corresponding payload value.
+/// * List patterns `[]` and `[a, b, c]` — match a `Value::List` of
+///   exactly that length, each element against its sub-pattern.  A
+///   `..tail` element is not modelled, so it does not match.
 fn match_pattern_against_value(
     pattern: &str,
     scrutinee: &Value,
@@ -2722,6 +2724,14 @@ fn match_pattern_against_value(
         if first.is_uppercase() {
             return match scrutinee {
                 Value::Variant { discriminator, .. } => discriminator == pattern,
+                // The recorder models Bool as Int (see
+                // `synthesize_builtin_result`), so `True` and `False`
+                // meet an `Int` scrutinee here.
+                Value::Int(v) => match pattern {
+                    "True" => *v != 0,
+                    "False" => *v == 0,
+                    _ => false,
+                },
                 _ => false,
             };
         }
@@ -2733,6 +2743,19 @@ fn match_pattern_against_value(
     if pattern == "[]" {
         return match scrutinee {
             Value::List(xs) => xs.is_empty(),
+            _ => false,
+        };
+    }
+    // Fixed-length list pattern `[a, b, c]`.
+    if let Some(sub_patterns) = parse_list_literal(pattern) {
+        return match scrutinee {
+            Value::List(xs) => {
+                sub_patterns.len() == xs.len()
+                    && sub_patterns
+                        .iter()
+                        .zip(xs.iter())
+                        .all(|(sub_pat, x)| match_pattern_against_value(sub_pat, x, env))
+            }
             _ => false,
         };
     }
@@ -2849,7 +2872,7 @@ fn parse_function_call(expr: &str) -> Option<(String, Vec<String>)> {
     if !expr.ends_with(')') {
         return None;
     }
-    let name = expr[..open].trim();
+    let name = strip_validator_qualifier(expr[..open].trim());
     if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return None;
     }
@@ -2890,6 +2913,20 @@ fn parse_function_call(expr: &str) -> Option<(String, Vec<String>)> {
     let inner = &expr[open + 1..expr.len() - 1];
     let args = split_top_level_commas(inner);
     Some((name.to_string(), args))
+}
+
+/// `gift_card.spend` names the handler `spend`, which the function
+/// table holds under its bare name.  Any other dotted name is returned
+/// unchanged and refused by the caller.  See `validator_test.ak`.
+fn strip_validator_qualifier(name: &str) -> &str {
+    match name.split_once('.') {
+        Some((validator, handler))
+            if is_simple_identifier(validator) && VALIDATOR_ENTRY_KEYWORDS.contains(&handler) =>
+        {
+            handler
+        }
+        _ => name,
+    }
 }
 
 /// Split a string on top-level commas (commas at depth 0 across all
@@ -2970,16 +3007,17 @@ fn parse_tuple_pattern(name: &str) -> Option<Vec<String>> {
 }
 
 /// Find a top-level `.` separator between a left-hand expression and
-/// a single trailing field name / numeric index.  Used by
+/// a single trailing field name / tuple ordinal.  Used by
 /// `eval_expr_to_value` to recognise field-access expressions like
-/// `p.x` (record field) or `pair.0` (tuple positional access).
+/// `p.x` (record field) or `pair.1st` (tuple positional access).
 ///
 /// Returns `(<lhs>, <field>)` when the input has the shape
-/// `<expr>.<simple-name-or-digits>` at top level (i.e. the dot is at
+/// `<expr>.<simple-name-or-ordinal>` at top level (i.e. the dot is at
 /// depth 0 across all bracket flavours).  Returns `None` for
 /// non-matching shapes — including chained accesses (`a.b.c`),
 /// arithmetic with `.` (we don't support floats), or anything where
-/// the field side isn't a simple ident / digit run.
+/// the field side isn't alphanumeric.  Whether the field means
+/// anything is the caller's question: see `parse_tuple_ordinal`.
 fn split_top_level_dot(expr: &str) -> Option<(&str, &str)> {
     let expr = expr.trim();
     let bytes = expr.as_bytes();
@@ -3009,6 +3047,24 @@ fn split_top_level_dot(expr: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((lhs, field))
+}
+
+/// The zero-based index an Aiken tuple ordinal names: `1st` is 0 and
+/// `2nd` is 1.  Aiken has no numeric projection, so `p.0` is not one.
+/// The suffix follows English ordinals (`11th`, `21st`), as the
+/// compiler's lexer requires.
+fn parse_tuple_ordinal(field: &str) -> Option<usize> {
+    let digits_end = field.find(|c: char| !c.is_ascii_digit())?;
+    let (digits, suffix) = field.split_at(digits_end);
+    let n: usize = digits.parse().ok()?;
+    let expected = match (n % 100, n % 10) {
+        (11..=13, _) => "th",
+        (_, 1) => "st",
+        (_, 2) => "nd",
+        (_, 3) => "rd",
+        _ => "th",
+    };
+    (n >= 1 && suffix == expected).then(|| n - 1)
 }
 
 /// Recognise an Aiken list literal `[expr, expr, ...]` and return the
@@ -3552,6 +3608,86 @@ test flow_test() {
         assert_eq!(env["sum_val"], 42);
         assert_eq!(env["doubled"], 84);
         assert_eq!(env["final_result"], 94);
+    }
+
+    #[test]
+    fn test_a_validator_handler_call_resolves_to_the_bare_handler() {
+        assert_eq!(
+            parse_function_call("gift_card.spend(None, 2)"),
+            Some((
+                "spend".to_string(),
+                vec!["None".to_string(), "2".to_string()]
+            ))
+        );
+        assert_eq!(parse_function_call("gift_card.other(1)"), None);
+        assert_eq!(parse_function_call("a.b.spend(1)"), None);
+    }
+
+    #[test]
+    fn test_tuple_ordinals_follow_the_compilers_spelling() {
+        assert_eq!(parse_tuple_ordinal("1st"), Some(0));
+        assert_eq!(parse_tuple_ordinal("2nd"), Some(1));
+        assert_eq!(parse_tuple_ordinal("3rd"), Some(2));
+        assert_eq!(parse_tuple_ordinal("4th"), Some(3));
+        assert_eq!(parse_tuple_ordinal("11th"), Some(10));
+        assert_eq!(parse_tuple_ordinal("21st"), Some(20));
+        for refused in ["0", "1", "0th", "1th", "2st", "11st", "st", ""] {
+            assert_eq!(parse_tuple_ordinal(refused), None, "{refused}");
+        }
+    }
+
+    #[test]
+    fn test_bool_patterns_match_the_int_a_bool_is_modelled_as() {
+        let mut env = HashMap::new();
+        assert!(match_pattern_against_value(
+            "True",
+            &Value::Int(1),
+            &mut env
+        ));
+        assert!(!match_pattern_against_value(
+            "False",
+            &Value::Int(1),
+            &mut env
+        ));
+        assert!(match_pattern_against_value(
+            "False",
+            &Value::Int(0),
+            &mut env
+        ));
+        assert!(!match_pattern_against_value(
+            "True",
+            &Value::Int(0),
+            &mut env
+        ));
+        assert!(!match_pattern_against_value(
+            "Other",
+            &Value::Int(1),
+            &mut env
+        ));
+    }
+
+    #[test]
+    fn test_list_patterns_match_a_list_of_exactly_their_length() {
+        let list = Value::List(vec![Value::Int(101), Value::Int(102)]);
+
+        let mut env = HashMap::new();
+        assert!(match_pattern_against_value("[a, b]", &list, &mut env));
+        assert_eq!(env["a"].as_i64(), Some(101));
+        assert_eq!(env["b"].as_i64(), Some(102));
+
+        let mut env = HashMap::new();
+        assert!(match_pattern_against_value("[_, 102]", &list, &mut env));
+        assert!(!match_pattern_against_value("[_, 103]", &list, &mut env));
+        assert!(!match_pattern_against_value("[a]", &list, &mut env));
+        assert!(!match_pattern_against_value("[a, b, c]", &list, &mut env));
+        assert!(!match_pattern_against_value("[]", &list, &mut env));
+        // A tail is not modelled, so it must not read as a binding.
+        assert!(!match_pattern_against_value("[a, ..rest]", &list, &mut env));
+        assert!(!match_pattern_against_value(
+            "[a, b]",
+            &Value::Int(1),
+            &mut env
+        ));
     }
 
     #[test]

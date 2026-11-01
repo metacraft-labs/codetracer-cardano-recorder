@@ -91,7 +91,10 @@ cargo test
 
 Test programs live in:
 
-- `test-programs/aiken/` -- Aiken smart contract examples
+- `test-programs/aiken/` -- Aiken smart contract examples. Every module must be
+  accepted by the real Aiken compiler, and its tests must pass when the compiler
+  runs them. `tests/test_corpus_is_valid_aiken.rs` checks this, using the
+  `aiken-lang/stdlib` checkout at `../stdlib` for the modules that import it.
 - `test-programs/uplc/` -- Raw UPLC programs
 
 ### Environment variables

@@ -5,6 +5,10 @@
 // `failing_compute()` triggers `fail` after computing a couple of
 // let-bindings — the recorder must still surface the bindings that
 // happened before the failure plus an error event for the fail.
+//
+// `failing_path` is declared `fail` because failing is its expected
+// outcome: without the keyword `aiken check` reports it as a failed
+// test.
 
 fn safe_compute() -> Int {
   let a = 5
@@ -29,6 +33,6 @@ test safe_path() {
   compute() == 112
 }
 
-test failing_path() {
+test failing_path() fail {
   failing_compute() == 0
 }

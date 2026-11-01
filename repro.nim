@@ -232,6 +232,9 @@ package codetracer_cardano_recorder:
     let ctPrintBuild = buildCtPrint(traceFormatNimRoot,
                                     after = @[testsBuild.action])
 
+    # ``tests/test_corpus_is_valid_aiken.rs`` compiles ``test-programs/aiken/``
+    # against the ``stdlib`` sibling at the fixed path ``../stdlib``, so moving
+    # that checkout re-runs the tests.
     let testsRun = cargo.test(
       locked = true,
       actionId = "codetracer-cardano-recorder.cargo-test-run",
@@ -240,7 +243,8 @@ package codetracer_cardano_recorder:
         "Cargo.toml", "Cargo.lock",
         "src", "tests", "test-programs",
         "target/debug/deps",
-        ctPrintPath(traceFormatNimRoot)
+        ctPrintPath(traceFormatNimRoot),
+        "../stdlib/aiken.toml", "../stdlib/lib"
       ])
 
     # ---- CLI-convention verification edge -----------------------------
