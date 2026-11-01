@@ -4014,3 +4014,61 @@ fn test_uplc_file_evaluation() {
     let result_term = eval_result.result().unwrap();
     assert_eq!(result_term, Term::Constant(Rc::new(Constant::Bool(true))));
 }
+
+/// `flow_test.uplc` is a hand-written fixture for the evaluator, and it must say
+/// so. The compiler's own optimiser reduces this very program to the constant
+/// `True`, so the arithmetic it spells out is exactly what a compiled script
+/// does not contain: read as "the compiled form of `flow_test.ak`" the file
+/// would promise a step stream the chain would never execute.
+///
+/// The pass applied here, `aiken_optimize_and_intern`, is the one the Aiken code
+/// generator ends in. This is why the assertions on the file's header sit next
+/// to a real run of the pass: the header's wording is checked against what the
+/// pass actually does to the file's own program, not against a claim.
+#[test]
+fn test_the_hand_written_flow_program_is_not_what_the_compiler_emits() {
+    let uplc_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-programs/uplc/flow_test.uplc");
+    let uplc_src = std::fs::read_to_string(&uplc_path).expect("failed to read flow_test.uplc");
+    let parsed = uplc::parser::program(&uplc_src).expect("flow_test.uplc should parse");
+
+    let hand_written: Program<NamedDeBruijn> =
+        parsed.clone().to_named_debruijn().expect("should convert");
+    let hand_written_cost = hand_written.eval(ExBudget::default()).cost();
+
+    let optimised = uplc::optimize::aiken_optimize_and_intern(parsed);
+    assert_eq!(
+        optimised.term,
+        Term::Constant(Rc::new(Constant::Bool(true))),
+        "the optimiser must reduce the fixture to its answer; if it no longer does, the fixture's \
+         header is out of date"
+    );
+    let optimised: Program<NamedDeBruijn> = optimised.to_named_debruijn().expect("should convert");
+    let optimised_cost = optimised.eval(ExBudget::default()).cost();
+    assert!(
+        hand_written_cost.cpu > optimised_cost.cpu && hand_written_cost.mem > optimised_cost.mem,
+        "the fixture must do work its optimised form does not: hand-written {hand_written_cost:?}, \
+         optimised {optimised_cost:?}"
+    );
+
+    let header: String = uplc_src
+        .lines()
+        .take_while(|line| line.starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for claim in ["UPLC equivalent of flow_test.ak", "mirrors the"] {
+        assert!(
+            !header.contains(claim),
+            "the header of {} claims the fixture is the compiled module ({claim:?}), and the \
+             assertions above show it is not",
+            uplc_path.display()
+        );
+    }
+    for statement in ["hand-written", "not what the compiler emits"] {
+        assert!(
+            header.contains(statement),
+            "the header of {} must state {statement:?}",
+            uplc_path.display()
+        );
+    }
+}
