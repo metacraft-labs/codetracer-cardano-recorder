@@ -3883,6 +3883,116 @@ fn test_multi_test_entry_test_via_ct_print_full() {
 // CLI env-var contract
 // ===========================================================================
 
+/// Records a one-off module and returns the recorder's refusal.  The
+/// tracer has no second chance at these: without the refusal each would
+/// exit 0 with a trace of some other program.  A refused module must also
+/// leave no container behind, which could be read as a recording of it.
+fn recording_error(source: &str) -> String {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let source_path = tmp_dir.path().join("refused.ak");
+    std::fs::write(&source_path, source).expect("the module must be writable");
+    let out_dir = tmp_dir.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let report = codetracer_cardano_recorder::recorder::record(&source_path, &out_dir)
+        .expect_err("the recorder must refuse this module");
+    let left: Vec<_> = std::fs::read_dir(&out_dir)
+        .expect("the output directory")
+        .map(|entry| entry.expect("a directory entry").path())
+        .collect();
+    assert!(left.is_empty(), "a refusal left {left:?}");
+    format!("{report:#}")
+}
+
+/// `p.0` is what `opaque_generic_test.ak` once spelled and the compiler
+/// refuses.  It used to record successfully with `first` unbound.
+#[test]
+fn test_a_numeric_tuple_projection_fails_the_recording() {
+    let message = recording_error(
+        "fn compute() -> Int {\n  let p = (7, 11)\n  let first = p.0\n  first\n}\n\n\
+         test t() {\n  compute() == 7\n}\n",
+    );
+    assert!(
+        message.contains("`p.0` is not a tuple projection"),
+        "{message}"
+    );
+}
+
+/// The same projection inside an expression takes a different path.
+#[test]
+fn test_a_numeric_tuple_projection_in_an_expression_fails_the_recording() {
+    let message = recording_error(
+        "fn compute() -> Int {\n  let p = (7, 11)\n  let x = p.0 + 1\n  x\n}\n\n\
+         test t() {\n  compute() == 8\n}\n",
+    );
+    assert!(
+        message.contains("`p.0` is not a tuple projection"),
+        "{message}"
+    );
+}
+
+/// A tuple ordinal past the end is refused the same way.
+#[test]
+fn test_a_tuple_ordinal_past_the_end_fails_the_recording() {
+    let message = recording_error(
+        "fn compute() -> Int {\n  let p = (7, 11)\n  let third = p.3rd\n  third\n}\n\n\
+         test t() {\n  compute() == 7\n}\n",
+    );
+    assert!(message.contains("2 element(s)"), "{message}");
+}
+
+/// `other.spend` names no validator.  Dropping the qualifier would
+/// trace `gift_card`'s handler instead of refusing the call.
+#[test]
+fn test_a_handler_call_through_an_undeclared_validator_fails_the_recording() {
+    let message = recording_error(
+        "validator gift_card {\n  mint(a: Int, _p: Data, _s: Data) {\n    a == 1\n  }\n}\n\n\
+         test t() {\n  other.mint(1, 0, 0)\n}\n",
+    );
+    assert!(message.contains("other.mint"), "{message}");
+}
+
+/// A refusal of the source is made before anything is written, so it leaves
+/// no recording behind to be mistaken for one.
+#[test]
+fn test_a_handler_refusal_writes_nothing() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let source_path = tmp_dir.path().join("refused.ak");
+    std::fs::write(
+        &source_path,
+        "validator gift_card {\n  mint(a: Int, _p: Data, _s: Data) {\n    a == 1\n  }\n}\n\n\
+         test t() {\n  other.mint(1, 0, 0)\n}\n",
+    )
+    .expect("the module must be writable");
+    let out_dir = tmp_dir.path().join("traces");
+    let report = codetracer_cardano_recorder::recorder::record(&source_path, &out_dir)
+        .expect_err("the recorder must refuse this module");
+    assert!(format!("{report:#}").contains("other.mint"), "{report:#}");
+    assert!(!out_dir.exists(), "a refusal must not create {out_dir:?}");
+}
+
+/// `helpers.mint` is valid Aiken and reaches the imported function: a dotted
+/// call is refused only when it would reach a handler by mistake.
+#[test]
+fn test_an_imported_function_named_like_a_handler_records() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let lib = tmp_dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(
+        lib.join("helpers.ak"),
+        "pub fn mint(x: Int) -> Int {\n  x + 1\n}\n",
+    )
+    .unwrap();
+    let source_path = tmp_dir.path().join("imports.ak");
+    std::fs::write(
+        &source_path,
+        "use my_project/helpers\n\ntest t() {\n  helpers.mint(1) == 2\n}\n",
+    )
+    .unwrap();
+    let out_dir = tmp_dir.path().join("traces");
+    codetracer_cardano_recorder::recorder::record(&source_path, &out_dir)
+        .expect("an imported function is not a handler");
+}
+
 /// `CODETRACER_CARDANO_RECORDER_OUT_DIR` must be honoured as a fallback
 /// for `--out-dir`.  Convention: `Recorder-CLI-Conventions.md` §5.
 #[test]

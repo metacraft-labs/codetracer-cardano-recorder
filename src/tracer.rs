@@ -588,6 +588,10 @@ impl AikenTracer {
         // step events carry the right path on the wire.  See
         // `module_imports_test.ak`.
         let (imported, module_sources) = load_imported_modules(source_path, source_code);
+        check_validator_handler_calls(
+            source_code,
+            module_sources.iter().map(|(_, module)| module.as_str()),
+        )?;
         functions.extend(imported);
         let opaque_type_names = collect_opaque_type_names(source_code);
         let const_decls = parse_const_declarations(source_code);
@@ -647,9 +651,30 @@ impl AikenTracer {
         // identifier.
         let func_map_for_consts: HashMap<String, &FunctionDef> =
             functions.iter().map(|f| (f.name.clone(), f)).collect();
-        tracer.consts = tracer.evaluate_consts(source_path, &const_decls, &func_map_for_consts)?;
-
-        tracer.evaluate_program(source_path, &functions)?;
+        let evaluated = tracer
+            .evaluate_consts(source_path, &const_decls, &func_map_for_consts)
+            .and_then(|consts| {
+                tracer.consts = consts;
+                tracer.evaluate_program(source_path, &functions)
+            });
+        if let Err(refusal) = evaluated {
+            // The container is already open, and what it holds so far would
+            // read as a recording of a program that was not recorded. The
+            // writer names it after the source, and has to let go of it first.
+            drop(tracer);
+            if let Some(stem) = source_path.file_stem() {
+                let partial = out_dir.join(stem).with_extension("ct");
+                if let Err(e) = std::fs::remove_file(&partial) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        return Err(refusal.wrap_err(format!(
+                            "cannot remove the partial recording {}: {e}",
+                            partial.display()
+                        )));
+                    }
+                }
+            }
+            return Err(refusal);
+        }
 
         // Surface every `fail @"..."` statement in the program as an
         // `EventLogKind::Error` io_event.  Per
@@ -1384,7 +1409,7 @@ impl AikenTracer {
         // be unresolvable — the UPLC compiler doesn't understand
         // dotted names — and `point_distance_sq` would silently
         // return `None`.
-        let resolved = resolve_field_accesses(expr, env);
+        let resolved = resolve_field_accesses(expr, env)?;
         let expr_str: &str = &resolved;
 
         // Check for comparison with function call: compute() == 94
@@ -1614,10 +1639,7 @@ impl AikenTracer {
                         }
                     }
                     (Value::Tuple(elements), ordinal) => {
-                        if let Some(v) = parse_tuple_ordinal(ordinal).and_then(|i| elements.get(i))
-                        {
-                            return Ok(Some(v.clone()));
-                        }
+                        return tuple_element(lhs, ordinal, elements).map(|v| Some(v.clone()));
                     }
                     _ => {}
                 }
@@ -1941,11 +1963,18 @@ fn value_env_to_i64_map(env: &HashMap<String, Value>) -> HashMap<String, i64> {
 /// projections are substituted; structured-valued projections stay
 /// in place (they'd just hit the same "unknown identifier" wall
 /// downstream).
-fn resolve_field_accesses(expr: &str, env: &HashMap<String, Value>) -> String {
+fn resolve_field_accesses(expr: &str, env: &HashMap<String, Value>) -> Result<String> {
     let bytes = expr.as_bytes();
     let mut out = String::with_capacity(expr.len());
     let mut i = 0usize;
     while i < bytes.len() {
+        // A string literal holds text, not field accesses.
+        if bytes[i] == b'"' {
+            let end = end_of_string_literal(expr, i);
+            out.push_str(&expr[i..end]);
+            i = end;
+            continue;
+        }
         let prev = if i == 0 { None } else { Some(bytes[i - 1]) };
         let at_word_boundary = match prev {
             None => true,
@@ -1972,9 +2001,9 @@ fn resolve_field_accesses(expr: &str, env: &HashMap<String, Value>) -> String {
                                 .iter()
                                 .find(|(n, _)| n == field)
                                 .and_then(|(_, v)| v.as_i64()),
-                            Value::Tuple(elements) => parse_tuple_ordinal(field)
-                                .and_then(|idx| elements.get(idx))
-                                .and_then(|v| v.as_i64()),
+                            Value::Tuple(elements) => {
+                                tuple_element(ident, field, elements)?.as_i64()
+                            }
                             _ => None,
                         };
                         if let Some(n) = resolved {
@@ -1991,7 +2020,38 @@ fn resolve_field_accesses(expr: &str, env: &HashMap<String, Value>) -> String {
         out.push(bytes[i] as char);
         i += 1;
     }
-    out
+    Ok(out)
+}
+
+/// The byte offset just past the string literal whose opening quote is at
+/// `open`.  Aiken escapes a quote as `\"`.  An unterminated literal runs to
+/// the end of `text`.
+fn end_of_string_literal(text: &str, open: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = open + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    text.len()
+}
+
+/// The element `<base>.<ordinal>` projects.  Aiken has no other tuple
+/// projection, so anything else is a program the compiler refuses.  This
+/// stops the recording rather than leave a trace with the value missing.
+fn tuple_element<'a>(base: &str, ordinal: &str, elements: &'a [Value]) -> Result<&'a Value> {
+    parse_tuple_ordinal(ordinal)
+        .and_then(|i| elements.get(i))
+        .ok_or_else(|| {
+            eyre!(
+                "`{base}.{ordinal}` is not a tuple projection: Aiken spells them `.1st`, `.2nd`, \
+                 ... and this tuple has {} element(s)",
+                elements.len()
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -2219,6 +2279,118 @@ fn collect_opaque_type_names(source: &str) -> std::collections::HashSet<String> 
         }
     }
     out
+}
+
+/// `source` with its comments and the contents of its string literals
+/// removed and its line breaks kept, so a scan of it sees only code.
+fn without_comments_and_strings(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0usize;
+    while i < source.len() {
+        let rest = &source[i..];
+        if rest.starts_with("//") {
+            i += rest.find('\n').unwrap_or(rest.len());
+        } else if rest.starts_with('"') {
+            let end = end_of_string_literal(source, i);
+            out.push_str("\"\"");
+            out.extend(source[i..end].chars().filter(|c| *c == '\n'));
+            i = end;
+        } else {
+            let c = rest.chars().next().expect("rest is not empty");
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
+/// Each handler name and the validators that declare it.  `code` is the
+/// output of `without_comments_and_strings`.  A validator header may span
+/// lines, and may take parameters, so a validator ends when the braces it
+/// opened have closed, not at the first line they balance on.
+fn validator_handlers(code: &str) -> HashMap<&str, Vec<&str>> {
+    let mut handlers: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut current: Option<&str> = None;
+    let mut depth = 0i32;
+    let mut opened = false;
+    for line in code.lines().map(str::trim) {
+        if current.is_none() {
+            if let Some(rest) = line.strip_prefix("validator ") {
+                let rest = rest.trim_start();
+                let end = rest
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                current = Some(&rest[..end]);
+                depth = 0;
+                opened = false;
+            }
+        }
+        let Some(validator) = current else {
+            continue;
+        };
+        if depth == 1 {
+            if let Some(entry) = try_validator_entry(line) {
+                let handler = &entry[..entry.find('(').unwrap_or(entry.len())];
+                handlers.entry(handler).or_default().push(validator);
+            }
+        }
+        opened |= line.contains('{');
+        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if opened && depth <= 0 {
+            current = None;
+        }
+    }
+    handlers
+}
+
+/// Refuse a call the bare-name function table would send to the wrong
+/// handler.  `strip_validator_qualifier` drops the qualifier of a dotted
+/// call and handlers are held by bare name, so when this module declares
+/// `spend`, `other.spend(...)` would trace that handler instead of what the
+/// program named, as would `a.spend(...)` when `b` declares `spend` too.
+///
+/// Only a call can go wrong: two validators may share a handler name, as
+/// they usually share `else`, and a dotted call to a name this module does
+/// not declare, such as `helpers.mint(...)`, reaches the imported function.
+/// `imported` is the source of each imported module, whose calls resolve
+/// through the same table.
+fn check_validator_handler_calls<'a>(
+    source: &str,
+    imported: impl Iterator<Item = &'a str>,
+) -> Result<()> {
+    let code = without_comments_and_strings(source);
+    let handlers = validator_handlers(&code);
+    if handlers.is_empty() {
+        return Ok(());
+    }
+    let imported_code: Vec<String> = imported.map(without_comments_and_strings).collect();
+    for line in std::iter::once(&code)
+        .chain(imported_code.iter())
+        .flat_map(|module| module.lines())
+    {
+        for (handler, validators) in &handlers {
+            for (at, _) in line.match_indices(&format!(".{handler}(")) {
+                let qualifier = line[..at]
+                    .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("");
+                if !validators.contains(&qualifier) {
+                    return Err(eyre!(
+                        "`{qualifier}.{handler}(...)` names no validator declaring `{handler}` \
+                         in this module, and the recorder holds handlers by bare name"
+                    ));
+                }
+                if validators.len() > 1 {
+                    return Err(eyre!(
+                        "`{qualifier}.{handler}(...)` is ambiguous: validators `{}` all declare \
+                         `{handler}`, and the recorder holds handlers by bare name",
+                        validators.join("`, `")
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_functions(source: &str) -> Vec<FunctionDef> {
@@ -2917,7 +3089,9 @@ fn parse_function_call(expr: &str) -> Option<(String, Vec<String>)> {
 
 /// `gift_card.spend` names the handler `spend`, which the function
 /// table holds under its bare name.  Any other dotted name is returned
-/// unchanged and refused by the caller.  See `validator_test.ak`.
+/// unchanged and refused by the caller.  This drops the qualifier, so
+/// `check_validator_handler_calls` has to have accepted the source
+/// first.  See `validator_test.ak`.
 fn strip_validator_qualifier(name: &str) -> &str {
     match name.split_once('.') {
         Some((validator, handler))
@@ -3608,6 +3782,88 @@ test flow_test() {
         assert_eq!(env["sum_val"], 42);
         assert_eq!(env["doubled"], 84);
         assert_eq!(env["final_result"], 94);
+    }
+
+    fn handler_check(source: &str) -> Result<()> {
+        check_validator_handler_calls(source, std::iter::empty())
+    }
+
+    #[test]
+    fn test_a_handler_call_must_name_a_validator_declaring_it() {
+        let module = "validator gift_card {\n  spend(a: Int) {\n    a == 1\n  }\n}\n";
+        let valid = format!("{module}fn f() {{\n  gift_card.spend(1)\n}}\n");
+        handler_check(&valid).expect("the declared validator is accepted");
+
+        let unknown = format!("{module}fn f() {{\n  other.spend(1)\n}}\n");
+        let err = handler_check(&unknown).expect_err("no validator `other`");
+        assert!(err.to_string().contains("other.spend"), "{err}");
+    }
+
+    #[test]
+    fn test_only_code_counts_as_a_handler_call() {
+        let module = "validator gift_card {\n  spend(a: Int) {\n    a == 1\n  }\n}\n";
+        handler_check(&format!("{module}// other.spend(1)\n")).expect("a comment is not a call");
+        handler_check(&format!(
+            "{module}fn f() {{\n  @\"other.spend(1) }} // \\\" {{\"\n}}\n"
+        ))
+        .expect("a string is not a call, and its braces and quotes are not code");
+    }
+
+    #[test]
+    fn test_a_handler_is_found_past_a_parameterised_multi_line_header() {
+        let module =
+            "validator gift_card(\n  limit: Int,\n) {\n  mint(a: Int) {\n    a < limit\n  }\n}\n";
+        handler_check(&format!("{module}fn f() {{\n  gift_card.mint(9, 1)\n}}\n"))
+            .expect("the declared validator is accepted");
+        let err = handler_check(&format!("{module}fn f() {{\n  other.mint(9, 1)\n}}\n"))
+            .expect_err("the handler was found, so `other` is refused");
+        assert!(err.to_string().contains("other.mint"), "{err}");
+    }
+
+    #[test]
+    fn test_a_dotted_call_to_a_name_no_validator_declares_is_left_alone() {
+        let module = "validator gift_card {\n  spend(a: Int) {\n    a == 1\n  }\n}\n";
+        handler_check(&format!("{module}fn f() {{\n  helpers.mint(1)\n}}\n"))
+            .expect("`helpers.mint` is an imported function");
+        handler_check("fn f() {\n  helpers.mint(1)\n}\n").expect("no validators at all");
+    }
+
+    #[test]
+    fn test_an_imported_module_cannot_reach_a_handler_by_accident() {
+        let module = "validator gift_card {\n  spend(a: Int) {\n    a == 1\n  }\n}\n";
+        let imported = "pub fn f() {\n  other.spend(1)\n}\n";
+        let err = check_validator_handler_calls(module, std::iter::once(imported))
+            .expect_err("the call would reach `gift_card`'s handler");
+        assert!(err.to_string().contains("other.spend"), "{err}");
+    }
+
+    #[test]
+    fn test_a_shared_handler_name_is_refused_only_when_it_is_called() {
+        let module = "validator a {\n  spend(x: Int) {\n    x == 1\n  }\n}\n\
+                      validator b {\n  spend(x: Int) {\n    x == 2\n  }\n}\n";
+        handler_check(module).expect("two validators may share a handler name");
+
+        let called = format!("{module}fn f() {{\n  a.spend(1)\n}}\n");
+        let err = handler_check(&called).expect_err("the table holds one `spend`");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn test_a_string_literal_is_not_read_for_field_accesses() {
+        let mut env = HashMap::new();
+        env.insert(
+            "p".to_string(),
+            Value::Tuple(vec![Value::Int(7), Value::Int(11)]),
+        );
+        assert_eq!(
+            resolve_field_accesses("p.1st + 1", &env).expect("a valid ordinal"),
+            "7 + 1"
+        );
+        assert!(resolve_field_accesses("p.0 + 1", &env).is_err());
+        assert_eq!(
+            resolve_field_accesses(r#"s == @"p.0""#, &env).expect("text is not a projection"),
+            r#"s == @"p.0""#
+        );
     }
 
     #[test]
