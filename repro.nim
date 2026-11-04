@@ -267,7 +267,7 @@ package codetracer_cardano_recorder:
     let cliVerify = shell(
       command = "bash tests/verify-cli-convention-no-silent-skip.sh",
       actionId = "codetracer-cardano-recorder.verify-cli-convention",
-      after = @[testsBuild.action],
+      after = @[testsRun.action],
       extraInputs = @[
         "tests/verify-cli-convention-no-silent-skip.sh",
         "Cargo.toml", "Cargo.lock", "src"
