@@ -25,7 +25,7 @@ fn add(a: Int, b: Int) -> Int {
   sum
 }
 
-fn pick(x: Option) -> Int {
+fn pick(x: Option<Int>) -> Int {
   when x is {
     Some(n) -> n
     None -> 0

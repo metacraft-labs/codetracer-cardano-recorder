@@ -21,7 +21,7 @@
 //   * `unwrap(Wrapper { inner: 42 })` returns 42.
 //   * `extract_first()` builds a tuple `(7, 11)`, calls
 //     `pair_first(pair)`, which projects the first element via
-//     `p.0`.  Returns 7.
+//     `p.1st`, Aiken's spelling of tuple projection.  Returns 7.
 //   * `compute()` sums them: 42 + 7 = 49.
 
 opaque type Wrapper {
@@ -34,7 +34,7 @@ fn unwrap(w: Wrapper) -> Int {
 }
 
 fn pair_first(p: (Int, Int)) -> Int {
-  let first = p.0
+  let first = p.1st
   first
 }
 

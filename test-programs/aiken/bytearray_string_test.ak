@@ -17,10 +17,10 @@
 //
 // Compute path (all integer arithmetic so the test body still drives
 // the existing UPLC-CEK pipeline):
-//   * `payload_len()` returns 4 (length-of the hex literal #"deadbeef"
-//     stored in `payload`, which is 4 bytes — `deadbeef` is two-hex-
-//     chars-per-byte so 8 hex chars = 4 bytes).
-//   * `name_len()` returns 3 (length-of the text literal "FOO").
+//   * `payload_len()` returns the literal 4, which is the length of
+//     the hex literal in `payload` but is not computed from it: nothing
+//     reads `payload`, so the compiler drops it.
+//   * `name_len()` returns the literal 3, on the same terms for "FOO".
 //   * `compute()` sums them: 4 + 3 = 7.
 
 fn payload_len() -> Int {

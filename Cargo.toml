@@ -27,3 +27,13 @@ ureq = { version = "3", features = ["json"] }
 # Reads the recorded `paths.dat` line-count table back in tests.
 codetracer_trace_reader = { path = "../codetracer-trace-format/codetracer_trace_reader" }
 tempfile = "3"
+# The compiler's own front-end and code generator, for the fixture gate in
+# `tests/test_corpus_is_valid_aiken.rs` and nothing else: no code in `src/`
+# reaches it. The version is the `uplc` dependency's, so the graph keeps one
+# `uplc` and the gate evaluates what it compiled with the machine the recorder
+# links.
+aiken-lang = "1.1.21"
+# `aiken-lang`'s `CodeGenerator::new` and `register_definitions` take
+# `IndexMap`s, so the gate has to name the type. This is the 1.x line
+# `aiken-lang` itself uses.
+indexmap = "1.9"

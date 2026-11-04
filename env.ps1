@@ -40,6 +40,9 @@ if (-not (Test-Path $codetracerEnv)) {
 }
 . $codetracerEnv
 
+# Select the genuine configured upstream hooks, preserving every rule.
+$env:PREK_NO_FAST_PATH = "1"
+
 # --- 2. Explicit MSVC linker (immune to Git Bash PATH reordering) -----------
 if ($env:WINDOWS_DIY_CL_EXE -and (Test-Path $env:WINDOWS_DIY_CL_EXE)) {
     $msvcBin = Split-Path -Parent $env:WINDOWS_DIY_CL_EXE

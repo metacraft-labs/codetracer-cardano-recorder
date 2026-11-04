@@ -23,10 +23,29 @@
 //! resulting `.ct` container through `ct-print --json`.  See
 //! `AUDIT-CTFS-2026-05.md` ("Convention compliance follow-up") for
 //! the full record.
+//!
+//! Reading a container back has three outcomes, and each has its own remedy:
+//!
+//! * `ct-print` is absent: the test skips and says so on stderr
+//!   (`ct_print_or_skip`). `just test` builds the binary first, so this state
+//!   is only reachable through a bare `cargo test`.
+//! * `ct-print` is present and refuses the container: the test FAILS with a
+//!   report that quotes the reader and names the remedy (`read_container`).
+//! * `ct-print` is present and reads the container: the test asserts on the
+//!   content.
+//!
+//! No mocks: the tests of that decision drive the real `ct-print` over a really
+//! recorded container, and classify real modification times on real files. A
+//! fake reader would only repeat what this file expects a refusal to look like,
+//! when the point is to quote what the reader actually says. The one test that
+//! re-runs this binary as a child does so because libtest's output capture is
+//! the thing under test.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::rc::Rc;
+use std::time::{Duration, SystemTime};
 
 use num_bigint::BigInt;
 use uplc::ast::{Constant, NamedDeBruijn, Program, Term};
@@ -51,6 +70,169 @@ fn ct_print_path() -> PathBuf {
         .join("..")
         .join("codetracer-trace-format-nim")
         .join(format!("ct-print{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// The Nim sources `ct-print` is built from, in the same sibling checkout.
+fn ct_print_sources_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("codetracer-trace-format-nim")
+        .join("src")
+}
+
+/// Whether a `ct-print` binary was built from the sources beside it.
+///
+/// Nothing but `just build-ct-print` rebuilds the binary, while cargo rebuilds
+/// the recorder's writer from those same sources whenever they change. So an
+/// old binary is the one way a recorder and its reader come to disagree in a
+/// single checkout, and it is worth telling apart from a real disagreement.
+#[derive(Debug, PartialEq, Eq)]
+enum CtPrintFreshness {
+    /// The binary is older than `newest_source` by `older_by`.
+    Stale {
+        newest_source: PathBuf,
+        older_by: Duration,
+    },
+    /// The binary is at least as new as every Nim source.
+    Current,
+    /// The times could not be compared; the string says why.
+    Undetermined(String),
+}
+
+/// The most recently modified `.nim` file under `dir`, if there is one.
+fn newest_nim_source(dir: &Path) -> std::io::Result<Option<(SystemTime, PathBuf)>> {
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let candidate = if path.is_dir() {
+            newest_nim_source(&path)?
+        } else if path.extension().is_some_and(|ext| ext == "nim") {
+            Some((std::fs::metadata(&path)?.modified()?, path))
+        } else {
+            None
+        };
+        if let Some(found) = candidate {
+            if newest.as_ref().is_none_or(|(time, _)| found.0 > *time) {
+                newest = Some(found);
+            }
+        }
+    }
+    Ok(newest)
+}
+
+/// Compare `binary` with the newest `.nim` file under `sources_dir`.
+///
+/// This only ever classifies a failure that has already happened. A checkout's
+/// modification times are not evidence that a binary which reads a container
+/// correctly is wrong, so a read that succeeds never consults them.
+fn ct_print_freshness(binary: &Path, sources_dir: &Path) -> CtPrintFreshness {
+    let binary_time = match std::fs::metadata(binary).and_then(|m| m.modified()) {
+        Ok(time) => time,
+        Err(err) => {
+            return CtPrintFreshness::Undetermined(format!(
+                "cannot read the modification time of {}: {err}",
+                binary.display()
+            ));
+        }
+    };
+    match newest_nim_source(sources_dir) {
+        Ok(Some((source_time, newest_source))) => match source_time.duration_since(binary_time) {
+            Ok(older_by) if !older_by.is_zero() => CtPrintFreshness::Stale {
+                newest_source,
+                older_by,
+            },
+            _ => CtPrintFreshness::Current,
+        },
+        Ok(None) => CtPrintFreshness::Undetermined(format!(
+            "no .nim file found under {}",
+            sources_dir.display()
+        )),
+        Err(err) => {
+            CtPrintFreshness::Undetermined(format!("cannot walk {}: {err}", sources_dir.display()))
+        }
+    }
+}
+
+/// What to do about a refusal. The reader's own message advises re-recording,
+/// which is the wrong remedy for both of the states this repo can be in, because
+/// the recording in question was written moments ago by the current sources.
+fn refusal_remedy(freshness: &CtPrintFreshness) -> String {
+    match freshness {
+        CtPrintFreshness::Stale {
+            newest_source,
+            older_by,
+        } => format!(
+            "STALE: this binary is {}s older than {}. Rebuild it with \
+             `just build-ct-print` in the codetracer-trace-format-nim checkout. \
+             Re-recording will not help: cargo already rebuilt the recorder's \
+             writer from those sources, so a new recording has the same revision.",
+            older_by.as_secs(),
+            newest_source.display()
+        ),
+        // A modification time only says when the file arrived, so "not older" is
+        // evidence about a binary built here and none about one copied or restored
+        // here. A schema-6 binary copied with a plain `cp` lands in this arm, so the
+        // report must not close off the rebuild that would fix it.
+        CtPrintFreshness::Current => "This binary is not older than its sources. If it \
+             was built here, the writer and the reader disagree on the format revision, \
+             or the reader found the defect quoted above. Rebuilding will not help: fix \
+             the side of codetracer-trace-format-nim or codetracer-trace-format that \
+             moved. If it was copied or restored here, its modification time proves \
+             nothing: run `just build-ct-print` first to rule that out."
+            .to_string(),
+        CtPrintFreshness::Undetermined(why) => format!(
+            "Could not tell whether this binary is stale ({why}). Rebuild it with \
+             `just build-ct-print` in the codetracer-trace-format-nim checkout; if it \
+             still refuses, the writer and the reader disagree on the format revision."
+        ),
+    }
+}
+
+/// Read `container` with the sibling's `ct-print`, or return a report of why it
+/// would not. Every test that reads a container goes through here, and panics
+/// with the report: a reader that is present and refuses is a failure, never a
+/// skip.
+fn read_container(ct_print: &Path, args: &[&str], container: &Path) -> Result<Output, String> {
+    read_container_against(ct_print, &ct_print_sources_dir(), args, container)
+}
+
+/// `read_container`, with the directory the binary's staleness is judged
+/// against spelled out so that tests can put both classifications to the real
+/// binary without rewriting it.
+fn read_container_against(
+    ct_print: &Path,
+    sources_dir: &Path,
+    args: &[&str],
+    container: &Path,
+) -> Result<Output, String> {
+    let command = format!(
+        "{} {} {}",
+        ct_print.display(),
+        args.join(" "),
+        container.display()
+    );
+    let output = match Command::new(ct_print).args(args).arg(container).output() {
+        Ok(output) => output,
+        Err(err) => {
+            return Err(format!(
+                "ct-print at {} could not be started: {err}\ncommand: {command}\n\
+                 The reader never saw the container, so this says nothing about the \
+                 format. Rebuild it with `just build-ct-print`.",
+                ct_print.display()
+            ));
+        }
+    };
+    if output.status.success() {
+        return Ok(output);
+    }
+    Err(format!(
+        "ct-print at {} refused a container ({})\ncommand: {command}\n\
+         --- the reader's stderr, verbatim ---\n{}\n--- end of the reader's stderr ---\n{}",
+        ct_print.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        refusal_remedy(&ct_print_freshness(ct_print, sources_dir))
+    ))
 }
 
 /// Helper: collect every `.ct` file in `out_dir`.
@@ -181,6 +363,301 @@ fn test_aiken_cli_record() {
 }
 
 // ===========================================================================
+// The reader's three states: absent, present and refusing, present and reading
+// ===========================================================================
+
+/// Record `flow_test.ak` and return the container, with the directory that
+/// keeps it alive.
+fn record_flow_test_container() -> (tempfile::TempDir, PathBuf) {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = tmp_dir.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let source_path = test_programs_dir().join("flow_test.ak");
+    run_tracer_on_file(&source_path, &out_dir);
+    let container = assert_valid_ct_file(&out_dir);
+    (tmp_dir, container)
+}
+
+/// Overwrite the schema version in `container`'s `meta.dat` with one no reader
+/// accepts, and return the version that was there.
+///
+/// `meta.dat` starts with the magic `CTMD`, then the version as a little-endian
+/// u16 (`codetracer-trace-format-nim/src/codetracer_trace_writer/meta_dat.nim`).
+/// The search must find exactly one magic: with none there would be nothing to
+/// patch, so a later "the reader accepted it" could mean anything.
+fn patch_meta_dat_schema_version(container: &Path) -> u16 {
+    const META_DAT_MAGIC: &[u8; 4] = b"CTMD";
+    const REFUSED_VERSION: u16 = u16::MAX;
+    let mut bytes = std::fs::read(container).expect("read container");
+    let found: Vec<usize> = bytes
+        .windows(META_DAT_MAGIC.len())
+        .enumerate()
+        .filter(|(_, window)| window == META_DAT_MAGIC)
+        .map(|(offset, _)| offset)
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one meta.dat magic in {}, found them at {found:?}",
+        container.display()
+    );
+    let version_at = found[0] + META_DAT_MAGIC.len();
+    let original = u16::from_le_bytes([bytes[version_at], bytes[version_at + 1]]);
+    assert_ne!(
+        original, REFUSED_VERSION,
+        "this version would not be refused"
+    );
+    bytes[version_at..version_at + 2].copy_from_slice(&REFUSED_VERSION.to_le_bytes());
+    std::fs::write(container, bytes).expect("write patched container");
+    original
+}
+
+/// A sources directory holding one `.nim` file modified at `time`, to put a real
+/// `ct-print` on either side of the staleness comparison. Moving the source's
+/// time rather than the binary's means the binary is never rewritten: writing an
+/// executable while parallel tests fork can make its exec fail with ETXTBSY.
+fn sources_dir_modified_at(time: SystemTime) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = std::fs::File::create(dir.path().join("reader.nim")).expect("create source");
+    file.set_modified(time).expect("set source mtime");
+    dir
+}
+
+fn modified_time(path: &Path) -> SystemTime {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .expect("read mtime")
+}
+
+const ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A refused container and the stderr of the same refusal, obtained directly
+/// from the reader so the report can be checked against its actual words. Also
+/// the control: the container reads before the patch, so the patch is what the
+/// reader refuses.
+fn refused_container(ct_print: &Path) -> (tempfile::TempDir, PathBuf, String) {
+    let (tmp_dir, container) = record_flow_test_container();
+    read_container(ct_print, &["--json"], &container).unwrap_or_else(|report| panic!("{report}"));
+    patch_meta_dat_schema_version(&container);
+    let direct = Command::new(ct_print)
+        .arg("--json")
+        .arg(&container)
+        .output()
+        .expect("run ct-print");
+    assert!(
+        !direct.status.success(),
+        "the patched version must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&direct.stderr)
+        .trim_end()
+        .to_string();
+    assert!(
+        stderr.contains("schema version 65535 is not supported"),
+        "the refusal should be the reader's schema check, got: {stderr}"
+    );
+    (tmp_dir, container, stderr)
+}
+
+#[test]
+fn test_refusal_by_a_stale_binary_says_rebuild() {
+    let Some(ct_print) = ct_print_or_skip("test_refusal_by_a_stale_binary_says_rebuild") else {
+        return;
+    };
+    let (_tmp, container, stderr) = refused_container(&ct_print);
+    let sources = sources_dir_modified_at(modified_time(&ct_print) + ONE_DAY);
+
+    let report = read_container_against(&ct_print, sources.path(), &["--json"], &container)
+        .expect_err("a refusal must be an Err");
+
+    assert!(report.contains(&stderr), "reader not quoted: {report}");
+    assert!(
+        report.contains(&ct_print.display().to_string()),
+        "binary not named: {report}"
+    );
+    assert!(report.contains("STALE"), "wrong state: {report}");
+    assert!(
+        report.contains("`just build-ct-print`"),
+        "no remedy: {report}"
+    );
+    assert!(
+        report.contains("Re-recording will not help"),
+        "wrong remedy: {report}"
+    );
+    assert!(
+        !report.contains("Rebuilding will not help"),
+        "contradictory remedy: {report}"
+    );
+}
+
+#[test]
+fn test_refusal_by_a_current_binary_says_rebuilding_will_not_help() {
+    let Some(ct_print) =
+        ct_print_or_skip("test_refusal_by_a_current_binary_says_rebuilding_will_not_help")
+    else {
+        return;
+    };
+    let (_tmp, container, stderr) = refused_container(&ct_print);
+    let sources = sources_dir_modified_at(modified_time(&ct_print) - ONE_DAY);
+
+    let report = read_container_against(&ct_print, sources.path(), &["--json"], &container)
+        .expect_err("a refusal must be an Err");
+
+    assert!(report.contains(&stderr), "reader not quoted: {report}");
+    assert!(
+        report.contains(&ct_print.display().to_string()),
+        "binary not named: {report}"
+    );
+    assert!(
+        report.contains("the writer and the reader disagree on the format revision"),
+        "wrong state: {report}"
+    );
+    assert!(
+        report.contains("Rebuilding will not help"),
+        "wrong remedy: {report}"
+    );
+    assert!(!report.contains("STALE"), "wrong state: {report}");
+    assert!(
+        report.contains("If it was copied or restored here"),
+        "a copied binary's time is not evidence: {report}"
+    );
+}
+
+/// A binary that cannot start never read the container, so the report must not
+/// blame the format, whatever the modification times say.
+#[test]
+fn test_reader_that_cannot_start_does_not_blame_the_format() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let not_executable = dir.path().join("ct-print");
+    std::fs::write(&not_executable, b"not a program").unwrap();
+    let container = dir.path().join("unread.ct");
+
+    let report = read_container(&not_executable, &["--json"], &container)
+        .expect_err("a binary that cannot start must be an Err");
+
+    assert!(report.contains("could not be started"), "{report}");
+    assert!(report.contains("`just build-ct-print`"), "{report}");
+    assert!(
+        !report.contains("disagree on the format revision"),
+        "blamed the format: {report}"
+    );
+}
+
+/// Staleness classifies a failure and nothing else: a binary older than its
+/// sources that reads the container is a successful read.
+#[test]
+fn test_staleness_never_fails_a_successful_read() {
+    let Some(ct_print) = ct_print_or_skip("test_staleness_never_fails_a_successful_read") else {
+        return;
+    };
+    let (_tmp, container) = record_flow_test_container();
+    let sources = sources_dir_modified_at(modified_time(&ct_print) + ONE_DAY);
+    assert!(
+        matches!(
+            ct_print_freshness(&ct_print, sources.path()),
+            CtPrintFreshness::Stale { .. }
+        ),
+        "the control: this binary must count as stale here"
+    );
+
+    let output = read_container_against(&ct_print, sources.path(), &["--json"], &container)
+        .unwrap_or_else(|report| panic!("{report}"));
+
+    assert!(!output.stdout.is_empty(), "the read produced no output");
+}
+
+#[test]
+fn test_ct_print_freshness_compares_real_modification_times() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let binary = dir.path().join("ct-print");
+    let sources = dir.path().join("src");
+    let nested = sources.join("deep");
+    std::fs::create_dir_all(&nested).unwrap();
+    let base = SystemTime::now() - ONE_DAY;
+    let binary_file = std::fs::File::create(&binary).unwrap();
+    binary_file.set_modified(base).unwrap();
+
+    assert!(
+        matches!(
+            ct_print_freshness(&binary, &sources),
+            CtPrintFreshness::Undetermined(_)
+        ),
+        "no sources to compare with"
+    );
+
+    let older = std::fs::File::create(sources.join("older.nim")).unwrap();
+    older.set_modified(base - ONE_DAY).unwrap();
+    assert_eq!(
+        ct_print_freshness(&binary, &sources),
+        CtPrintFreshness::Current
+    );
+
+    // Equal times are not stale: the binary is not older than the source.
+    older.set_modified(base).unwrap();
+    assert_eq!(
+        ct_print_freshness(&binary, &sources),
+        CtPrintFreshness::Current
+    );
+
+    // Only Nim sources count, however new another file is.
+    let notes = std::fs::File::create(nested.join("notes.txt")).unwrap();
+    notes.set_modified(base + ONE_DAY).unwrap();
+    assert_eq!(
+        ct_print_freshness(&binary, &sources),
+        CtPrintFreshness::Current
+    );
+
+    // A newer source is found however deep it is.
+    let newer_path = nested.join("newer.nim");
+    let newer = std::fs::File::create(&newer_path).unwrap();
+    newer.set_modified(base + ONE_DAY).unwrap();
+    match ct_print_freshness(&binary, &sources) {
+        CtPrintFreshness::Stale {
+            newest_source,
+            older_by,
+        } => {
+            assert_eq!(newest_source, newer_path);
+            assert_eq!(older_by, ONE_DAY);
+        }
+        other => panic!("expected Stale, got {other:?}"),
+    }
+}
+
+/// The absent state must be SAID under cargo's default output capture, because a
+/// skipped test counts as passed and a passing test's captured output is thrown
+/// away. Capture is a property of the test harness, so this re-runs this very
+/// test binary as a child, capture on, with an absent path.
+#[test]
+fn test_absent_ct_print_is_said_under_default_capture() {
+    const NAME: &str = "test_absent_ct_print_is_said_under_default_capture";
+    const CHILD_ABSENT_PATH: &str = "CT_PRINT_ABSENT_PATH_FOR_CHILD_TEST";
+    if let Some(path) = std::env::var_os(CHILD_ABSENT_PATH) {
+        assert!(ct_print_at_or_skip("probe", PathBuf::from(path)).is_none());
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let absent = dir.path().join("no-such-ct-print");
+    let child = Command::new(std::env::current_exe().expect("current_exe"))
+        .args([NAME, "--exact"])
+        .env(CHILD_ABSENT_PATH, &absent)
+        .output()
+        .expect("run this test binary");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    let stderr = String::from_utf8_lossy(&child.stderr);
+
+    assert!(child.status.success(), "child failed: {stdout}\n{stderr}");
+    // The control: the filter matched, so the child really ran the skip.
+    assert!(stdout.contains("1 passed"), "child ran nothing: {stdout}");
+    assert!(
+        stderr.contains(&format!(
+            "SKIP: probe requires ct-print at {}",
+            absent.display()
+        )),
+        "the skip was not said; stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+// ===========================================================================
 // CTFS content via `ct-print` — replaces the legacy `--format json` test
 // ===========================================================================
 
@@ -208,15 +685,9 @@ fn test_aiken_cli_record() {
 /// `{"kind":"Int","i":42,"type_id":N}`.
 #[test]
 fn test_recorded_trace_via_ct_print_json() {
-    let ct_print = ct_print_path();
-    if !ct_print.exists() {
-        eprintln!(
-            "SKIP: ct-print not found at {} — only available within the \
-             metacraft workspace where codetracer-trace-format-nim is a sibling.",
-            ct_print.display()
-        );
+    let Some(ct_print) = ct_print_or_skip("test_recorded_trace_via_ct_print_json") else {
         return;
-    }
+    };
 
     let tmp_dir = tempfile::tempdir().expect("tempdir");
     let out_dir = tmp_dir.path().join("traces");
@@ -238,17 +709,8 @@ fn test_recorded_trace_via_ct_print_json() {
     // Kept as a safety net so a regression in the textual rendering
     // is caught even if --full's JSON shape evolves.
     // -----------------------------------------------------------------
-    let output = Command::new(&ct_print)
-        .args(["--json"])
-        .arg(&ct_files[0])
-        .output()
-        .expect("failed to run ct-print");
-
-    assert!(
-        output.status.success(),
-        "ct-print --json should succeed; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let output = read_container(&ct_print, &["--json"], &ct_files[0])
+        .unwrap_or_else(|report| panic!("{report}"));
 
     let stdout_json = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -279,17 +741,8 @@ fn test_recorded_trace_via_ct_print_json() {
     // -----------------------------------------------------------------
     // Layer 2 (the upgrade): ct-print --full — exact decoded values.
     // -----------------------------------------------------------------
-    let full_output = Command::new(&ct_print)
-        .args(["--full", "--strip-paths"])
-        .arg(&ct_files[0])
-        .output()
-        .expect("failed to run ct-print --full");
-
-    assert!(
-        full_output.status.success(),
-        "ct-print --full should succeed; stderr: {}",
-        String::from_utf8_lossy(&full_output.stderr)
-    );
+    let full_output = read_container(&ct_print, &["--full", "--strip-paths"], &ct_files[0])
+        .unwrap_or_else(|report| panic!("{report}"));
 
     let doc: serde_json::Value = serde_json::from_slice(&full_output.stdout)
         .expect("ct-print --full should emit valid JSON");
@@ -489,22 +942,31 @@ fn test_recorded_trace_via_ct_print_json() {
 // * it contributes **no** step — `start` emits the entry step at
 //   `(path, line)` regardless — so step counts are unaffected.
 
-/// Skip-helper: returns `Some(path)` to ct-print or logs a clear
-/// `SKIP:` diagnostic and returns `None`.  The
-/// `verify-cli-convention-no-silent-skip.sh` script greps for the
-/// literal `SKIP:` token, so silent skips remain forbidden.
+/// Skip-helper: returns `Some(path)` to ct-print or says `SKIP:` and returns
+/// `None`.
 fn ct_print_or_skip(test_name: &str) -> Option<PathBuf> {
-    let p = ct_print_path();
-    if !p.exists() {
-        eprintln!(
-            "SKIP: {test_name} requires ct-print at {} — only available \
-             within the metacraft workspace where codetracer-trace-format-nim \
-             is a sibling.",
-            p.display()
-        );
-        return None;
+    ct_print_at_or_skip(test_name, ct_print_path())
+}
+
+/// `ct_print_or_skip` for an explicit path.
+///
+/// The line goes straight to the stderr handle. `eprintln!` would hand it to
+/// libtest's output capture, which only replays the output of a FAILED test, so
+/// a skipped test (a pass, as far as libtest can tell) would say nothing.
+fn ct_print_at_or_skip(test_name: &str, path: PathBuf) -> Option<PathBuf> {
+    if path.exists() {
+        return Some(path);
     }
-    Some(p)
+    let line = format!(
+        "SKIP: {test_name} requires ct-print at {} -- build it with \
+         `just build-ct-print`; it is only available where \
+         codetracer-trace-format-nim is checked out as a sibling.\n",
+        path.display()
+    );
+    std::io::stderr()
+        .write_all(line.as_bytes())
+        .expect("cannot write a SKIP line to stderr");
+    None
 }
 
 /// Record a program and return the `ct-print --full --strip-paths`
@@ -530,17 +992,8 @@ fn record_and_dump_full(test_name: &str, program: &str) -> Option<(serde_json::V
         out_dir
     );
 
-    let output = Command::new(&ct_print)
-        .args(["--full", "--strip-paths"])
-        .arg(&ct_files[0])
-        .output()
-        .expect("failed to run ct-print --full");
-
-    assert!(
-        output.status.success(),
-        "ct-print --full should succeed; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let output = read_container(&ct_print, &["--full", "--strip-paths"], &ct_files[0])
+        .unwrap_or_else(|report| panic!("{report}"));
 
     let doc: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("ct-print --full should emit valid JSON");
@@ -549,6 +1002,39 @@ fn record_and_dump_full(test_name: &str, program: &str) -> Option<(serde_json::V
     drop(tmp_dir);
 
     Some((doc, source_path))
+}
+
+/// Like `observed_int_vars`, for a program with one parameter that
+/// is not an Int: `name` must appear exactly once and decode as the
+/// `Variant` `discriminator`, and is left out of the returned pairs.
+/// Every other variable is still held to the Int rule.
+fn observed_int_vars_except_variant(
+    doc: &serde_json::Value,
+    name: &str,
+    discriminator: &str,
+) -> Vec<(String, i64)> {
+    let mut doc = doc.clone();
+    let mut seen = 0;
+    for ev in doc["events"].as_array_mut().expect("events array") {
+        let Some(vars) = ev["vars"].as_array_mut() else {
+            continue;
+        };
+        vars.retain(|v| {
+            if v["varname"].as_str() != Some(name) {
+                return true;
+            }
+            seen += 1;
+            assert_eq!(v["value"]["kind"].as_str(), Some("Variant"), "{v}");
+            assert_eq!(
+                v["value"]["discriminator"].as_str(),
+                Some(discriminator),
+                "{v}"
+            );
+            false
+        });
+    }
+    assert_eq!(seen, 1, "`{name}` must be recorded exactly once");
+    observed_int_vars(&doc)
 }
 
 /// Decode every (varname, i64) pair from step events.  Rejects any
@@ -1216,13 +1702,13 @@ fn test_error_paths_test_via_ct_print_full() {
 
     let counts = &doc["counts"];
     // safe_path branch:
-    //   * 1 dispatch step (line 29: `compute() == 112`)
+    //   * 1 dispatch step (line 33: `compute() == 112`)
     //   * compute(): 2 let-binding steps + 1 trailing-expr step
     //   * safe_compute(): 1 param-intro is suppressed (no params), 3
     //     let-bindings + 1 trailing-expr = 4 steps
     //   = 1 + 3 + 4 = 8 steps so far.
     // failing_path branch:
-    //   * 1 dispatch step (line 33: `failing_compute() == 0`)
+    //   * 1 dispatch step (line 37: `failing_compute() == 0`)
     //   * failing_compute(): 1 param-intro suppressed, 2 let-bindings
     //     before the `fail` arm `break`s out = 2 steps,
     //     plus 1 trailing in-flight step that lands at the `fail`
@@ -1290,12 +1776,12 @@ fn test_error_paths_test_via_ct_print_full() {
     // failures (which carry `AikenUplcEvalError`).
     let error_events: Vec<&serde_json::Value> = events
         .iter()
-        .filter(|e| e["kind"] == "io" && e["io_kind"] == "ioError")
+        .filter(|e| e["kind"] == "io" && e["io_kind"] == "Error")
         .collect();
     assert_eq!(
         error_events.len(),
         1,
-        "expected exactly one ioError io_event for the `fail` in failing_compute; \
+        "expected exactly one Error io_event for the `fail` in failing_compute; \
          got {error_events:?}"
     );
     let text = error_events[0]["text"].as_str().unwrap_or("");
@@ -1392,11 +1878,9 @@ fn test_tracing_test_via_ct_print_full() {
         vec![("a".into(), 4), ("b".into(), 5), ("sum_val".into(), 9),],
     );
 
-    // Each `trace @"label": value` surfaces as an `ioStdout` io_event
-    // (the multi-stream IOEvent stream collapses
-    // `EventLogKind::Write` / `WriteFile` / `WriteOther` to the
-    // `ioStdout` bucket — see `toIOEventKind` in
-    // `codetracer-trace-format-nim`) whose `text` carries
+    // Each `trace @"label": value` surfaces as an io_event whose
+    // `io_kind` is the exact `EventLogKind` the recorder wrote, `Write`
+    // (`trace-events.md` §"EventLogKind (u8 enum)"), and whose `text` carries
     // `"<label>: <value-expr>"` verbatim.  The frontend can route on
     // the `AikenTrace` metadata tag (mirroring the `AikenFail`
     // convention) to distinguish trace output from generic
@@ -1407,7 +1891,7 @@ fn test_tracing_test_via_ct_print_full() {
     // called out for `emit_fail_events_for_program`.
     let trace_events: Vec<&serde_json::Value> = events
         .iter()
-        .filter(|e| e["kind"] == "io" && e["io_kind"] == "ioStdout")
+        .filter(|e| e["kind"] == "io" && e["io_kind"] == "Write")
         .collect();
     let texts: Vec<&str> = trace_events
         .iter()
@@ -1416,7 +1900,7 @@ fn test_tracing_test_via_ct_print_full() {
     assert_eq!(
         texts,
         vec!["after-a: a", "after-b: b", "final-sum: sum_val"],
-        "ioStdout events should carry one entry per `trace @\"label\": value` \
+        "Write events should carry one entry per `trace @\"label\": value` \
          with text \"<label>: <value-expr>\""
     );
 }
@@ -1443,9 +1927,12 @@ fn test_tracing_test_emits_record_events() {
 /// outer block — Aiken's primary on-chain shape.  The recorder's
 /// parser gained validator-block awareness alongside this fixture
 /// (`spend` / `mint` / `else` / etc. inside a `validator <name> { ... }`
-/// block now register as function-table entries).  The strict pin
-/// asserts on the call sequence (compute → spend → redeemer_bonus
-/// then compute → mint → redeemer_bonus) and the per-step values.
+/// block now register as function-table entries).  `compute()` calls
+/// the handlers through the validator's name (`gift_card.spend(...)`),
+/// each returns Bool, and `score` turns each Bool into points.  The
+/// strict pin asserts on the call sequence (compute → spend →
+/// redeemer_bonus, compute → mint → redeemer_bonus, then compute →
+/// score twice) and the per-step values.
 #[test]
 fn test_validator_test_via_ct_print_full() {
     let Some((doc, source_path)) =
@@ -1464,9 +1951,10 @@ fn test_validator_test_via_ct_print_full() {
         .collect();
     // The function table includes the test fn (validator_smoke), the
     // free-function `compute()`, the validator's entry-point handlers
-    // `spend` / `mint`, and the shared helper `redeemer_bonus`, under
-    // the `<toplevel>` root the writer's `start` registers — see the
-    // "`<toplevel>` root frame" note above.
+    // `spend` / `mint`, the shared helper `redeemer_bonus` and the
+    // Bool-to-points helper `score`, under the `<toplevel>` root the
+    // writer's `start` registers — see the "`<toplevel>` root frame"
+    // note above.
     assert_eq!(
         functions,
         vec![
@@ -1475,15 +1963,19 @@ fn test_validator_test_via_ct_print_full() {
             "compute",
             "spend",
             "redeemer_bonus",
-            "mint"
+            "mint",
+            "score"
         ],
     );
 
     // ----- counts -----------------------------------------------------
     let counts = &doc["counts"];
-    assert_eq!(counts["steps"].as_u64(), Some(18), "steps; counts={counts}");
-    // 5 program calls + the `<toplevel>` root frame.
-    assert_eq!(counts["calls"].as_u64(), Some(6), "calls; counts={counts}");
+    // 1 in the test body, 6 in compute(), 3 in each handler, 1 in each
+    // redeemer_bonus, 3 in each score (the `when` line and both arms),
+    // plus one call-entry step for each of the 7 program calls.
+    assert_eq!(counts["steps"].as_u64(), Some(28), "steps; counts={counts}");
+    // 7 program calls + the `<toplevel>` root frame.
+    assert_eq!(counts["calls"].as_u64(), Some(8), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
         Some(0),
@@ -1491,14 +1983,14 @@ fn test_validator_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 18 steps + 6 call_entry + 6 call_exit = 30 events.
-    assert_eq!(events.len(), 30, "events.len()");
+    // 28 steps + 8 call_entry + 8 call_exit = 44 events.
+    assert_eq!(events.len(), 44, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     // ----- Call sequence ----------------------------------------------
-    // compute() → spend(2) → redeemer_bonus(2), then back to compute(),
-    // → mint(3) → redeemer_bonus(3), all nested in the `<toplevel>`
-    // root frame.
+    // compute() → spend(...) → redeemer_bonus(2), then back to compute(),
+    // → mint(...) → redeemer_bonus(3), then compute() → score twice, all
+    // nested in the `<toplevel>` root frame.
     assert_eq!(
         observed_call_sequence(&doc),
         vec![
@@ -1508,34 +2000,50 @@ fn test_validator_test_via_ct_print_full() {
             "redeemer_bonus".to_string(),
             "mint".to_string(),
             "redeemer_bonus".to_string(),
+            "score".to_string(),
+            "score".to_string(),
         ],
     );
 
     // ----- Decoded variable values ------------------------------------
-    // spend(2): amount=2 (param-intro in spend) → redeemer_bonus(2)
-    //   binds amount=2 in callee → bonus=20 → adjusted=21 (spend's
-    //   return).  Back in compute: spent=21.
-    // mint(3): action=3 → redeemer_bonus(3) (amount=3) → base=30 →
-    //   total=35 (mint's return).  Back in compute: minted=35.
+    // spend(None, 2, 0, 0): amount=2, _utxo=0, _self=0 (param-intro in
+    //   spend; `_datum` is `None`, which is not an Int) →
+    //   redeemer_bonus(2) binds amount=2 in callee → bonus=20 →
+    //   adjusted=21.  `adjusted == 21` holds, so spend returns True,
+    //   modelled as 1.  Back in compute: spend_ok=1.
+    // mint(3, 0, 0): action=3, _policy_id=0, _self=0 → redeemer_bonus(3)
+    //   (amount=3) → base=30 → total=35.  `total == 35` holds, so
+    //   mint_ok=1.
+    // score(spend_ok, 21) → spent=21; score(mint_ok, 35) → minted=35.
     // combined = 21 + 35 = 56.
     assert_eq!(
-        observed_var_sequence(&doc),
+        observed_int_vars_except_variant(&doc, "_datum", "None"),
         vec![
             ("amount".into(), 2),
+            ("_utxo".into(), 0),
+            ("_self".into(), 0),
             ("amount".into(), 2),
             ("bonus".into(), 20),
             ("adjusted".into(), 21),
-            ("spent".into(), 21),
+            ("spend_ok".into(), 1),
             ("action".into(), 3),
+            ("_policy_id".into(), 0),
+            ("_self".into(), 0),
             ("amount".into(), 3),
             ("base".into(), 30),
             ("total".into(), 35),
+            ("mint_ok".into(), 1),
+            ("accepted".into(), 1),
+            ("points".into(), 21),
+            ("spent".into(), 21),
+            ("accepted".into(), 1),
+            ("points".into(), 35),
             ("minted".into(), 35),
             ("combined".into(), 56),
         ],
     );
 
-    // ----- Return values: 20, 21, 30, 35, 56 ---------------------------
+    // ----- Return values: 20, 1, 30, 1, 21, 35, 56 ---------------------
     let returns: Vec<i64> = program_call_exits(&doc)
         .iter()
         .map(|e| {
@@ -1544,7 +2052,7 @@ fn test_validator_test_via_ct_print_full() {
             rv["i"].as_i64().expect("return value Int.i")
         })
         .collect();
-    assert_eq!(returns, vec![20, 21, 30, 35, 56]);
+    assert_eq!(returns, vec![20, 1, 30, 1, 21, 35, 56]);
 }
 
 // --- pattern_match_test.ak -------------------------------------------------
@@ -2174,6 +2682,8 @@ fn test_recursion_test_via_ct_print_full() {
 ///   * `list.map([1,2,3], fn(x) { x + 100 })` is recognised in
 ///     `eval_list_map` and dispatches the closure over each list
 ///     element, surfacing one Call/Return per iteration.
+///   * A `when` over `[first, second, third]` adds the map's result
+///     into compute()'s return value, so the map has to have run.
 ///
 /// The strict pin captures the call sequence (the `<toplevel>` root
 /// frame + compute + 2 closure inc(...) calls + 3 list.map closure
@@ -2237,7 +2747,8 @@ fn test_higher_order_test_via_ct_print_full() {
     // at the SAME exit step, so trace-format-nim's LIFO same-step
     // ordering (sort callsByExit by exit_step ASC, call_key DESC) emits
     // the last-opened iteration first → 103, 102, 101.  compute() is the
-    // outermost frame and exits last → 323.
+    // outermost frame and exits last → 323, which it can only reach by
+    // binding the three mapped elements in its `when` arm.
     let returns: Vec<i64> = program_call_exits(&doc)
         .iter()
         .map(|e| {
@@ -2497,19 +3008,19 @@ fn test_expect_refinement_test_via_ct_print_full() {
     let events = doc["events"].as_array().expect("events array");
     let expect_errors: Vec<&serde_json::Value> = events
         .iter()
-        .filter(|e| e["kind"] == "io" && e["io_kind"] == "ioError")
+        .filter(|e| e["kind"] == "io" && e["io_kind"] == "Error")
         .collect();
     assert_eq!(
         expect_errors.len(),
         3,
-        "expected 3 ioError io_events (one per expect statement); got {expect_errors:?}",
+        "expected 3 Error io_events (one per expect statement); got {expect_errors:?}",
     );
     // Every error message should mention `expect`.
     for ev in &expect_errors {
         let text = ev["text"].as_str().unwrap_or("");
         assert!(
             text.starts_with("expect "),
-            "ioError text should start with `expect `; got {text:?}"
+            "Error text should start with `expect `; got {text:?}"
         );
     }
 }
@@ -3372,6 +3883,116 @@ fn test_multi_test_entry_test_via_ct_print_full() {
 // CLI env-var contract
 // ===========================================================================
 
+/// Records a one-off module and returns the recorder's refusal.  The
+/// tracer has no second chance at these: without the refusal each would
+/// exit 0 with a trace of some other program.  A refused module must also
+/// leave no container behind, which could be read as a recording of it.
+fn recording_error(source: &str) -> String {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let source_path = tmp_dir.path().join("refused.ak");
+    std::fs::write(&source_path, source).expect("the module must be writable");
+    let out_dir = tmp_dir.path().join("traces");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let report = codetracer_cardano_recorder::recorder::record(&source_path, &out_dir)
+        .expect_err("the recorder must refuse this module");
+    let left: Vec<_> = std::fs::read_dir(&out_dir)
+        .expect("the output directory")
+        .map(|entry| entry.expect("a directory entry").path())
+        .collect();
+    assert!(left.is_empty(), "a refusal left {left:?}");
+    format!("{report:#}")
+}
+
+/// `p.0` is what `opaque_generic_test.ak` once spelled and the compiler
+/// refuses.  It used to record successfully with `first` unbound.
+#[test]
+fn test_a_numeric_tuple_projection_fails_the_recording() {
+    let message = recording_error(
+        "fn compute() -> Int {\n  let p = (7, 11)\n  let first = p.0\n  first\n}\n\n\
+         test t() {\n  compute() == 7\n}\n",
+    );
+    assert!(
+        message.contains("`p.0` is not a tuple projection"),
+        "{message}"
+    );
+}
+
+/// The same projection inside an expression takes a different path.
+#[test]
+fn test_a_numeric_tuple_projection_in_an_expression_fails_the_recording() {
+    let message = recording_error(
+        "fn compute() -> Int {\n  let p = (7, 11)\n  let x = p.0 + 1\n  x\n}\n\n\
+         test t() {\n  compute() == 8\n}\n",
+    );
+    assert!(
+        message.contains("`p.0` is not a tuple projection"),
+        "{message}"
+    );
+}
+
+/// A tuple ordinal past the end is refused the same way.
+#[test]
+fn test_a_tuple_ordinal_past_the_end_fails_the_recording() {
+    let message = recording_error(
+        "fn compute() -> Int {\n  let p = (7, 11)\n  let third = p.3rd\n  third\n}\n\n\
+         test t() {\n  compute() == 7\n}\n",
+    );
+    assert!(message.contains("2 element(s)"), "{message}");
+}
+
+/// `other.spend` names no validator.  Dropping the qualifier would
+/// trace `gift_card`'s handler instead of refusing the call.
+#[test]
+fn test_a_handler_call_through_an_undeclared_validator_fails_the_recording() {
+    let message = recording_error(
+        "validator gift_card {\n  mint(a: Int, _p: Data, _s: Data) {\n    a == 1\n  }\n}\n\n\
+         test t() {\n  other.mint(1, 0, 0)\n}\n",
+    );
+    assert!(message.contains("other.mint"), "{message}");
+}
+
+/// A refusal of the source is made before anything is written, so it leaves
+/// no recording behind to be mistaken for one.
+#[test]
+fn test_a_handler_refusal_writes_nothing() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let source_path = tmp_dir.path().join("refused.ak");
+    std::fs::write(
+        &source_path,
+        "validator gift_card {\n  mint(a: Int, _p: Data, _s: Data) {\n    a == 1\n  }\n}\n\n\
+         test t() {\n  other.mint(1, 0, 0)\n}\n",
+    )
+    .expect("the module must be writable");
+    let out_dir = tmp_dir.path().join("traces");
+    let report = codetracer_cardano_recorder::recorder::record(&source_path, &out_dir)
+        .expect_err("the recorder must refuse this module");
+    assert!(format!("{report:#}").contains("other.mint"), "{report:#}");
+    assert!(!out_dir.exists(), "a refusal must not create {out_dir:?}");
+}
+
+/// `helpers.mint` is valid Aiken and reaches the imported function: a dotted
+/// call is refused only when it would reach a handler by mistake.
+#[test]
+fn test_an_imported_function_named_like_a_handler_records() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let lib = tmp_dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(
+        lib.join("helpers.ak"),
+        "pub fn mint(x: Int) -> Int {\n  x + 1\n}\n",
+    )
+    .unwrap();
+    let source_path = tmp_dir.path().join("imports.ak");
+    std::fs::write(
+        &source_path,
+        "use my_project/helpers\n\ntest t() {\n  helpers.mint(1) == 2\n}\n",
+    )
+    .unwrap();
+    let out_dir = tmp_dir.path().join("traces");
+    codetracer_cardano_recorder::recorder::record(&source_path, &out_dir)
+        .expect("an imported function is not a handler");
+}
+
 /// `CODETRACER_CARDANO_RECORDER_OUT_DIR` must be honoured as a fallback
 /// for `--out-dir`.  Convention: `Recorder-CLI-Conventions.md` §5.
 #[test]
@@ -3562,4 +4183,62 @@ fn test_uplc_file_evaluation() {
     let eval_result = named_db.eval(ExBudget::default());
     let result_term = eval_result.result().unwrap();
     assert_eq!(result_term, Term::Constant(Rc::new(Constant::Bool(true))));
+}
+
+/// `flow_test.uplc` is a hand-written fixture for the evaluator, and it must say
+/// so. The compiler's own optimiser reduces this very program to the constant
+/// `True`, so the arithmetic it spells out is exactly what a compiled script
+/// does not contain: read as "the compiled form of `flow_test.ak`" the file
+/// would promise a step stream the chain would never execute.
+///
+/// The pass applied here, `aiken_optimize_and_intern`, is the one the Aiken code
+/// generator ends in. This is why the assertions on the file's header sit next
+/// to a real run of the pass: the header's wording is checked against what the
+/// pass actually does to the file's own program, not against a claim.
+#[test]
+fn test_the_hand_written_flow_program_is_not_what_the_compiler_emits() {
+    let uplc_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-programs/uplc/flow_test.uplc");
+    let uplc_src = std::fs::read_to_string(&uplc_path).expect("failed to read flow_test.uplc");
+    let parsed = uplc::parser::program(&uplc_src).expect("flow_test.uplc should parse");
+
+    let hand_written: Program<NamedDeBruijn> =
+        parsed.clone().to_named_debruijn().expect("should convert");
+    let hand_written_cost = hand_written.eval(ExBudget::default()).cost();
+
+    let optimised = uplc::optimize::aiken_optimize_and_intern(parsed);
+    assert_eq!(
+        optimised.term,
+        Term::Constant(Rc::new(Constant::Bool(true))),
+        "the optimiser must reduce the fixture to its answer; if it no longer does, the fixture's \
+         header is out of date"
+    );
+    let optimised: Program<NamedDeBruijn> = optimised.to_named_debruijn().expect("should convert");
+    let optimised_cost = optimised.eval(ExBudget::default()).cost();
+    assert!(
+        hand_written_cost.cpu > optimised_cost.cpu && hand_written_cost.mem > optimised_cost.mem,
+        "the fixture must do work its optimised form does not: hand-written {hand_written_cost:?}, \
+         optimised {optimised_cost:?}"
+    );
+
+    let header: String = uplc_src
+        .lines()
+        .take_while(|line| line.starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for claim in ["UPLC equivalent of flow_test.ak", "mirrors the"] {
+        assert!(
+            !header.contains(claim),
+            "the header of {} claims the fixture is the compiled module ({claim:?}), and the \
+             assertions above show it is not",
+            uplc_path.display()
+        );
+    }
+    for statement in ["hand-written", "not what the compiler emits"] {
+        assert!(
+            header.contains(statement),
+            "the header of {} must state {statement:?}",
+            uplc_path.display()
+        );
+    }
 }

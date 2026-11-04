@@ -270,7 +270,7 @@ fn test_uplc_eval_error_does_not_abort_trace() {
     let error_contents: Vec<_> = events
         .iter()
         .map(|event| serde_json::from_str::<serde_json::Value>(event).expect("parse event JSON"))
-        .filter(|event| event["kind"] == "error")
+        .filter(|event| event["kind"] == "Error")
         .map(|event| json_bytes_as_string(&event["data"]))
         .collect();
 
