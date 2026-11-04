@@ -112,9 +112,14 @@ jobs:
           cd "$GITHUB_WORKSPACE/../codetracer"
           NIM_SRC="$GITHUB_WORKSPACE/../codetracer-trace-format-nim"
           echo "Locked Nim source commit: $(git -C "$NIM_SRC" rev-parse HEAD)"
-          git -C "$NIM_SRC" hash-object build_ffi.nims build_ffi_flags.nim
+          # Record the C ABI library's build sources at the locked revision.
+          # ``build_ffi.nims`` is the entry point every revision has; later
+          # revisions move its flags into ``build_ffi_flags.nim``, which the
+          # locked revision need not carry, so hash the build_ffi sources the
+          # locked checkout tracks instead of a fixed list.
           test -f "$NIM_SRC/build_ffi.nims"
-          test -f "$NIM_SRC/build_ffi_flags.nim"
+          mapfile -t FFI_BUILD_SOURCES < <(git -C "$NIM_SRC" ls-files -- build_ffi.nims 'build_ffi_*.nim')
+          git -C "$NIM_SRC" hash-object "${FFI_BUILD_SOURCES[@]}"
           # Both native writer sources come from setup-dev-env's immutable
           # repro.lock siblings; the UI flake's older nested Nim pin must not
           # replace the recorder's recorded dependency tuple.
