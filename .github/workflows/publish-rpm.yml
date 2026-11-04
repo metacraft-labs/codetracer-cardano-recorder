@@ -102,6 +102,9 @@ jobs:
         with:
           env-flavor: nix
           gh-token: ${{ steps.ci_token.outputs.token }}
+          # `.github/sibling-repos` names `aiken-lang/stdlib`; setup-dev-env
+          # clones a sibling only when its owner is in the token's scope.
+          token-owner: metacraft-labs aiken-lang
 
       - name: Build recorder binary
         run: |

@@ -44,9 +44,16 @@ jobs:
         with:
           env-flavor: windows-diy
           gh-token: ${{ steps.app-token.outputs.token }}
+          # env.ps1 sources the shared CodeTracer env script from
+          # ../codetracer, and `cargo test` compiles test-programs/aiken/
+          # against ../stdlib, which is under aiken-lang: setup-dev-env
+          # clones a sibling only when its owner is in the token's scope.
+          token-owner: metacraft-labs aiken-lang
           siblings: |
+            codetracer
             codetracer-trace-format
             codetracer-trace-format-nim
+            aiken-lang/stdlib
 
       - name: Check
         run: dev-exec cargo check

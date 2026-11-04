@@ -28,4 +28,7 @@ jobs:
     uses: metacraft-labs/devops-modules/.github/workflows/reusable-recorder-ci.yml@dev
     with:
       prepare-recipe: prepare-ci
+      # `.github/sibling-repos` names `aiken-lang/stdlib`; setup-dev-env
+      # clones a sibling only when its owner is in the token's scope.
+      token-owner: metacraft-labs aiken-lang
     secrets: inherit
