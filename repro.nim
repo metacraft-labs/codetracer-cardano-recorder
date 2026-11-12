@@ -97,8 +97,11 @@ package codetracer_cardano_recorder:
     "cargo >=1.85"
     # C compiler driver — rustc links through `cc`, and build scripts
     # (cc-rs, the Nim FFI) compile C. Declaring it puts its directory on
-    # every cargo edge's PATH. Windows links with MSVC instead.
-    when defined(linux):
+    # every cargo edge's PATH. Windows Cargo links with MSVC instead; the
+    # owning ct-print constructor (``build_writer_artifacts.buildCtPrint``)
+    # separately compiles with GCC on Windows, so ``gcc`` is declared there
+    # for that edge only (the Windows cargo edges do not register it).
+    when defined(linux) or defined(windows):
       "gcc"
     elif defined(macosx):
       "clang"
@@ -119,10 +122,14 @@ package codetracer_cardano_recorder:
     "zstd"
     # zstd.h + libzstd for the sibling ct-print edge
     # (``build_writer_artifacts.buildCtPrint`` compiles and links against
-    # them; ``zstd`` is the CLI only). The constructor cannot provision a
-    # tool from inside ``build:`` and refuses a recipe that omits it.
-    when not defined(windows):
-      "zstd-dev"
+    # them; ``zstd`` is the CLI only). The ct-print edge needs both on every
+    # host, so this is declared on Windows too: there reprobuild provisions
+    # ``zstd-dev`` from a tarball whose prefix holds ``zstd.h`` and a static
+    # ``libzstd.a``, which ct-print links with ``-lzstd``. The constructor
+    # cannot provision a tool from inside ``build:`` and refuses a recipe
+    # that omits any of ``CtPrintToolSelectors`` (the C compiler plus
+    # ``zstd-dev``), on Windows as on POSIX.
+    "zstd-dev"
 
     # pkg-config + OpenSSL — openssl-sys consults pkg-config to find
     # OpenSSL on Linux/macOS. The Windows build uses the rustls-tls
