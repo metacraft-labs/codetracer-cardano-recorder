@@ -50,10 +50,42 @@
 #     <tmp>/<check>/codetracer-trace-format    `git archive` of the pin
 #                                              (check 1), or a symlink to
 #                                              the sibling checkout (check 2)
+#     <tmp>/<check>/metacraft-aiken-fork       a symlink to the checkout on
+#                                              disk, the SAME tree in both
+#                                              checks (see below)
 #
 # The committed `Cargo.lock` is never modified: cargo only writes the scratch
 # copy, and the lock is compared before and after the run (and restored, with
 # a failure, if it changed).
+#
+# The other sibling: metacraft-aiken-fork
+# ---------------------------------------
+# `Cargo.toml` also reaches `uplc` and `aiken-lang` by sibling path
+# (`../metacraft-aiken-fork/crates/{uplc,aiken-lang}`), because the CEK
+# stepping API this recorder drives is `pub` only in the fork. Resolution needs
+# that tree present too, so the shadow has to carry it: without it cargo stops
+# at "failed to read .../metacraft-aiken-fork/crates/aiken-lang/Cargo.toml"
+# before it ever looks at a trace-format edge, and BOTH checks die for a reason
+# that is not a verdict on the lock. (That is a FAIL, correctly — the script
+# classifies it as "not a stale lock" — but it takes `just test` out at step 1,
+# so no test runs at all.)
+#
+# It is linked from the checkout on disk, not from a pinned `git archive` like
+# trace-format, because THERE IS NO PIN TO ARCHIVE: `metacraft-aiken-fork` is
+# absent from `repro.lock` (the workspace manifest declares it as repo `aiken`
+# at path `metacraft-aiken-fork`, but no dependency edge records a revision for
+# it). Checked, not assumed — grep it.
+#
+# This preserves the gate's meaning rather than widening it. The subject of
+# both checks is whether `Cargo.lock` matches the TRACE-FORMAT tree; the fork
+# is incidental to that question. Linking the same on-disk fork into both
+# checks holds it CONSTANT, so the only tree that varies between check 1 and
+# check 2 is trace-format, and any difference the gate reports is still
+# attributable to trace-format alone. What this does NOT observe, and is not
+# trying to: whether the fork checkout itself is at any particular revision.
+# If the fork drifts, both checks drift together and the gate stays silent
+# about it — that is a separate gate's subject, and it cannot be this one's
+# while the fork carries no pin.
 #
 # Reading the pin
 # ---------------
@@ -67,12 +99,20 @@
 #
 # Skips
 # -----
-# A missing sibling checkout, a sibling lacking the pinned revision, or a
-# registry cache that cannot resolve offline each print a SKIP naming what is
-# missing and the command that fixes it; the run then ends in SKIP, never OK.
+# A missing sibling checkout, a sibling lacking the pinned revision, a missing
+# `metacraft-aiken-fork` checkout, or a registry cache that cannot resolve
+# offline each print a SKIP naming what is missing and the command that fixes
+# it; the run then ends in SKIP, never OK.
 # CT_SIBLING_CARGO_LOCKS_STRICT=1 (the variable codetracer's guard reads)
-# turns every skip into a failure. CT_TRACE_FORMAT_CHECKOUT overrides where
-# the sibling checkout is looked for.
+# turns every skip into a failure. CT_TRACE_FORMAT_CHECKOUT and
+# CT_AIKEN_FORK_CHECKOUT override where the two sibling trees are looked for.
+#
+# A missing fork is a SKIP and not a FAIL because it is the same kind of fact
+# as a missing trace-format checkout — the environment cannot answer the
+# question — and it is reported in the same words. It is a LOUD skip: it names
+# the tree, prints the clone command, forces the run's verdict to SKIP, and is
+# a hard failure under CT_SIBLING_CARGO_LOCKS_STRICT=1, which is what CI sets.
+# A loud skip is reachable by design; a SILENT pass is not.
 #
 # Wire-up: see `Justfile` (`just test` runs this script) and `repro.nim`
 # (the `verify-cargo-lock` execute edge in the `test` collection).
@@ -86,11 +126,13 @@ set -euo pipefail
 
 RECORDER_NAME="codetracer-cardano-recorder"
 SIBLING_NAME="codetracer-trace-format"
+FORK_NAME="metacraft-aiken-fork"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WORKSPACE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
 SIBLING_DIR="${CT_TRACE_FORMAT_CHECKOUT:-${WORKSPACE_ROOT}/${SIBLING_NAME}}"
+FORK_DIR="${CT_AIKEN_FORK_CHECKOUT:-${WORKSPACE_ROOT}/${FORK_NAME}}"
 STRICT="${CT_SIBLING_CARGO_LOCKS_STRICT:-0}"
 CARGO="${CARGO:-cargo}"
 
@@ -106,6 +148,27 @@ done
 
 [[ -f "${REPO_ROOT}/repro.lock" ]] || fail "${REPO_ROOT}/repro.lock does not exist."
 [[ -f "${REPO_ROOT}/Cargo.lock" ]] || fail "${REPO_ROOT}/Cargo.lock does not exist."
+[[ -f "${REPO_ROOT}/Cargo.toml" ]] || fail "${REPO_ROOT}/Cargo.toml does not exist."
+
+# ---------------------------------------------------------------------------
+# The shadow is only correct if it carries EVERY sibling the manifest reaches
+# by `../` path. That set is read out of Cargo.toml rather than assumed, so a
+# sibling path dep added later fails this check loudly instead of reaching
+# cargo as "failed to read .../Cargo.toml" — the shape that took `just test`
+# out at step 1 and said nothing about the lock.
+# ---------------------------------------------------------------------------
+
+EXPECTED_SIBLINGS="$(printf '%s\n' "${SIBLING_NAME}" "${FORK_NAME}" | sort)"
+ACTUAL_SIBLINGS="$(grep -oE 'path = "\.\./[^"/]+' "${REPO_ROOT}/Cargo.toml" |
+  sed 's|^path = "\.\./||' | sort -u || true)"
+if [[ "${ACTUAL_SIBLINGS}" != "${EXPECTED_SIBLINGS}" ]]; then
+  fail "Cargo.toml reaches a different set of '../' siblings than this check builds into its scratch shadow.
+  expected: $(tr '\n' ' ' <<< "${EXPECTED_SIBLINGS}")
+  found:    $(tr '\n' ' ' <<< "${ACTUAL_SIBLINGS}")
+Teach make_shadow/resolve_against about the new sibling (and give it a pinned
+'git archive' if repro.lock pins it). This is a parse failure, NOT a statement
+about Cargo.lock."
+fi
 
 # ---------------------------------------------------------------------------
 # The pinned revision (see "Reading the pin" above)
@@ -176,6 +239,9 @@ resolve_against() {
   local out rc=0
   make_shadow "${shadow}"
   [[ -e "${ws}/${SIBLING_NAME}" ]] || ln -s "${tree}" "${ws}/${SIBLING_NAME}"
+  # The same on-disk fork in every check, so it cannot be what differs between
+  # them (see "The other sibling" in the header).
+  [[ -e "${ws}/${FORK_NAME}" ]] || ln -s "${FORK_TREE}" "${ws}/${FORK_NAME}"
   # No --locked: see "exact re-resolution" in the header.
   out="$(cd "${shadow}" && "${CARGO}" update --workspace --offline 2>&1 >/dev/null)" || rc=$?
   if [[ "${rc}" -ne 0 ]]; then
@@ -202,11 +268,33 @@ ${out}"
 }
 
 # ---------------------------------------------------------------------------
+# The metacraft-aiken-fork checkout (see "The other sibling" in the header).
+# Needed by BOTH checks, so its absence is settled once, before either runs.
+# ---------------------------------------------------------------------------
+
+FORK_TREE=""
+FORK_AVAILABLE=0
+if [[ -d "${FORK_DIR}" && -f "${FORK_DIR}/crates/aiken-lang/Cargo.toml" ]]; then
+  FORK_TREE="$(cd "${FORK_DIR}" && pwd)"
+  FORK_AVAILABLE=1
+  FORK_REV="$(git -C "${FORK_TREE}" rev-parse --verify -q HEAD 2>/dev/null || echo '(not a git checkout)')"
+  echo "${FORK_NAME} checkout: ${FORK_TREE} (HEAD ${FORK_REV}) — held constant across both checks"
+else
+  skip_note "no usable ${FORK_NAME} checkout at ${FORK_DIR} (expected ${FORK_DIR}/crates/aiken-lang/Cargo.toml). Cargo.toml takes 'uplc' and 'aiken-lang' from that sibling by path, so NEITHER check could be re-resolved and NOTHING about Cargo.lock has been established. repro.lock does not pin this repo; the workspace manifest declares it as repo 'aiken' at path '${FORK_NAME}'. Fix with:
+    repro ws enable codetracer     (from the workspace root)
+  or clone it directly:
+    git clone https://github.com/metacraft-labs/aiken '${FORK_DIR}'
+  or point this check at an existing checkout with CT_AIKEN_FORK_CHECKOUT."
+fi
+
+# ---------------------------------------------------------------------------
 # Check 1 — the pinned tree, from the sibling's objects only
 # ---------------------------------------------------------------------------
 
 PINNED_OK=0
-if [[ ! -e "${SIBLING_DIR}/.git" ]]; then
+if [[ "${FORK_AVAILABLE}" -ne 1 ]]; then
+  : # already reported above; neither check can run
+elif [[ ! -e "${SIBLING_DIR}/.git" ]]; then
   skip_note "no ${SIBLING_NAME} checkout at ${SIBLING_DIR} (clone it beside this repo, or set CT_TRACE_FORMAT_CHECKOUT). Cargo.lock was NOT resolved against the pinned revision ${PINNED_REV}, nor against a checkout."
 elif ! git -C "${SIBLING_DIR}" cat-file -e "${PINNED_REV}^{commit}" 2>/dev/null; then
   skip_note "the ${SIBLING_NAME} checkout at ${SIBLING_DIR} does not have the pinned revision ${PINNED_REV}, so Cargo.lock was NOT resolved against it. Run: git -C '${SIBLING_DIR}' fetch origin ${PINNED_REV}"
@@ -227,7 +315,9 @@ fi
 
 DISK_REV=""
 DISK_DESC=""
-if [[ -e "${SIBLING_DIR}/.git" ]]; then
+if [[ "${FORK_AVAILABLE}" -ne 1 ]]; then
+  : # already reported above; neither check can run
+elif [[ -e "${SIBLING_DIR}/.git" ]]; then
   if DISK_REV="$(git -C "${SIBLING_DIR}" rev-parse --verify -q HEAD)"; then
     DISK_DESC="${SIBLING_NAME} checkout at ${SIBLING_DIR} (HEAD ${DISK_REV}"
     if [[ -n "$(git -C "${SIBLING_DIR}" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
