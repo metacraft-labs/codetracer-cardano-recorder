@@ -73,7 +73,8 @@ jobs:
 
       - name: Setup dev env (reprobuild flavor)
         # setup-dev-env clones the siblings listed in .github/sibling-repos
-        # (codetracer-trace-format, codetracer-trace-format-nim) at the
+        # (codetracer-trace-format, codetracer-trace-format-nim,
+        # aiken-lang/stdlib, metacraft-labs/aiken) at the
         # workspace-lock-pinned revisions before materialising the env.
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:

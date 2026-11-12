@@ -64,7 +64,7 @@ use crate::chain::{ChainSource, EpochParams, ProtocolVersionRow};
 /// Plutus language.
 ///
 /// These are counted from `initialize_cost_model`'s own `costs[N]` indices in
-/// `metacraft-aiken-fork/crates/uplc`, not guessed: V1 reads 0..=165, V2
+/// `aiken/crates/uplc`, not guessed: V1 reads 0..=165, V2
 /// 0..=174 and V3 0..=296. A chain parameter vector shorter than the figure
 /// here cannot produce that era's prices, and one longer carries parameters
 /// this evaluator does not read.

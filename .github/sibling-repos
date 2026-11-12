@@ -9,3 +9,11 @@ codetracer-trace-format-nim
 # comes from repro.lock like the others. tests/test_corpus_is_valid_aiken.rs
 # compiles test-programs/aiken/ against it.
 aiken-lang/stdlib
+# The Metacraft Aiken fork, cloned into `../aiken` because that is both the
+# workspace-lock key and the directory `clone-siblings` derives from the NAME
+# half of this entry. `Cargo.toml` takes `uplc` and `aiken-lang` from it by
+# path (`../aiken/crates/{uplc,aiken-lang}`), so `cargo metadata` fails before
+# compilation on any job without it. Its pin comes from repro.lock like the
+# others. `windows-build.yml` passes an explicit `siblings:` list instead of
+# reading this file, so it names the fork there too.
+metacraft-labs/aiken

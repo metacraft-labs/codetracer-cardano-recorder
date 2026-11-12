@@ -68,8 +68,7 @@ use uplc::parser;
 /// if the corpus were missing the crate could not have compiled in the first
 /// place.  The test therefore never needs to skip, and never does.
 fn conformance_v3_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metacraft-aiken-fork/crates/uplc/test_data/conformance/v3")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../aiken/crates/uplc/test_data/conformance/v3")
 }
 
 /// Recursively collect every `.uplc` file under `dir`.

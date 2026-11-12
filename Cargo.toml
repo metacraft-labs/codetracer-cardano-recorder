@@ -24,7 +24,15 @@ num-traits = "0.2"
 # release, so the dependency points at the workspace fork, where it landed as
 # `baeb591a` and is an ancestor of `origin/codetracer`.  The fork is the same
 # version (1.1.21) as the registry crate, so this is a drop-in redirect.
-uplc = { path = "../metacraft-aiken-fork/crates/uplc" }
+#
+# THE DIRECTORY IS `aiken`, NOT `metacraft-aiken-fork`. The workspace manifest
+# fragment `repos/aiken.toml` declares the fork as repo `aiken`, and
+# `clone-siblings` uses the NAME half of a `.github/sibling-repos` entry as
+# BOTH the workspace-lock key and the directory it clones into. While the
+# fragment's `path` said `metacraft-aiken-fork`, CI cloned `metacraft-labs/
+# aiken` into `../aiken` and these path deps named a directory that was never
+# created, so `cargo metadata` failed before compilation. The two now agree.
+uplc = { path = "../aiken/crates/uplc" }
 # CXP-ADA-1 deliverable 3: the compiler must actually be invoked, so the
 # artifact this recorder executes is the artifact the compiler produced rather
 # than one of our own parsing. The whole front-end this needs — the lexer and
@@ -43,8 +51,11 @@ uplc = { path = "../metacraft-aiken-fork/crates/uplc" }
 # modules).
 #
 # Same fork and same version (1.1.21) as the `uplc` path dep above, so the two
-# resolve to one checkout; CI already clones it (`03e3ec3`).
-aiken-lang = { path = "../metacraft-aiken-fork/crates/aiken-lang" }
+# resolve to one checkout. CI gets that checkout from the `metacraft-labs/aiken`
+# entry in `.github/sibling-repos` (and, for the one workflow that passes an
+# explicit `siblings:` list instead of reading that file, from that list) at the
+# revision this commit's `repro.lock` pins for repo `aiken`.
+aiken-lang = { path = "../aiken/crates/aiken-lang" }
 hex = "0.4"
 # Named directly because `aiken-lang`'s own API is in terms of it:
 # `TypedModule::register_definitions` and `CodeGenerator::new` take

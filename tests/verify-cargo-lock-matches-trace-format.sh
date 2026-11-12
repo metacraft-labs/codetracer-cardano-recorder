@@ -50,7 +50,7 @@
 #     <tmp>/<check>/codetracer-trace-format    `git archive` of the pin
 #                                              (check 1), or a symlink to
 #                                              the sibling checkout (check 2)
-#     <tmp>/<check>/metacraft-aiken-fork       a symlink to the checkout on
+#     <tmp>/<check>/aiken                      a symlink to the checkout on
 #                                              disk, the SAME tree in both
 #                                              checks (see below)
 #
@@ -58,23 +58,29 @@
 # copy, and the lock is compared before and after the run (and restored, with
 # a failure, if it changed).
 #
-# The other sibling: metacraft-aiken-fork
-# ---------------------------------------
+# The other sibling: aiken
+# ------------------------
 # `Cargo.toml` also reaches `uplc` and `aiken-lang` by sibling path
-# (`../metacraft-aiken-fork/crates/{uplc,aiken-lang}`), because the CEK
-# stepping API this recorder drives is `pub` only in the fork. Resolution needs
-# that tree present too, so the shadow has to carry it: without it cargo stops
-# at "failed to read .../metacraft-aiken-fork/crates/aiken-lang/Cargo.toml"
-# before it ever looks at a trace-format edge, and BOTH checks die for a reason
-# that is not a verdict on the lock. (That is a FAIL, correctly — the script
-# classifies it as "not a stale lock" — but it takes `just test` out at step 1,
-# so no test runs at all.)
+# (`../aiken/crates/{uplc,aiken-lang}`), because the CEK stepping API this
+# recorder drives is `pub` only in the fork. Resolution needs that tree present
+# too, so the shadow has to carry it: without it cargo stops at "failed to read
+# .../aiken/crates/aiken-lang/Cargo.toml" before it ever looks at a
+# trace-format edge, and BOTH checks die for a reason that is not a verdict on
+# the lock. (That is a FAIL, correctly — the script classifies it as "not a
+# stale lock" — but it takes `just test` out at step 1, so no test runs at
+# all.)
+#
+# The directory is `aiken` and not `metacraft-aiken-fork`: the workspace
+# manifest fragment `repos/aiken.toml` declares the fork as repo `aiken`, and
+# `clone-siblings` uses the NAME half of a sibling entry as both the
+# workspace-lock key and the directory it clones into, so the checkout path and
+# the repo name have to agree.
 #
 # It is linked from the checkout on disk, not from a pinned `git archive` like
-# trace-format, because THERE IS NO PIN TO ARCHIVE: `metacraft-aiken-fork` is
-# absent from `repro.lock` (the workspace manifest declares it as repo `aiken`
-# at path `metacraft-aiken-fork`, but no dependency edge records a revision for
-# it). Checked, not assumed — grep it.
+# trace-format. `repro.lock` now DOES pin it — the manifest declares the
+# `depends` edge, so `repro lock refresh` records a revision for repo `aiken`
+# — so this is a deliberate choice rather than the absence of a pin it used to
+# be.
 #
 # This preserves the gate's meaning rather than widening it. The subject of
 # both checks is whether `Cargo.lock` matches the TRACE-FORMAT tree; the fork
@@ -84,8 +90,8 @@
 # attributable to trace-format alone. What this does NOT observe, and is not
 # trying to: whether the fork checkout itself is at any particular revision.
 # If the fork drifts, both checks drift together and the gate stays silent
-# about it — that is a separate gate's subject, and it cannot be this one's
-# while the fork carries no pin.
+# about it — that is a separate gate's subject, and widening this one to it
+# would change what a STALE verdict here means.
 #
 # Reading the pin
 # ---------------
@@ -100,7 +106,7 @@
 # Skips
 # -----
 # A missing sibling checkout, a sibling lacking the pinned revision, a missing
-# `metacraft-aiken-fork` checkout, or a registry cache that cannot resolve
+# `aiken` checkout, or a registry cache that cannot resolve
 # offline each print a SKIP naming what is missing and the command that fixes
 # it; the run then ends in SKIP, never OK.
 # CT_SIBLING_CARGO_LOCKS_STRICT=1 (the variable codetracer's guard reads)
@@ -126,7 +132,7 @@ set -euo pipefail
 
 RECORDER_NAME="codetracer-cardano-recorder"
 SIBLING_NAME="codetracer-trace-format"
-FORK_NAME="metacraft-aiken-fork"
+FORK_NAME="aiken"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -268,7 +274,7 @@ ${out}"
 }
 
 # ---------------------------------------------------------------------------
-# The metacraft-aiken-fork checkout (see "The other sibling" in the header).
+# The aiken fork checkout (see "The other sibling" in the header).
 # Needed by BOTH checks, so its absence is settled once, before either runs.
 # ---------------------------------------------------------------------------
 
@@ -280,7 +286,7 @@ if [[ -d "${FORK_DIR}" && -f "${FORK_DIR}/crates/aiken-lang/Cargo.toml" ]]; then
   FORK_REV="$(git -C "${FORK_TREE}" rev-parse --verify -q HEAD 2>/dev/null || echo '(not a git checkout)')"
   echo "${FORK_NAME} checkout: ${FORK_TREE} (HEAD ${FORK_REV}) — held constant across both checks"
 else
-  skip_note "no usable ${FORK_NAME} checkout at ${FORK_DIR} (expected ${FORK_DIR}/crates/aiken-lang/Cargo.toml). Cargo.toml takes 'uplc' and 'aiken-lang' from that sibling by path, so NEITHER check could be re-resolved and NOTHING about Cargo.lock has been established. repro.lock does not pin this repo; the workspace manifest declares it as repo 'aiken' at path '${FORK_NAME}'. Fix with:
+  skip_note "no usable ${FORK_NAME} checkout at ${FORK_DIR} (expected ${FORK_DIR}/crates/aiken-lang/Cargo.toml). Cargo.toml takes 'uplc' and 'aiken-lang' from that sibling by path, so NEITHER check could be re-resolved and NOTHING about Cargo.lock has been established. the workspace manifest declares it as repo 'aiken' at path '${FORK_NAME}', and repro.lock pins that repo; this check still links the on-disk checkout rather than the pinned archive, so that it is held constant across both checks. Fix with:
     repro ws enable codetracer     (from the workspace root)
   or clone it directly:
     git clone https://github.com/metacraft-labs/aiken '${FORK_DIR}'

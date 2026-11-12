@@ -49,11 +49,20 @@ jobs:
           # against ../stdlib, which is under aiken-lang: setup-dev-env
           # clones a sibling only when its owner is in the token's scope.
           token-owner: metacraft-labs aiken-lang
+          # An explicit `siblings:` list REPLACES `.github/sibling-repos`
+          # ("instead of reading .github/sibling-repos" in setup-dev-env's
+          # input description), so every sibling this job needs has to be named
+          # HERE -- the fork entry in that file does not reach this workflow.
+          # `metacraft-labs/aiken` is required by `cargo check` / `cargo test`
+          # below: Cargo.toml takes `uplc` and `aiken-lang` from
+          # ../aiken/crates/ by path, so cargo fails during manifest resolution
+          # without it.
           siblings: |
             codetracer
             codetracer-trace-format
             codetracer-trace-format-nim
             aiken-lang/stdlib
+            metacraft-labs/aiken
 
       - name: Check
         run: dev-exec cargo check
