@@ -83,7 +83,7 @@ const CORPUS_PACKAGE: &str = "codetracer/cardano-test-programs";
 const CORPUS_PLUTUS_VERSION: PlutusVersion = PlutusVersion::V3;
 
 /// The compiler the stdlib checkout must have been released for. It is the
-/// version of the `aiken-lang` dev-dependency.
+/// version of the `aiken-lang` dependency.
 const STDLIB_COMPILER_LINE: &str = "compiler = \"v1.1.21\"";
 
 fn corpus_dir() -> PathBuf {
@@ -98,15 +98,15 @@ fn stdlib_lib_dir() -> PathBuf {
     let manifest = std::fs::read_to_string(root.join("aiken.toml")).unwrap_or_else(|e| {
         panic!(
             "cannot read {}: {e}. This test needs the `stdlib` sibling, so run \
-             `repro sync --only=stdlib` from the workspace root",
+             `repro ws enable codetracer` from the workspace root",
             root.join("aiken.toml").display()
         )
     });
     assert!(
         manifest.lines().any(|line| line == STDLIB_COMPILER_LINE),
         "{} is not the stdlib release for this compiler (expected `{STDLIB_COMPILER_LINE}`). \
-         Run `repro sync --only=stdlib` from the workspace root, or move repos/aiken-stdlib.toml \
-         and the `aiken-lang` dev-dependency together",
+         Run `repro ws enable codetracer` from the workspace root, or move repos/stdlib.toml \
+         and the `aiken-lang` dependency together",
         root.display()
     );
     root.join("lib")
