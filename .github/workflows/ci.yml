@@ -32,3 +32,39 @@ jobs:
       # clones a sibling only when its owner is in the token's scope.
       token-owner: metacraft-labs aiken-lang
     secrets: inherit
+
+  # The source-only packaging channels (homebrew, nix, aur, scoop,
+  # chocolatey) verify without a build, so they run on every push and pull
+  # request here; deb and rpm are verified in publish-deb.yml / publish-rpm.yml
+  # on the package just built. `verify-package` is strict: a missing tool
+  # fails the job instead of passing it vacuously.
+  packaging:
+    name: Verify packaging sources
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mint installation token for cross-repo sibling clones
+        id: ci_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Setup dev env
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        with:
+          env-flavor: nix
+          gh-token: ${{ steps.ci_token.outputs.token }}
+          # `.github/sibling-repos` names `aiken-lang/stdlib`; setup-dev-env
+          # clones a sibling only when its owner is in the token's scope.
+          token-owner: metacraft-labs aiken-lang
+          substituters: ${{ vars.SUBSTITUTERS }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-cache: ${{ vars.ATTIC_CACHE }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+
+      - name: Verify packaging sources
+        run: dev-exec just verify-packaging-sources

@@ -156,6 +156,14 @@ jobs:
           rpm=$(find out -name "*.rpm" -type f | head -n1)
           nix shell --inputs-from . nixpkgs#rpm -c rpm -qip --requires "$rpm"
 
+      - name: Verify .rpm
+        # Runs on dry runs too, so a broken package fails before any upload.
+        # `verify-rpm` is strict: no .rpm in out/ or no rpm fails it.
+        run: |
+          set -euo pipefail
+          nix shell --inputs-from . nixpkgs#rpm nixpkgs#python3 nixpkgs#just -c \
+            just verify-rpm out
+
       - name: Sign .rpm
         if: ${{ inputs.dry_run == false }}
         env:

@@ -32,7 +32,11 @@
             pkgs.nixfmt-rfc-style
             pkgs.opentofu
             pkgs.nodePackages.prettier
+            # `just verify-package` is a Python script, and checks the
+            # Homebrew formula with `ruby -c`. It fails rather than skips
+            # when a tool is missing, so the shell provides both.
             pkgs.python3
+            pkgs.ruby
             pkgs.zstd # required by libcodetracer_trace_writer (Nim FFI)
             # Declare nim + nimble + just + capnproto explicitly
             # so the dev shell is self-contained.  Previously these

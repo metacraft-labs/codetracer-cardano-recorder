@@ -157,6 +157,14 @@ jobs:
           nix shell --inputs-from . nixpkgs#dpkg -c \
             dpkg-deb --info "out/codetracer-cardano-recorder_${VERSION}_${ARCH}.deb"
 
+      - name: Verify .deb
+        # Runs on dry runs too, so a broken package fails before any upload.
+        # `verify-deb` is strict: no .deb in out/ or no dpkg-deb fails it.
+        run: |
+          set -euo pipefail
+          nix shell --inputs-from . nixpkgs#dpkg nixpkgs#python3 nixpkgs#just -c \
+            just verify-deb out
+
       - name: Sign .deb
         if: ${{ inputs.dry_run == false }}
         env:
