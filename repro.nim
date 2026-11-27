@@ -88,6 +88,22 @@ const traceFormatNimRoot = "../codetracer-trace-format-nim"
 package codetracer_cardano_recorder:
   defaultToolProvisioning "path"
 
+  # CI clones these siblings beside the checkout (.github/sibling-repos, and
+  # the `siblings:` lists in cross-repo-tests.yml and windows-build.yml), and
+  # the clone actions resolve each one from the committed lock, so the lock
+  # must pin them. No build edge declares them with `uses:`: they are pinned,
+  # not used. `aiken` is the Metacraft Aiken fork that Cargo.toml takes `uplc`
+  # and `aiken-lang` from by path; `stdlib` is the Aiken standard library
+  # tests/test_corpus_is_valid_aiken.rs compiles the corpus against.
+  pinned:
+    "aiken"
+    "codetracer"
+    "codetracer-trace-format"
+    "codetracer-trace-format-nim"
+    "codetracer-vscode-extension"
+    "nix-blockchain-development"
+    "stdlib"
+
   uses:
     # Rust toolchain — declared by version so the tarball-direct
     # provisioning entries in repro_dsl_stdlib/packages/cargo.nim /
